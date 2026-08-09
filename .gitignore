@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.egg-info/
+*.pyc
+.pytest_cache/
+
+# fetched at setup, not vendored
+models/*.onnx
+
+# recorded sessions
+session-*/
+*.jsonl

@@ -1,0 +1,31 @@
+[project]
+name = "gpagent"
+version = "0.1.0"
+description = "Gameplay capture and discretization for a realtime LLM commentator (Component A)"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0",
+    "onnxruntime>=1.20",
+    "pillow>=11.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24"]
+
+[project.scripts]
+gpagent = "gpagent.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gpagent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "hardware: touches real devices (gamepad/mic/screen); deselected by default",
+]
+addopts = "-m 'not hardware'"

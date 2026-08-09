@@ -1,0 +1,33 @@
+# Example configuration. Every key is optional; unspecified sections keep
+# defaults. Use with:  gpagent record -c gpagent.example.toml
+# Anything here can also be set ad hoc:  --set screen.long_edge=1280
+
+[gamepad]
+window_ms = 500        # aggregation window
+sticks_mode = "intensity"   # off | intensity | full
+deadzone = 0.12        # our own; device-reported `flat` is far too small
+tap_max_ms = 220       # longer presses count as holds, not taps
+
+[audio]
+vad_backend = "silero" # silero | webrtc
+vad_threshold = 0.5
+preroll_ms = 300       # audio kept from before speech onset
+hangover_ms = 500      # audio kept after speech ends
+min_speech_ms = 250    # drops coughs and clicks
+echo_cancel = true     # reference is the default sink's monitor
+noise_suppression_level = "moderate"   # low | moderate | high | very-high
+echo_suppression_level = "high"        # raise if game audio leaks into segments
+
+[screen]
+long_edge = 1024       # 1280 for readable HUD text, 640 to save tokens
+jpeg_quality = 75
+pipeline_fps = 2       # constant cheap rate into the latest-frame holder
+
+[triggers]
+min_interval_s = 1.5   # global floor between frames (speech bypasses it)
+heartbeat_s = 10.0
+gamepad_intensity = 0.35
+gamepad_throttle_s = 2.0   # leading-edge throttle, not a debounce
+scene_threshold = 0.06
+scene_throttle_s = 3.0
+dedup_threshold = 0.01     # drop frames too similar to the last one sent
