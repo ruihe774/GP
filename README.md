@@ -183,3 +183,10 @@ eating it and `echo_suppression_level` is the knob.
 - `webrtcdsp echo-suppression-level=high` suppresses the *player* during
   double-talk. Talking over game audio is double-talk by definition, so the
   default is `moderate`.
+- `silero_vad.onnx` does **not** carry its own context. The reference wrapper
+  prepends 64 samples of the previous chunk, so the input tensor is 576 wide at
+  16 kHz, not 512. The graph declares its input as `[None, None]` and therefore
+  accepts a bare 512 without complaint — it just returns ~0 for everything,
+  speech included. `tests/test_vad_model.py` pins both the tensor width and a
+  positive detection, because every *negative* test passes against a VAD that
+  is permanently asleep.

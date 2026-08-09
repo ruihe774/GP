@@ -15,8 +15,15 @@ log = logging.getLogger(__name__)
 
 __all__ = ["SileroVAD", "default_model_path", "WINDOW_SAMPLES"]
 
-#: Silero v5 requires exactly 512 samples per call at 16 kHz.
+#: Chunk of new audio per call at 16 kHz.
 WINDOW_SAMPLES = 512
+
+#: Samples of the *previous* chunk that must be prepended to the new one. The
+#: exported silero_vad.onnx does not carry this internally -- the reference
+#: wrapper concatenates it before every inference, so the tensor is 576 wide at
+#: 16 kHz. Feeding a bare 512 is accepted by the graph (its input is [None,
+#: None]) but yields a near-zero probability for *all* input, speech included.
+CONTEXT_SAMPLES = {16000: 64, 8000: 32}
 
 
 def default_model_path() -> Path:
@@ -51,21 +58,27 @@ class SileroVAD:
             str(path), sess_options=options, providers=["CPUExecutionProvider"]
         )
         self.sample_rate = sample_rate
+        self.window = 512 if sample_rate == 16000 else 256
+        self._context_size = CONTEXT_SAMPLES.get(sample_rate, 64)
         self._sr = np.array(sample_rate, dtype=np.int64)
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
+        self._context = np.zeros((1, self._context_size), dtype=np.float32)
         self.model_path = path
 
     def reset(self) -> None:
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
+        self._context = np.zeros((1, self._context_size), dtype=np.float32)
 
     def __call__(self, frame: np.ndarray) -> float:
-        """Speech probability for exactly WINDOW_SAMPLES float32 samples."""
-        if frame.shape[-1] != WINDOW_SAMPLES:
-            raise ValueError(
-                f"expected {WINDOW_SAMPLES} samples, got {frame.shape[-1]}"
-            )
-        batch = frame.reshape(1, WINDOW_SAMPLES).astype(np.float32, copy=False)
+        """Speech probability for exactly `window` float32 samples."""
+        if frame.shape[-1] != self.window:
+            raise ValueError(f"expected {self.window} samples, got {frame.shape[-1]}")
+        chunk = frame.reshape(1, self.window).astype(np.float32, copy=False)
+        # Prepend the tail of the previous chunk; without it the model scores
+        # everything at ~0 and the VAD silently never fires.
+        batch = np.concatenate((self._context, chunk), axis=1)
         out, self._state = self._session.run(
             None, {"input": batch, "state": self._state, "sr": self._sr}
         )
+        self._context = batch[:, -self._context_size :]
         return float(out[0][0])
