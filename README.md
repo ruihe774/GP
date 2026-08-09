@@ -153,6 +153,36 @@ by hand:
 7. Unplug and replug the pad mid-session — disconnect/connect events, capture
    resumes.
 
+## Listening to captured speech
+
+Speech blobs are **headerless PCM** — signed 16-bit little-endian, mono,
+24 kHz — so a player needs to be told the format. The built-in way:
+
+```bash
+gpagent inspect sess3 --wav        # writes sess3/wav/*.wav
+```
+
+Or with ffmpeg directly:
+
+```bash
+ffplay -f s16le -ar 24000 -ac 1 sess3/blobs/000088-speech.pcm   # play in place
+ffmpeg -f s16le -ar 24000 -ac 1 -i in.pcm out.wav               # convert one
+```
+
+Convert a whole session (fish):
+
+```fish
+for f in sess3/blobs/*.pcm
+    ffmpeg -y -f s16le -ar 24000 -ac 1 -i $f (string replace .pcm .wav $f)
+end
+```
+
+Concatenate everything into one file to review a session quickly (bash/fish):
+
+```bash
+cat sess3/blobs/*-speech.pcm | ffmpeg -y -f s16le -ar 24000 -ac 1 -i - all.wav
+```
+
 ## Diagnosing a session that captured nothing
 
 `record` prints a `note:` line when a source produced nothing and says why, and

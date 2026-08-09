@@ -3,6 +3,11 @@
 Pure logic with an injectable clock so the timing rules are testable without
 hardware or real waiting.
 
+Two rules stack. `min_interval_s` is a global floor binding every trigger, and
+each trigger additionally throttles its own kind. The global rule is what keeps
+the *combined* rate sane: three triggers each obeying only their own throttle
+will happily take turns and emit far more often than any of them permits.
+
 The gamepad rule is a *leading-edge throttle*, not a debounce: gameplay activity
 is near-continuous, so a debounce would either fire late or starve frames
 entirely. The first frame of a burst is the informative one.
@@ -44,15 +49,20 @@ class TriggerPolicy:
         """Which trigger, if any, wants a frame right now."""
         now = self.clock() if now is None else now
 
+        # The global floor is checked first and binds every trigger, speech
+        # included. Per-trigger throttles govern only their own kind, so
+        # anything exempted here raises the combined rate for free.
+        if self._last_emit is not None and now - self._last_emit < self.cfg.min_interval_s:
+            # Consume pending hints rather than queueing them, so a burst
+            # cannot produce a ghost frame long after the fact.
+            self._speech_pending = False
+            self._gamepad_pending = False
+            return None
+
         if self._speech_pending:
             self._speech_pending = False
             if self.cfg.on_speech:
                 return "speech"
-
-        if self._last_emit is not None and now - self._last_emit < self.cfg.min_interval_s:
-            # Still consume the gamepad hint so it cannot fire late.
-            self._gamepad_pending = False
-            return None
 
         if self._gamepad_pending:
             self._gamepad_pending = False

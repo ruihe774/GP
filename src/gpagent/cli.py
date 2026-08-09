@@ -484,6 +484,16 @@ def cmd_inspect(args) -> int:
 
     if args.wav:
         _write_wavs(directory, events)
+    elif speech_ms:
+        rate = next(
+            (e.sample_rate for e in events if isinstance(e, SpeechSegment)), 24000
+        )
+        print(
+            f"\nspeech blobs are headerless PCM (s16le, mono, {rate} Hz)."
+            f"\n  gpagent inspect {directory} --wav      # write .wav files"
+            f"\n  ffplay -f s16le -ar {rate} -ac 1 {directory}/blobs/<seq>-speech.pcm"
+            f"\n  ffmpeg -f s16le -ar {rate} -ac 1 -i in.pcm out.wav"
+        )
     if args.contact_sheet:
         _write_contact_sheet(directory, events)
     return 0

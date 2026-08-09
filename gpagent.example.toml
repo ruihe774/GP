@@ -4,7 +4,9 @@
 
 [gamepad]
 window_ms = 500        # aggregation window
-sticks_mode = "intensity"   # off | intensity | full
+# off = movement never drives a screen capture (default);
+# intensity = sticks feed the activity scalar; full = also described in summaries
+sticks_mode = "off"
 deadzone = 0.12        # our own; device-reported `flat` is far too small
 tap_max_ms = 220       # longer presses count as holds, not taps
 
@@ -27,7 +29,10 @@ jpeg_quality = 75
 pipeline_fps = 2       # constant cheap rate into the latest-frame holder
 
 [triggers]
-min_interval_s = 1.5   # global floor between frames (speech bypasses it)
+# Global floor between frames, binding on EVERY trigger. This is the main cost
+# knob: the per-trigger throttles below only limit their own kind, so without
+# this the triggers take turns and the combined rate far exceeds any of them.
+min_interval_s = 5.0
 heartbeat_s = 10.0
 gamepad_intensity = 0.35
 gamepad_throttle_s = 2.0   # leading-edge throttle, not a debounce

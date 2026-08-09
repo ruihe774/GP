@@ -113,9 +113,12 @@ class TestSink:
 class TestConfig:
     def test_defaults_are_sane(self):
         cfg = CaptureConfig()
-        assert cfg.gamepad.sticks_mode == "intensity"
+        assert cfg.gamepad.sticks_mode == "off", "moving must not drive captures"
         assert cfg.audio.vad_backend == "silero"
         assert cfg.audio.out_rate == 24000, "the Realtime API's rate"
+        assert cfg.triggers.min_interval_s >= cfg.triggers.gamepad_throttle_s, (
+            "the global floor must dominate the per-trigger throttles"
+        )
 
     def test_overrides_apply(self):
         cfg = CaptureConfig()

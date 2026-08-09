@@ -21,7 +21,7 @@ class Clock:
 
 def make(**kwargs):
     base = dict(
-        min_interval_s=1.5,
+        min_interval_s=5.0,
         heartbeat_s=10.0,
         gamepad_intensity=0.35,
         gamepad_throttle_s=2.0,
@@ -54,9 +54,11 @@ class TestGamepadThrottle:
         assert emit(policy, clock) == "gamepad"
 
     def test_sustained_activity_is_rate_limited_not_suppressed(self):
-        policy, clock = make()
+        # Global floor set below the gamepad throttle so this isolates the
+        # per-trigger rule; the combined rate is covered in TestGlobalFloor.
+        policy, clock = make(min_interval_s=0.5, gamepad_throttle_s=2.0, heartbeat_s=1000)
         fired = []
-        for tick in range(40):  # 20 s of unbroken activity, sampled at 2 Hz
+        for _ in range(40):  # 20 s of unbroken activity, sampled at 2 Hz
             policy.on_intensity(0.9)
             trigger = emit(policy, clock)
             if trigger:
@@ -93,17 +95,53 @@ class TestGlobalFloor:
         assert policy.decide(scene_score=0.9) is None
 
     def test_after_the_floor_a_scene_change_fires(self):
-        policy, clock = make()
+        policy, clock = make(min_interval_s=5.0)
         emit(policy, clock, scene_score=1.0)
-        clock.advance(3.5)
+        clock.advance(6.0)
         assert policy.decide(scene_score=0.9) == "scene"
+
+    def test_combined_rate_is_bounded_when_everything_fires_at_once(self):
+        """The sess3 regression: three triggers taking turns produced 36
+        frames/min while each individually respected its own throttle."""
+        policy, clock = make(min_interval_s=5.0)
+        fired = []
+        for _ in range(240):  # 120 s sampled at 2 Hz, everything always active
+            policy.on_intensity(1.0)
+            policy.on_speech_start()
+            trigger = policy.decide(scene_score=1.0)
+            if trigger:
+                policy.mark_emitted(trigger)
+                fired.append(clock.now)
+            clock.advance(0.5)
+
+        gaps = [b - a for a, b in zip(fired, fired[1:])]
+        assert all(gap >= 5.0 - 1e-9 for gap in gaps), f"floor violated: {gaps}"
+        per_minute = len(fired) / 2.0
+        assert per_minute <= 12.5, f"{per_minute}/min still too many"
+
+    def test_floor_applies_across_different_trigger_kinds(self):
+        policy, clock = make(min_interval_s=5.0)
+        policy.on_intensity(1.0)
+        assert emit(policy, clock) == "gamepad"
+        clock.advance(1.0)
+        # A different kind of trigger must not slip under the shared floor.
+        policy.on_speech_start()
+        assert policy.decide(scene_score=1.0) is None
 
 
 class TestSpeech:
-    def test_speech_bypasses_the_floor(self):
-        policy, clock = make()
+    def test_speech_obeys_the_global_floor(self):
+        """Speech used to bypass the floor, which let frames land 0.5 s apart."""
+        policy, clock = make(min_interval_s=5.0)
         emit(policy, clock, scene_score=1.0)
-        clock.advance(0.1)
+        clock.advance(0.5)
+        policy.on_speech_start()
+        assert policy.decide(scene_score=0.0) is None
+
+    def test_speech_fires_once_the_floor_clears(self):
+        policy, clock = make(min_interval_s=5.0)
+        emit(policy, clock, scene_score=1.0)
+        clock.advance(6.0)
         policy.on_speech_start()
         assert policy.decide(scene_score=0.0) == "speech"
 
@@ -115,10 +153,9 @@ class TestSpeech:
 
     def test_speech_can_be_disabled(self):
         policy, clock = make(on_speech=False)
-        emit(policy, clock, scene_score=1.0)
-        clock.advance(0.1)
+        clock.advance(100)
         policy.on_speech_start()
-        assert policy.decide(scene_score=0.0) is None
+        assert policy.decide(scene_score=0.0) != "speech"
 
 
 class TestHeartbeat:
@@ -151,7 +188,9 @@ class TestSceneChange:
         assert policy.decide(scene_score=0.02) is None
 
     def test_scene_throttle_applies(self):
-        policy, clock = make(scene_threshold=0.06, heartbeat_s=1000)
+        policy, clock = make(
+            min_interval_s=0.5, scene_threshold=0.06, scene_throttle_s=3.0, heartbeat_s=1000
+        )
         emit(policy, clock, scene_score=1.0)
         clock.advance(2.0)
         assert policy.decide(scene_score=0.5) is None  # inside scene throttle

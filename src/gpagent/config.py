@@ -37,9 +37,10 @@ class GamepadConfig:
     trigger_full: float = 0.60
     #: max press duration still counted as a tap rather than a hold
     tap_max_ms: int = 220
-    #: "off" ignores sticks; "intensity" feeds the scalar only (default);
+    #: "off" ignores sticks entirely (default), so simply moving around never
+    #: drives a screen capture; "intensity" feeds the activity scalar only;
     #: "full" also describes direction/magnitude in the summary
-    sticks_mode: SticksMode = "intensity"
+    sticks_mode: SticksMode = "off"
     #: rescan interval when the netlink hotplug socket is unavailable
     rescan_s: float = 2.0
 
@@ -95,15 +96,19 @@ class ScreenConfig:
 
 @dataclass
 class TriggerConfig:
-    #: no two frames closer than this, except speech
-    min_interval_s: float = 1.5
+    #: Global floor between frames, binding on *every* trigger. Per-trigger
+    #: throttles only limit their own kind, so without a global rule the
+    #: triggers take turns and the combined rate is far higher than any one of
+    #: them allows -- measured at 36 frames/min with a 1.5 s floor.
+    min_interval_s: float = 5.0
     heartbeat_s: float = 10.0
     gamepad_intensity: float = 0.35
     #: leading-edge throttle: fire at once, then at most once per interval
     gamepad_throttle_s: float = 2.0
     scene_threshold: float = 0.06
     scene_throttle_s: float = 3.0
-    #: speech-start frames bypass min_interval_s
+    #: whether a speech onset asks for a frame at all (still subject to the
+    #: global floor)
     on_speech: bool = True
     #: drop frames too similar to the last emitted one, whatever the trigger
     dedup_threshold: float = 0.01
