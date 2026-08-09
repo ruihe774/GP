@@ -87,6 +87,10 @@ class ScreenConfig:
     cursor_mode: int = 2  # 1=hidden 2=embedded 4=metadata
     source_types: int = 3  # 1=monitor 2=window (bitmask)
     restore_token_path: str | None = None
+    #: Ignore the cached restore token and show the portal picker again, so a
+    #: different monitor or window can be chosen. The new choice is then saved
+    #: and reused by later runs.
+    reselect_source: bool = False
 
 
 @dataclass

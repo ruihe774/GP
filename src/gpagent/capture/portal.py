@@ -113,9 +113,15 @@ def open_screencast(
     multiple: bool = False,
     token_path: Path | None = None,
     timeout_s: float = 120.0,
+    use_saved_token: bool = True,
 ) -> ScreenCastSession:
-    """Run the full portal handshake. Blocking; call from a worker thread."""
+    """Run the full portal handshake. Blocking; call from a worker thread.
+
+    With `use_saved_token=False` the cached restore token is ignored so the
+    portal shows its picker again; whatever is chosen is then saved as usual.
+    """
     token_path = token_path or default_token_path()
+    saved = _load_token(token_path) if use_saved_token else None
     result: dict[str, Any] = {}
     error: list[BaseException] = []
 
@@ -127,7 +133,7 @@ def open_screencast(
                     cursor_mode=cursor_mode,
                     persist_mode=persist_mode,
                     multiple=multiple,
-                    restore_token=_load_token(token_path),
+                    restore_token=saved,
                 )
             )
         except BaseException as exc:  # surfaced to the caller below

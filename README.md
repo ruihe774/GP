@@ -56,6 +56,18 @@ First `record` raises a portal permission dialog. Approve it once — the
 `restore_token` is cached in `~/.config/gpagent/screencast.json` and later runs
 are silent.
 
+To capture something else — a different monitor, or one window instead of the
+whole screen — force the picker back up:
+
+```bash
+gpagent record --pick-screen        # ignore the cached choice and ask again
+```
+
+Whatever you pick is saved and reused by subsequent runs, so this is only needed
+when the target changes. Note the dialog blocks *only* the screen source; the
+gamepad and microphone start recording immediately, so answer it promptly or the
+first stretch of the session will have no frames.
+
 Tuning without editing files:
 
 ```bash

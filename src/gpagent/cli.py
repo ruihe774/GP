@@ -65,6 +65,8 @@ def _build_config(args) -> CaptureConfig:
     for section, flag in (("gamepad", "no_gamepad"), ("audio", "no_audio"), ("screen", "no_screen")):
         if getattr(args, flag, False):
             getattr(cfg, section).enabled = False
+    if getattr(args, "pick_screen", False):
+        cfg.screen.reselect_source = True
     return cfg
 
 
@@ -597,6 +599,11 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("-c", "--config", help="TOML config file")
     record.add_argument("--set", action="append", metavar="SECTION.KEY=VALUE", help="config override")
     record.add_argument("--inline", action="store_true", help="base64 blobs into the JSONL")
+    record.add_argument(
+        "--pick-screen",
+        action="store_true",
+        help="show the screen-capture picker instead of reusing the last choice",
+    )
     record.add_argument("--no-gamepad", action="store_true")
     record.add_argument("--no-audio", action="store_true")
     record.add_argument("--no-screen", action="store_true")

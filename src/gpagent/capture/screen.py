@@ -72,7 +72,10 @@ class ScreenSource:
         self._gst = Gst
 
         loop = asyncio.get_running_loop()
-        log.info("requesting screen capture from the portal (approve the dialog if it appears)")
+        if self.cfg.reselect_source:
+            log.info("requesting screen capture -- pick a source in the dialog")
+        else:
+            log.info("requesting screen capture from the portal (approve the dialog if it appears)")
         handshake_started = time.monotonic()
         self._session = await loop.run_in_executor(
             None,
@@ -84,6 +87,7 @@ class ScreenSource:
                     if self.cfg.restore_token_path
                     else None
                 ),
+                use_saved_token=not self.cfg.reselect_source,
             ),
         )
         self._handshake_s = time.monotonic() - handshake_started
