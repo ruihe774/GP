@@ -1,3 +1,8 @@
+# secrets -- Component B reads the OpenAI key from here
+.env
+.env.*
+!.env.example
+
 .venv/
 __pycache__/
 *.egg-info/
