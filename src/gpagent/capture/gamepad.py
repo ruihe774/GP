@@ -97,18 +97,49 @@ class Layout:
         }
 
 
-def resolve_layout(info: ev.DeviceInfo) -> Layout:
-    """Derive the control layout from probed capabilities."""
+def parse_button_map(mapping: dict[str, str] | None) -> dict[int, str]:
+    """Turn a configured {code: label} map into {kernel code: label}."""
+    if not mapping:
+        return {}
+    return {ev.key_code(code): str(label) for code, label in mapping.items()}
+
+
+def resolve_layout(info: ev.DeviceInfo, cfg: GamepadConfig | None = None) -> Layout:
+    """Derive the control layout from probed capabilities.
+
+    Labels are applied in increasing order of specificity: the Linux gamepad
+    spec, then built-in vendor quirks, then the user's global remap, then the
+    user's per-device remap. The last word belongs to whoever was most specific.
+    """
     labels = dict(_BASE_BUTTONS)
     labels.update(_HAPPY_DPAD)
     vendor = _VENDOR_OVERRIDES.get(info.vid)
     if vendor is not None:
         labels.update(vendor.get(info.pid) or vendor.get(None) or {})
 
+    if cfg is not None:
+        labels.update(parse_button_map(cfg.button_map))
+        key = f"{info.vid:04x}:{info.pid:04x}"
+        labels.update(parse_button_map(cfg.device_button_map.get(key)))
+
     buttons = {code: labels[code] for code in info.keys if code in labels}
     for code in info.keys:
         if code not in buttons and ev.BTN_JOYSTICK <= code < ev.BTN_GAMEPAD:
             buttons[code] = f"BTN{code - ev.BTN_JOYSTICK + 1}"
+
+    # Two buttons sharing a label is almost always a half-finished swap: the
+    # user remapped one direction and forgot the other.
+    seen: dict[str, int] = {}
+    for code, label in sorted(buttons.items()):
+        if label in seen:
+            log.warning(
+                "%s: %s and %s both report %r -- a remap swap needs both directions",
+                info.name,
+                ev.key_name(seen[label]),
+                ev.key_name(code),
+                label,
+            )
+        seen[label] = code
 
     left = (
         (ev.ABS_X, ev.ABS_Y)
@@ -527,7 +558,7 @@ class GamepadSource:
         except OSError as exc:
             log.warning("cannot open %s (%s): %s", info.path, info.name, exc)
             return
-        layout = resolve_layout(info)
+        layout = resolve_layout(info, self.cfg)
         discretizer = GamepadDiscretizer(info.device_id, layout, info, self.cfg)
         device = _Device(info, fd, discretizer)
         self._devices[info.device_id] = device

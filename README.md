@@ -174,6 +174,39 @@ obvious. On exit it lists any buttons you did not press, and anything the layout
 does not know about is flagged `UNMAPPED`. `--raw` additionally dumps every
 evdev event.
 
+### Fixing a wrong mapping
+
+Labels follow the Linux gamepad spec, but not every pad does. If a button comes
+out wrong, relabel it by kernel code — the code `monitor` prints is exactly what
+you write:
+
+```bash
+gpagent monitor --map BTN_NORTH=X --map BTN_WEST=Y   # try it
+gpagent record --map BTN_NORTH=X --map BTN_WEST=Y    # use it
+```
+
+Make it permanent in a config file, either for every pad:
+
+```toml
+[gamepad.button_map]
+BTN_NORTH = "X"
+BTN_WEST = "Y"
+```
+
+or for one device only, keyed `vid:pid` in lowercase hex (`gpagent devices`
+prints it), which is the better choice if you swap between controllers:
+
+```toml
+[gamepad.device_button_map."2dc8:200f"]
+BTN_NORTH = "X"
+BTN_WEST = "Y"
+```
+
+Precedence runs spec → built-in vendor quirks → `button_map` →
+`device_button_map`. `devices` and `monitor` mark relabelled entries
+`(remapped)`, an unknown button name is rejected before any device is opened,
+and remapping one half of a swap warns that two buttons now share a label.
+
 This is also the quickest way to spot **stick drift**: a worn stick resting near
 the deadzone shows up as repeated `stick` lines with no hands on the controller.
 Drift is one reason `sticks_mode` defaults to `off` — otherwise it would feed the

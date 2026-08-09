@@ -67,7 +67,34 @@ def _build_config(args) -> CaptureConfig:
             getattr(cfg, section).enabled = False
     if getattr(args, "pick_screen", False):
         cfg.screen.reselect_source = True
+
+    for item in getattr(args, "map", None) or []:
+        code, sep, label = item.partition("=")
+        if not sep or not label.strip():
+            raise SystemExit(f"--map expects CODE=LABEL, got {item!r}")
+        cfg.gamepad.button_map[code.strip()] = label.strip()
+
+    # Fail on a mistyped button now, rather than after opening devices.
+    from .capture.gamepad import parse_button_map
+
+    try:
+        parse_button_map(cfg.gamepad.button_map)
+        for device in cfg.gamepad.device_button_map.values():
+            parse_button_map(device)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
     return cfg
+
+
+def _add_mapping_args(parser) -> None:
+    parser.add_argument("-c", "--config", help="TOML config file")
+    parser.add_argument("--set", action="append", metavar="SECTION.KEY=VALUE")
+    parser.add_argument(
+        "--map",
+        action="append",
+        metavar="CODE=LABEL",
+        help="relabel a button, e.g. --map BTN_NORTH=X (repeatable)",
+    )
 
 
 # -- devices ---------------------------------------------------------------
@@ -77,6 +104,7 @@ def cmd_devices(args) -> int:
     from .capture import evdev_raw as ev
     from .capture.gamepad import resolve_layout
 
+    gamepad_cfg = _build_config(args).gamepad
     print("session")
     session_type = os.environ.get("XDG_SESSION_TYPE", "?")
     print(f"  type            {session_type}")
@@ -97,7 +125,7 @@ def cmd_devices(args) -> int:
         if not ev.is_gamepad(info):
             continue
         found += 1
-        layout = resolve_layout(info)
+        layout = resolve_layout(info, gamepad_cfg)
         print(f"  {path}  {info.name}")
         print(f"    id            {info.device_id}")
         print(f"    vid:pid       {info.vid:04x}:{info.pid:04x}")
@@ -254,7 +282,7 @@ def cmd_monitor(args) -> int:
     import time
 
     from .capture import evdev_raw as ev
-    from .capture.gamepad import GamepadDiscretizer, resolve_layout
+    from .capture.gamepad import parse_button_map, resolve_layout
 
     # Output is watched live and is often piped to a file; keep it unbuffered.
     sys.stdout.reconfigure(line_buffering=True)
@@ -267,11 +295,15 @@ def cmd_monitor(args) -> int:
 
     devices = []
     for info in pads:
-        layout = resolve_layout(info)
+        layout = resolve_layout(info, cfg)
+        remapped = set(parse_button_map(cfg.button_map)) | set(
+            parse_button_map(cfg.device_button_map.get(f"{info.vid:04x}:{info.pid:04x}"))
+        )
         print(f"{info.name}  [{info.vid:04x}:{info.pid:04x}]  {info.path}")
         print("  resolved button map (kernel code -> label used in events):")
         for code in sorted(layout.buttons):
-            print(f"    {ev.key_name(code):<24s} {code:#06x}  ->  {layout.buttons[code]}")
+            note = "  (remapped)" if code in remapped else ""
+            print(f"    {ev.key_name(code):<24s} {code:#06x}  ->  {layout.buttons[code]}{note}")
         for label, axis in sorted(layout.triggers.items()):
             print(f"    {ev.abs_name(axis):<24s} {axis:#06x}  ->  {label} (analog)")
         if layout.hat:
@@ -754,21 +786,20 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     devices = sub.add_parser("devices", help="enumerate inputs and verify permissions")
+    _add_mapping_args(devices)
     devices.set_defaults(func=cmd_devices)
 
     monitor = sub.add_parser(
         "monitor", help="live per-button view, to verify the mapping is right"
     )
     monitor.add_argument("--raw", action="store_true", help="also dump every evdev event")
-    monitor.add_argument("-c", "--config", help="TOML config file")
-    monitor.add_argument("--set", action="append", metavar="SECTION.KEY=VALUE")
+    _add_mapping_args(monitor)
     monitor.set_defaults(func=cmd_monitor)
 
     record = sub.add_parser("record", help="capture a session")
     record.add_argument("-o", "--output", help="session directory (default: session-<timestamp>)")
     record.add_argument("-d", "--duration", type=float, default=0.0, help="stop after N seconds")
-    record.add_argument("-c", "--config", help="TOML config file")
-    record.add_argument("--set", action="append", metavar="SECTION.KEY=VALUE", help="config override")
+    _add_mapping_args(record)
     record.add_argument("--inline", action="store_true", help="base64 blobs into the JSONL")
     record.add_argument(
         "--pick-screen",

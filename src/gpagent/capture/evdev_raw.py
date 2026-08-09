@@ -107,6 +107,37 @@ def abs_name(code: int) -> str:
     return ABS_CODE_NAMES.get(code, f"ABS_{code:#x}")
 
 
+_KEY_CODES_BY_NAME = {name: code for code, name in KEY_CODE_NAMES.items()}
+
+
+def key_code(name: str | int) -> int:
+    """Resolve a button to its kernel code.
+
+    Accepts what `monitor` prints -- a name like ``BTN_NORTH``, or a literal
+    like ``0x133`` / ``307`` -- so a remap can be written straight from the
+    output that revealed the problem.
+    """
+    if isinstance(name, int):
+        return name
+    text = name.strip()
+    if not text:
+        raise ValueError("empty button code")
+    upper = text.upper()
+    if upper in _KEY_CODES_BY_NAME:
+        return _KEY_CODES_BY_NAME[upper]
+    if upper.startswith("BTN_TRIGGER_HAPPY"):
+        suffix = upper[len("BTN_TRIGGER_HAPPY") :]
+        if suffix.isdigit() and 1 <= int(suffix) <= 0x40:
+            return BTN_TRIGGER_HAPPY + int(suffix) - 1
+    try:
+        return int(text, 0)
+    except ValueError:
+        raise ValueError(
+            f"unknown button {name!r}; use a name like BTN_NORTH or a code like 0x133 "
+            f"(run `gpagent monitor` to see the codes your pad reports)"
+        ) from None
+
+
 #: struct input_event { struct timeval time; __u16 type; __u16 code; __s32 value; }
 _EVENT_FMT = "llHHi"
 EVENT_SIZE = struct.calcsize(_EVENT_FMT)  # 24 on 64-bit

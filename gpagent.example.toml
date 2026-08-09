@@ -10,6 +10,17 @@ sticks_mode = "off"
 deadzone = 0.12        # our own; device-reported `flat` is far too small
 tap_max_ms = 220       # longer presses count as holds, not taps
 
+# Relabel buttons on pads that do not follow the Linux gamepad spec. Keys are
+# kernel codes as printed by `gpagent monitor` (BTN_NORTH, or 0x133).
+# [gamepad.button_map]
+# BTN_NORTH = "X"
+# BTN_WEST = "Y"
+
+# The same, for one device only. Key is vid:pid from `gpagent devices`.
+# [gamepad.device_button_map."2dc8:200f"]
+# BTN_NORTH = "X"
+# BTN_WEST = "Y"
+
 [audio]
 vad_backend = "silero" # silero | webrtc
 vad_threshold = 0.5

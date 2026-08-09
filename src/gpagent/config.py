@@ -43,6 +43,13 @@ class GamepadConfig:
     sticks_mode: SticksMode = "off"
     #: rescan interval when the netlink hotplug socket is unavailable
     rescan_s: float = 2.0
+    #: Relabel buttons, for pads that do not follow the Linux gamepad spec.
+    #: Keys are kernel codes ("BTN_NORTH" or "0x133"), values are the label to
+    #: report. Applied to every pad, after the built-in vendor quirks.
+    button_map: dict[str, str] = field(default_factory=dict)
+    #: The same, restricted to one device, keyed "vid:pid" in lowercase hex
+    #: (e.g. "2dc8:200f"). Takes precedence over `button_map`.
+    device_button_map: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
 @dataclass
