@@ -7,6 +7,8 @@ __pycache__/
 # fetched at setup, not vendored
 models/*.onnx
 
-# recorded sessions
+# recorded sessions (default name plus whatever -o was pointed at)
 session-*/
+sess*/
 *.jsonl
+contact-sheet.png

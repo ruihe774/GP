@@ -52,6 +52,7 @@ class AudioSource:
         self._webrtc_voice = False
         self._voice_transitions = 0
         self._segments = 0
+        self._peak = 0.0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -108,15 +109,30 @@ class AudioSource:
             self._pipeline = None
 
     def describe(self) -> dict[str, Any]:
-        return {
+        import math
+
+        seg = self._segmenter
+        peak_dbfs = round(20 * math.log10(self._peak), 1) if self._peak > 1e-9 else -120.0
+        info: dict[str, Any] = {
             "vad_backend": self.cfg.vad_backend,
             "echo_cancel_active": self._aec_active,
+            "echo_suppression_level": self.cfg.echo_suppression_level,
             "reference": "default sink monitor (stream.capture.sink=true)",
             "capture": "default source",
             "out_rate": self.cfg.out_rate,
             "segments": self._segments,
+            "input_peak_dbfs": peak_dbfs,
             "voice_transitions": self._voice_transitions,
         }
+        if seg is not None:
+            info.update(
+                vad_windows=seg.windows,
+                vad_speech_windows=seg.speech_windows,
+                vad_max_probability=round(seg.max_probability, 3),
+                vad_threshold=self.cfg.vad_threshold,
+                segments_dropped_short=seg.dropped_short,
+            )
+        return info
 
     # -- pipeline ----------------------------------------------------------
 
@@ -213,9 +229,25 @@ class AudioSource:
             return Gst.FlowReturn.OK
         data = pull_bytes(sample)
         if data:
+            self._track_level(data)
             with self._lock:
                 self._segmenter.feed_out(data)
         return Gst.FlowReturn.OK
+
+    def _track_level(self, pcm: bytes) -> None:
+        """Running peak of what actually reaches the segmenter.
+
+        A dead microphone and a microphone the VAD simply never liked look the
+        same from the outside; this separates them.
+        """
+        import numpy as np
+
+        samples = np.frombuffer(pcm, dtype="<i2")
+        if not samples.size:
+            return
+        peak = float(np.abs(samples).max()) / 32768.0
+        if peak > self._peak:
+            self._peak = peak
 
     def _on_dsp_buffer(self, pad, info):
         Gst = self._gst

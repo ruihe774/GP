@@ -16,7 +16,10 @@ hangover_ms = 500      # audio kept after speech ends
 min_speech_ms = 250    # drops coughs and clicks
 echo_cancel = true     # reference is the default sink's monitor
 noise_suppression_level = "moderate"   # low | moderate | high | very-high
-echo_suppression_level = "high"        # raise if game audio leaks into segments
+# Leave at moderate. Higher levels "trade off double-talk performance", and
+# talking over game audio IS double-talk -- "high" suppresses you along with
+# the echo. Raise only if game audio leaks into captured segments.
+echo_suppression_level = "moderate"    # low | moderate | high
 
 [screen]
 long_edge = 1024       # 1280 for readable HUD text, 640 to save tokens

@@ -59,8 +59,11 @@ class AudioConfig:
     #: the canceller has to estimate it; both of these exist for that case.
     delay_agnostic: bool = True
     extended_filter: bool = True
-    #: "low" | "moderate" | "high"
-    echo_suppression_level: str = "high"
+    #: "low" | "moderate" | "high". Keep this at moderate: the docs note a
+    #: higher level "trades off double-talk performance", and talking over game
+    #: audio *is* double-talk, so "high" suppresses the player along with the
+    #: echo. Raise it only if game audio is leaking into segments.
+    echo_suppression_level: str = "moderate"
     high_pass_filter: bool = True
     #: "silero" (ONNX, accurate, ~2 MB model) or "webrtc" (webrtcdsp's built-in
     #: detector, zero extra cost but noticeably more permissive on game audio)

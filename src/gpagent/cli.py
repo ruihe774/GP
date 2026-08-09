@@ -317,6 +317,9 @@ async def _record(cfg: CaptureConfig, directory: Path, args) -> int:
         task.cancel()
 
     print("\nstopping...")
+    # Snapshot diagnostics before teardown: sources drop their device handles
+    # in stop(), which would otherwise report an empty, useless manifest.
+    devices = bus.describe()
     await bus.stop()
     with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
         await asyncio.wait_for(consumer, timeout=5)
@@ -332,13 +335,51 @@ async def _record(cfg: CaptureConfig, directory: Path, args) -> int:
             "started_at": started.isoformat(),
             "duration_s": round(duration, 2),
             "config": cfg.to_dict(),
-            "devices": bus.describe(),
+            "devices": devices,
             "dropped_events": bus.dropped,
         }
     )
     print(f"wrote {sum(sink.counts.values())} events to {directory}")
+    _warn_about_capture(devices, duration)
     print(f"inspect with: gpagent inspect {directory}")
     return 0
+
+
+def _warn_about_capture(devices: dict[str, Any], duration: float) -> None:
+    """Say plainly when a source produced nothing, and why."""
+    audio = devices.get("audio") or {}
+    screen = devices.get("screen") or {}
+    notes: list[str] = []
+
+    if audio and audio.get("segments") == 0:
+        peak = audio.get("input_peak_dbfs", -120.0)
+        best = audio.get("vad_max_probability", 0.0)
+        threshold = audio.get("vad_threshold", 0.5)
+        if peak <= -60.0:
+            notes.append(
+                f"no speech captured, and the microphone never rose above {peak:.0f} dBFS "
+                "-- check that the default source is a real microphone (gpagent devices)"
+            )
+        else:
+            notes.append(
+                f"no speech captured, though the microphone peaked at {peak:.0f} dBFS; "
+                f"the VAD topped out at {best:.2f} against a {threshold} threshold"
+            )
+
+    handshake = screen.get("portal_handshake_s") or 0.0
+    if handshake > 5.0:
+        notes.append(
+            f"the portal consent dialog took {handshake:.0f}s to answer, so the first "
+            f"{handshake:.0f}s of a {duration:.0f}s session has no screen frames"
+        )
+    if screen.get("stall_events"):
+        notes.append(
+            f"the compositor stopped delivering frames {screen['stall_events']} time(s) "
+            "-- a fullscreen game can suspend the screencast"
+        )
+
+    for note in notes:
+        print(f"  note: {note}")
 
 
 def _print_live(event) -> None:

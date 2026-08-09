@@ -16,6 +16,7 @@ import contextlib
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,9 @@ def _even(value: int) -> int:
 class ScreenSource:
     name = "screen"
 
+    #: warn if the compositor delivers nothing for this long
+    STALL_S = 5.0
+
     def __init__(self, cfg: ScreenConfig, triggers: TriggerConfig):
         self.cfg = cfg
         self.policy = TriggerPolicy(triggers)
@@ -54,6 +58,11 @@ class ScreenSource:
         self._task: asyncio.Task | None = None
         self._frames_seen = 0
         self._deduped = 0
+        self._handshake_s = 0.0
+        self._last_frame_at: float | None = None
+        self._stalled = False
+        self._stall_events = 0
+        self._starved_s = 0.0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -63,6 +72,8 @@ class ScreenSource:
         self._gst = Gst
 
         loop = asyncio.get_running_loop()
+        log.info("requesting screen capture from the portal (approve the dialog if it appears)")
+        handshake_started = time.monotonic()
         self._session = await loop.run_in_executor(
             None,
             lambda: open_screencast(
@@ -75,13 +86,24 @@ class ScreenSource:
                 ),
             ),
         )
+        self._handshake_s = time.monotonic() - handshake_started
         log.info(
-            "screencast: node=%s size=%sx%s restored=%s",
+            "screencast: node=%s size=%sx%s source_type=%s (portal took %.1fs)",
             self._session.node_id,
             self._session.width,
             self._session.height,
-            self._session.restore_token is not None,
+            self._session.source_type,
+            self._handshake_s,
         )
+        if self._handshake_s > 5.0:
+            # A pending consent dialog blocks only this source; the others have
+            # been recording all along, so the gap is easy to misread as "the
+            # screen capture is broken".
+            log.warning(
+                "portal consent took %.0fs -- the first %.0fs of screen capture was missed",
+                self._handshake_s,
+                self._handshake_s,
+            )
 
         self._pipeline = self._build_pipeline(self._session)
         self._pipeline.set_state(Gst.State.PLAYING)
@@ -110,12 +132,14 @@ class ScreenSource:
     def describe(self) -> dict[str, Any]:
         return {
             "session": self._session.describe() if self._session else None,
+            "portal_handshake_s": round(self._handshake_s, 1),
             "long_edge": self.cfg.long_edge,
             "jpeg_quality": self.cfg.jpeg_quality,
             "pipeline_fps": self.cfg.pipeline_fps,
             "frames_seen": self._frames_seen,
             "frames_emitted": sum(self.policy.counts.values()),
             "frames_deduped": self._deduped,
+            "stall_events": self._stall_events,
             "by_trigger": dict(self.policy.counts),
         }
 
@@ -147,7 +171,11 @@ class ScreenSource:
         fd = os.dup(session.fd)
         description = (
             f"pipewiresrc fd={fd} path={session.node_id} "
-            f"! videorate max-rate={self.cfg.pipeline_fps} drop-only=true "
+            # videorate's max-rate property does not limit a variable-framerate
+            # source (the portal negotiates framerate=0/1); it measured 21 fps
+            # against a requested 2. An explicit framerate capsfilter does work.
+            f"! videorate drop-only=true "
+            f"! video/x-raw,framerate={self.cfg.pipeline_fps}/1 "
             f"! videoconvert ! tee name=vt "
             f"vt. ! queue leaky=downstream max-size-buffers=2 "
             f"! videoscale add-borders=false ! {self._scale_caps(session)} "
@@ -180,6 +208,7 @@ class ScreenSource:
             with self._lock:
                 self._latest = (data, width if ok_w else 0, height if ok_h else 0)
                 self._frames_seen += 1
+                self._last_frame_at = time.monotonic()
         return Gst.FlowReturn.OK
 
     def _on_thumb(self, sink):
@@ -204,12 +233,37 @@ class ScreenSource:
             return 1.0
         return float(np.abs(thumb - self._last_sent_thumb).mean() / 255.0)
 
+    def _check_stall(self, started_at: float) -> None:
+        """Surface a compositor that has stopped producing frames.
+
+        A fullscreen game that takes over the display can leave the screencast
+        stream running but starved, which otherwise looks identical to working
+        capture: the last frame just keeps getting deduplicated.
+        """
+        now = time.monotonic()
+        last = self._last_frame_at or started_at
+        idle = now - last
+        if idle > self.STALL_S and not self._stalled:
+            self._stalled = True
+            self._stall_events += 1
+            log.warning(
+                "no screen frames for %.0fs -- the compositor has stopped "
+                "producing them (a fullscreen game can do this)",
+                idle,
+            )
+        elif idle <= self.STALL_S and self._stalled:
+            self._stalled = False
+            self._starved_s += idle
+            log.info("screen frames resumed after %.0fs", idle)
+
     async def _sample_loop(self) -> None:
         interval = 1.0 / max(1, self.cfg.pipeline_fps)
+        started_at = time.monotonic()
         while True:
             await asyncio.sleep(interval)
             if self._pipeline is not None:
                 drain_bus_errors(self._pipeline, "screen")
+            self._check_stall(started_at)
 
             with self._lock:
                 latest = self._latest

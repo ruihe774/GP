@@ -141,6 +141,27 @@ by hand:
 7. Unplug and replug the pad mid-session — disconnect/connect events, capture
    resumes.
 
+## Diagnosing a session that captured nothing
+
+`record` prints a `note:` line when a source produced nothing and says why, and
+`manifest.json` carries the same detail under `devices`:
+
+- `audio.input_peak_dbfs` — how loud the microphone actually got. Below about
+  −60 dBFS means the default source is not a live microphone.
+- `audio.vad_max_probability` vs `vad_threshold` — whether the VAD came close.
+  A live mic plus a max probability near 0 means the audio reaching the VAD did
+  not sound like speech; suspect the echo canceller.
+- `screen.portal_handshake_s` — an unanswered consent dialog blocks *only* the
+  screen source, so the other two keep recording and the result looks like
+  broken screen capture rather than a pending dialog.
+- `screen.stall_events` — the compositor stopped delivering frames.
+- `screen.frames_seen` vs `frames_emitted` vs `frames_deduped` — separates "no
+  frames arrived" from "frames arrived and the policy declined them".
+
+If speech goes missing while game audio is playing, the first thing to try is
+`--set audio.echo_cancel=false`. If speech then appears, the canceller was
+eating it and `echo_suppression_level` is the knob.
+
 ## Known gotchas
 
 - The portal tears down the ScreenCast session, and with it the PipeWire node,
@@ -155,3 +176,10 @@ by hand:
 - `Gst.DeviceMonitor` reports each device 2–3× across the pipewire/alsa/pulse
   providers, and a sink shares `node.name` with its own monitor — dedup on
   `(media.class, node.name)`.
+- `videorate max-rate=N` does **not** limit a portal screencast: the stream
+  negotiates `framerate=0/1` (variable) and a requested 2 fps measured 21 fps,
+  JPEG-encoding the whole way. An explicit `video/x-raw,framerate=N/1`
+  capsfilter after `videorate` is what actually throttles it.
+- `webrtcdsp echo-suppression-level=high` suppresses the *player* during
+  double-talk. Talking over game audio is double-talk by definition, so the
+  default is `moderate`.

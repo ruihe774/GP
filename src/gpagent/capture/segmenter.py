@@ -78,6 +78,13 @@ class SpeechSegmenter:
         #: set after a forced split so the next chunk resumes contiguously
         self._resume_at: int | None = None
 
+        # Diagnostics: without these, "no speech was captured" is impossible to
+        # tell apart from "the VAD never came close to firing".
+        self.windows = 0
+        self.speech_windows = 0
+        self.max_probability = 0.0
+        self.dropped_short = 0
+
         #: how much 24 kHz history to retain
         self._retain = (
             _ms_to_samples(cfg.max_segment_ms + cfg.preroll_ms + cfg.hangover_ms + 1000, cfg.out_rate)
@@ -109,6 +116,10 @@ class SpeechSegmenter:
         the caller holds the level between transitions and pushes it per buffer.
         """
         self._vad_pos += n_samples
+        self.windows += 1
+        self.max_probability = max(self.max_probability, probability)
+        if probability >= self.cfg.vad_threshold:
+            self.speech_windows += 1
         self._step(probability, self._vad_pos, n_samples)
 
     def feed_out(self, pcm: bytes) -> None:
@@ -174,6 +185,7 @@ class SpeechSegmenter:
         # A continuation is the tail of an utterance already in flight; the
         # min-speech filter exists to drop clicks, not to truncate speech.
         if not continuation and speech_samples < self._min_speech:
+            self.dropped_short += 1
             log.debug(
                 "dropping %d ms segment below min_speech",
                 _samples_to_ms(speech_samples, self.vad_rate),
