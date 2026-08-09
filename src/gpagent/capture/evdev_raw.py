@@ -56,6 +56,57 @@ BTN_TOOL_FINGER, BTN_TOUCH = 0x145, 0x14A
 BTN_TRIGGER_HAPPY = 0x2C0
 KEY_RECORD = 0x0A7
 
+#: Reverse lookups, for diagnostics that need to show the raw kernel code
+#: alongside the label we resolved it to.
+KEY_CODE_NAMES: dict[int, str] = {
+    BTN_MOUSE: "BTN_MOUSE",
+    BTN_JOYSTICK: "BTN_JOYSTICK",
+    BTN_SOUTH: "BTN_SOUTH",
+    BTN_EAST: "BTN_EAST",
+    BTN_C: "BTN_C",
+    BTN_NORTH: "BTN_NORTH",
+    BTN_WEST: "BTN_WEST",
+    BTN_Z: "BTN_Z",
+    BTN_TL: "BTN_TL",
+    BTN_TR: "BTN_TR",
+    BTN_TL2: "BTN_TL2",
+    BTN_TR2: "BTN_TR2",
+    BTN_SELECT: "BTN_SELECT",
+    BTN_START: "BTN_START",
+    BTN_MODE: "BTN_MODE",
+    BTN_THUMBL: "BTN_THUMBL",
+    BTN_THUMBR: "BTN_THUMBR",
+    BTN_TOUCH: "BTN_TOUCH",
+    BTN_TOOL_FINGER: "BTN_TOOL_FINGER",
+    KEY_RECORD: "KEY_RECORD",
+}
+
+ABS_CODE_NAMES: dict[int, str] = {
+    ABS_X: "ABS_X",
+    ABS_Y: "ABS_Y",
+    ABS_Z: "ABS_Z",
+    ABS_RX: "ABS_RX",
+    ABS_RY: "ABS_RY",
+    ABS_RZ: "ABS_RZ",
+    ABS_HAT0X: "ABS_HAT0X",
+    ABS_HAT0Y: "ABS_HAT0Y",
+    0x09: "ABS_GAS",
+    0x0A: "ABS_BRAKE",
+}
+
+
+def key_name(code: int) -> str:
+    if code in KEY_CODE_NAMES:
+        return KEY_CODE_NAMES[code]
+    if BTN_TRIGGER_HAPPY <= code < BTN_TRIGGER_HAPPY + 0x40:
+        return f"BTN_TRIGGER_HAPPY{code - BTN_TRIGGER_HAPPY + 1}"
+    return f"KEY_{code:#x}"
+
+
+def abs_name(code: int) -> str:
+    return ABS_CODE_NAMES.get(code, f"ABS_{code:#x}")
+
+
 #: struct input_event { struct timeval time; __u16 type; __u16 code; __s32 value; }
 _EVENT_FMT = "llHHi"
 EVENT_SIZE = struct.calcsize(_EVENT_FMT)  # 24 on 64-bit

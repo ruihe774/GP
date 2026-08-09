@@ -57,6 +57,29 @@ def test_device_id_distinguishes_two_identical_pads():
     assert a.device_id != b.device_id
 
 
+class TestCodeNames:
+    """`monitor` prints these beside the resolved label to verify the mapping."""
+
+    def test_face_buttons(self):
+        assert ev.key_name(ev.BTN_SOUTH) == "BTN_SOUTH"
+        assert ev.key_name(ev.BTN_NORTH) == "BTN_NORTH"
+        assert ev.key_name(ev.KEY_RECORD) == "KEY_RECORD"
+
+    def test_trigger_happy_range_is_expanded(self):
+        assert ev.key_name(ev.BTN_TRIGGER_HAPPY) == "BTN_TRIGGER_HAPPY1"
+        assert ev.key_name(ev.BTN_TRIGGER_HAPPY + 3) == "BTN_TRIGGER_HAPPY4"
+
+    def test_unknown_code_falls_back_to_hex(self):
+        # 0x1ff sits outside both the named table and the TRIGGER_HAPPY range.
+        assert ev.key_name(0x1FF) == "KEY_0x1ff"
+
+    def test_axis_names(self):
+        assert ev.abs_name(ev.ABS_Z) == "ABS_Z"
+        assert ev.abs_name(ev.ABS_HAT0X) == "ABS_HAT0X"
+        assert ev.abs_name(0x0A) == "ABS_BRAKE"
+        assert ev.abs_name(0x3F) == "ABS_0x3f"
+
+
 class TestLayoutResolution:
     def test_xpad_layout(self):
         layout = resolve_layout(make_gamepad())

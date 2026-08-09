@@ -46,6 +46,7 @@ curl -L -o models/silero_vad.onnx \
 
 ```bash
 gpagent devices                    # what was detected, and whether it is usable
+gpagent monitor                    # live per-button view, to check the mapping
 gpagent record -o sess -d 60       # capture a minute
 gpagent inspect sess               # timeline, stats, estimated cost
 gpagent inspect sess --wav --contact-sheet   # listen to it, look at it
@@ -152,6 +153,31 @@ by hand:
 6. Re-run `record` — no portal dialog (restore token working).
 7. Unplug and replug the pad mid-session — disconnect/connect events, capture
    resumes.
+
+## Checking the button mapping
+
+`gpagent monitor` prints the resolved layout, then one line per input as you
+press things — using the same `resolve_layout` the discretizer uses, so what it
+shows is what events will say:
+
+```
+    BTN_SOUTH                0x0130  ->  A
+    BTN_NORTH                0x0133  ->  Y     <- note: NORTH is Y, WEST is X
+    ABS_Z                    0x0002  ->  LT (analog)
+
+      3.18  press     LB       BTN_TL 0x0136
+      3.35  release   LB       held 176 ms -> tap
+```
+
+Each line carries the kernel code next to the label, so a mis-mapped pad is
+obvious. On exit it lists any buttons you did not press, and anything the layout
+does not know about is flagged `UNMAPPED`. `--raw` additionally dumps every
+evdev event.
+
+This is also the quickest way to spot **stick drift**: a worn stick resting near
+the deadzone shows up as repeated `stick` lines with no hands on the controller.
+Drift is one reason `sticks_mode` defaults to `off` — otherwise it would feed the
+activity scalar and quietly pull screen captures while the player sits still.
 
 ## Listening to captured speech
 

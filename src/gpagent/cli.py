@@ -245,6 +245,159 @@ def _print_portal() -> None:
     print(f"  token cache     {token} ({'present' if token.exists() else 'absent'})")
 
 
+# -- monitor ---------------------------------------------------------------
+
+
+def cmd_monitor(args) -> int:
+    """Live per-input view, for checking that buttons map to the right labels."""
+    import select
+    import time
+
+    from .capture import evdev_raw as ev
+    from .capture.gamepad import GamepadDiscretizer, resolve_layout
+
+    # Output is watched live and is often piped to a file; keep it unbuffered.
+    sys.stdout.reconfigure(line_buffering=True)
+
+    cfg = _build_config(args).gamepad
+    pads = ev.find_gamepads()
+    if not pads:
+        print("no gamepad detected (run `gpagent devices`)", file=sys.stderr)
+        return 1
+
+    devices = []
+    for info in pads:
+        layout = resolve_layout(info)
+        print(f"{info.name}  [{info.vid:04x}:{info.pid:04x}]  {info.path}")
+        print("  resolved button map (kernel code -> label used in events):")
+        for code in sorted(layout.buttons):
+            print(f"    {ev.key_name(code):<24s} {code:#06x}  ->  {layout.buttons[code]}")
+        for label, axis in sorted(layout.triggers.items()):
+            print(f"    {ev.abs_name(axis):<24s} {axis:#06x}  ->  {label} (analog)")
+        if layout.hat:
+            print(f"    {ev.abs_name(layout.hat[0])}/{ev.abs_name(layout.hat[1])}       ->  dpad")
+        try:
+            devices.append((info, layout, ev.open_device(info.path)))
+        except OSError as exc:
+            print(f"  cannot open: {exc}", file=sys.stderr)
+
+    if not devices:
+        return 1
+
+    print("\npress buttons; Ctrl-C to stop\n")
+    print(f"  {'time':>8s}  {'event':<9s} {'label':<8s} {'detail'}")
+
+    down: dict[tuple[int, int], float] = {}
+    state: dict[tuple[int, int], str] = {}
+    seen: set[str] = set()
+    start = time.monotonic()
+    fds = [fd for _, _, fd in devices]
+
+    try:
+        while True:
+            ready, _, _ = select.select(fds, [], [], 0.2)
+            now = time.monotonic()
+            for info, layout, fd in devices:
+                if fd not in ready:
+                    continue
+                # A throwaway discretizer gives the same bucketing the real
+                # pipeline uses, so what is printed is what events will say.
+                for raw in ev.read_events(fd):
+                    _print_input(raw, info, layout, cfg, now - start, down, state, seen, args.raw)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for _, _, fd in devices:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+    print(f"\nbuttons seen: {' '.join(sorted(seen)) or 'none'}")
+    all_labels = {label for _, layout, _ in devices for label in layout.buttons.values()}
+    missing = sorted(all_labels - seen)
+    if missing:
+        print(f"not pressed:  {' '.join(missing)}")
+    return 0
+
+
+def _print_input(raw, info, layout, cfg, elapsed, down, state, seen, show_raw) -> None:
+    from .capture import evdev_raw as ev
+
+    key = (id(info), raw.code)
+    if show_raw and raw.type != ev.EV_SYN:
+        kind = {ev.EV_KEY: "KEY", ev.EV_ABS: "ABS"}.get(raw.type, str(raw.type))
+        print(f"  {elapsed:8.2f}  raw       {kind:<8s} code={raw.code:#06x} value={raw.value}")
+
+    if raw.type == ev.EV_KEY:
+        label = layout.buttons.get(raw.code)
+        if label is None:
+            print(
+                f"  {elapsed:8.2f}  UNMAPPED  {'?':<8s} "
+                f"{ev.key_name(raw.code)} {raw.code:#06x} value={raw.value}"
+            )
+            return
+        if raw.value == 1:
+            down[key] = elapsed
+            seen.add(label)
+            print(
+                f"  {elapsed:8.2f}  press     {label:<8s} "
+                f"{ev.key_name(raw.code)} {raw.code:#06x}"
+            )
+        elif raw.value == 0:
+            held = (elapsed - down.pop(key, elapsed)) * 1000.0
+            kind = "tap" if held <= cfg.tap_max_ms else "hold"
+            print(f"  {elapsed:8.2f}  release   {label:<8s} held {held:.0f} ms -> {kind}")
+        return
+
+    if raw.type != ev.EV_ABS:
+        return
+
+    absinfo = info.absinfo.get(raw.code)
+    value = absinfo.normalize(raw.value) if absinfo else 0.0
+
+    for label, axis in layout.triggers.items():
+        if axis == raw.code:
+            bucket = (
+                "idle" if value < cfg.trigger_light
+                else "full" if value >= cfg.trigger_full
+                else "light"
+            )
+            if state.get(key) != bucket:
+                state[key] = bucket
+                seen.add(label)
+                print(
+                    f"  {elapsed:8.2f}  trigger   {label:<8s} {bucket:<5s} "
+                    f"({ev.abs_name(raw.code)} raw={raw.value} -> {value:.2f})"
+                )
+            return
+
+    if layout.hat and raw.code in layout.hat:
+        axis = "x" if raw.code == layout.hat[0] else "y"
+        if state.get(key) != str(raw.value):
+            state[key] = str(raw.value)
+            if raw.value:
+                name = {("x", -1): "left", ("x", 1): "right", ("y", -1): "up", ("y", 1): "down"}
+                direction = name.get((axis, raw.value), str(raw.value))
+                seen.add(f"dpad-{direction}")
+                print(
+                    f"  {elapsed:8.2f}  dpad      {direction:<8s} "
+                    f"({ev.abs_name(raw.code)} = {raw.value})"
+                )
+        return
+
+    for name, axes in (("left", layout.left_stick), ("right", layout.right_stick)):
+        if axes and raw.code in axes:
+            magnitude = abs(value)
+            bucket = "idle" if magnitude < cfg.deadzone else "moved"
+            if state.get(key) != bucket:
+                state[key] = bucket
+                if bucket != "idle":
+                    print(
+                        f"  {elapsed:8.2f}  stick     {name:<8s} "
+                        f"{ev.abs_name(raw.code)} {value:+.2f}"
+                    )
+            return
+
+
 # -- record ----------------------------------------------------------------
 
 
@@ -602,6 +755,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     devices = sub.add_parser("devices", help="enumerate inputs and verify permissions")
     devices.set_defaults(func=cmd_devices)
+
+    monitor = sub.add_parser(
+        "monitor", help="live per-button view, to verify the mapping is right"
+    )
+    monitor.add_argument("--raw", action="store_true", help="also dump every evdev event")
+    monitor.add_argument("-c", "--config", help="TOML config file")
+    monitor.add_argument("--set", action="append", metavar="SECTION.KEY=VALUE")
+    monitor.set_defaults(func=cmd_monitor)
 
     record = sub.add_parser("record", help="capture a session")
     record.add_argument("-o", "--output", help="session directory (default: session-<timestamp>)")
