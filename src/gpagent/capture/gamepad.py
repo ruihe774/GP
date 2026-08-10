@@ -193,14 +193,19 @@ def _direction(x: float, y: float) -> str:
 # -- discretizer ----------------------------------------------------------
 
 
-@dataclass
-class _Press:
-    start: float
-    accounted: float  # ms already attributed to held_ms in earlier windows
-
-
 class GamepadDiscretizer:
-    """Folds raw events into fixed windows of semantic activity."""
+    """Folds raw events into fixed windows of semantic activity.
+
+    The summary is *edge triggered*. A hold is announced once when it begins and
+    once when it ends; the windows in between say nothing about it and are
+    suppressed entirely if nothing else happened. Repeating "held RT" twice a
+    second for a trigger the player is leaning on is pure token cost and reads
+    as noise to the model.
+
+    Level state still exists where it is useful: the structured `triggers` field
+    and `holding` list describe the present moment, and `intensity` stays
+    level-based because it drives screen-frame triggers.
+    """
 
     def __init__(self, device_id: str, layout: Layout, info: ev.DeviceInfo, cfg: GamepadConfig):
         self.device_id = device_id
@@ -208,14 +213,19 @@ class GamepadDiscretizer:
         self.info = info
         self.cfg = cfg
 
-        self._down: dict[str, _Press] = {}
+        self._down: dict[str, float] = {}  # name -> press start
         self._taps: dict[str, int] = {}
-        self._held_ms: dict[str, float] = {}
+        self._ended: dict[str, tuple[float, bool]] = {}  # name -> (total ms, announced)
+        self._hold_started: list[str] = []
+        self._announced_holds: set[str] = set()
+        self._announced_triggers: dict[str, str] = {}
+        self._trigger_full_since: dict[str, float] = {}
+        self._announced_dpad = "idle"
+        self._announced_sticks: dict[str, tuple[str, str]] = {}
         self._raw_axis: dict[int, int] = {}
         self._window_start: float | None = None
         self._was_active = False
         self._active_since: float | None = None
-        self._prev_discrete: tuple | None = None
         self._transitions = 0
         self._pending_flush = False
         #: intensity of the most recent window, whether or not an event was emitted
@@ -236,20 +246,21 @@ class GamepadDiscretizer:
         if name is None:
             return
         if event.value == 1:
-            self._down[name] = _Press(start=now, accounted=0.0)
+            self._down[name] = now
             self._transitions += 1
             self._pending_flush = True
         elif event.value == 0:
-            press = self._down.pop(name, None)
-            if press is None:
+            start = self._down.pop(name, None)
+            if start is None:
                 return
-            duration_ms = (now - press.start) * 1000.0
+            duration_ms = (now - start) * 1000.0
             if duration_ms <= self.cfg.tap_max_ms:
                 self._taps[name] = self._taps.get(name, 0) + 1
             else:
-                self._held_ms[name] = self._held_ms.get(name, 0.0) + max(
-                    0.0, duration_ms - press.accounted - self.cfg.tap_max_ms
-                )
+                announced = name in self._announced_holds
+                self._announced_holds.discard(name)
+                previous = self._ended.get(name, (0.0, announced))
+                self._ended[name] = (previous[0] + duration_ms, announced)
             self._transitions += 1
 
     def _feed_abs(self, event: ev.InputEvent, now: float) -> None:
@@ -295,6 +306,18 @@ class GamepadDiscretizer:
             return "full", value
         return "light", value
 
+    def _discrete_axes(self) -> tuple:
+        """The quantized analog state, used to count meaningful transitions."""
+        left = self._stick(self.layout.left_stick)[:2]
+        right = self._stick(self.layout.right_stick)[:2]
+        sticks = (left, right) if self.cfg.sticks_mode == "full" else ()
+        return (
+            self._trigger("LT")[0],
+            self._trigger("RT")[0],
+            self._dpad(),
+            sticks,
+        )
+
     def _dpad(self) -> str:
         if self.layout.hat is None:
             pressed = [n for n in ("DUp", "DDown", "DLeft", "DRight") if n in self._down]
@@ -307,31 +330,20 @@ class GamepadDiscretizer:
         x, y = self._raw_axis.get(hx, 0), self._raw_axis.get(hy, 0)
         return _direction(float(x), float(y)) if (x or y) else "idle"
 
-    def _discrete_axes(self) -> tuple:
-        """The quantized analog state; window flush compares against this."""
-        left = self._stick(self.layout.left_stick)[:2]
-        right = self._stick(self.layout.right_stick)[:2]
-        sticks = (left, right) if self.cfg.sticks_mode == "full" else ()
-        return (
-            self._trigger("LT")[0],
-            self._trigger("RT")[0],
-            self._dpad(),
-            sticks,
-        )
-
     # -- output -----------------------------------------------------------
 
     def flush(self, now: float) -> GamepadActivity | GamepadIdle | None:
         window_start = self._window_start if self._window_start is not None else now
         window_ms = max(1.0, (now - window_start) * 1000.0)
 
-        held: dict[str, float] = dict(self._held_ms)
-        for name, press in self._down.items():
-            total_ms = (now - press.start) * 1000.0
-            billable = max(0.0, total_ms - press.accounted - self.cfg.tap_max_ms)
-            if billable > 0:
-                held[name] = held.get(name, 0.0) + billable
-                press.accounted += billable
+        # A press crosses into "hold" the moment it outlives the tap threshold;
+        # announce it once, here, and stay quiet until it ends.
+        for name, start in self._down.items():
+            if name in self._announced_holds:
+                continue
+            if (now - start) * 1000.0 > self.cfg.tap_max_ms:
+                self._announced_holds.add(name)
+                self._hold_started.append(name)
 
         lt_bucket, lt_value = self._trigger("LT")
         rt_bucket, rt_value = self._trigger("RT")
@@ -339,32 +351,61 @@ class GamepadDiscretizer:
         left_dir, left_mag, left_value = self._stick(self.layout.left_stick)
         right_dir, right_mag, right_value = self._stick(self.layout.right_stick)
 
-        discrete = self._discrete_axes()
-        analog_idle = (
-            lt_bucket == "idle"
-            and rt_bucket == "idle"
-            and dpad == "idle"
-            and left_value == 0.0
-            and right_value == 0.0
-        )
-        has_events = bool(self._taps or held)
-        changed = self._prev_discrete is not None and discrete != self._prev_discrete
-        active = has_events or not analog_idle or changed
+        trigger_edges: list[tuple[str, str, float | None]] = []
+        for label, bucket in (("LT", lt_bucket), ("RT", rt_bucket)):
+            previous = self._announced_triggers.get(label, "idle")
+            if previous == bucket:
+                continue
+            self._announced_triggers[label] = bucket
+            duration = None
+            if bucket == "full":
+                self._trigger_full_since[label] = now
+            elif previous == "full":
+                started = self._trigger_full_since.pop(label, None)
+                if started is not None:
+                    duration = (now - started) * 1000.0
+            trigger_edges.append((label, bucket, duration))
 
-        self._prev_discrete = discrete
-        intensity = self._intensity(held, lt_value, rt_value, left_value, right_value, window_ms)
+        dpad_edge = dpad if dpad != self._announced_dpad else None
+        self._announced_dpad = dpad
+
+        stick_edges: list[tuple[str, str, str]] = []
+        if self.cfg.sticks_mode == "full":
+            for label, direction, magnitude in (
+                ("left", left_dir, left_mag),
+                ("right", right_dir, right_mag),
+            ):
+                if self._announced_sticks.get(label) != (direction, magnitude):
+                    self._announced_sticks[label] = (direction, magnitude)
+                    if direction != "idle":
+                        stick_edges.append((label, direction, magnitude))
+
+        holding = sorted(
+            self._announced_holds
+            | {label for label, bucket in self._announced_triggers.items() if bucket == "full"}
+        )
+
+        intensity = self._intensity(lt_value, rt_value, left_value, right_value)
         self.last_intensity = intensity
         apm = int(round(self._transitions * 60000.0 / window_ms))
 
         buttons = {
-            name: {"taps": self._taps.get(name, 0), "held_ms": int(round(held.get(name, 0.0)))}
-            for name in sorted(set(self._taps) | set(held))
+            name: {
+                "taps": self._taps.get(name, 0),
+                "held_ms": int(round(self._ended.get(name, (0.0, False))[0])),
+            }
+            for name in sorted(set(self._taps) | set(self._ended))
         }
-        summary = self._summarize(buttons, lt_bucket, rt_bucket, dpad, left_dir, left_mag, right_dir, right_mag)
+        summary = self._summarize(trigger_edges, dpad_edge, stick_edges)
 
         self._reset_window(now)
 
-        if not active:
+        # Edge-triggered means an ongoing hold contributes nothing to say. The
+        # controller is still active, but there is no news.
+        has_news = bool(buttons or summary)
+        still_active = bool(self._down) or holding or dpad != "idle" or left_value or right_value
+
+        if not has_news and not still_active:
             if self._was_active:
                 self._was_active = False
                 active_ms = int(round((now - (self._active_since or now)) * 1000.0))
@@ -376,11 +417,7 @@ class GamepadDiscretizer:
             self._was_active = True
             self._active_since = window_start
 
-        # In "intensity" mode a bare stick push produces no describable content.
-        # It still counts as activity (and still drives frame triggers via
-        # last_intensity), but emitting an empty summary would cost tokens for
-        # nothing, so the event itself is suppressed.
-        if not buttons and not summary:
+        if not has_news:
             return None
 
         event = GamepadActivity(
@@ -389,6 +426,7 @@ class GamepadDiscretizer:
             buttons=buttons,
             triggers={"LT": lt_bucket, "RT": rt_bucket},
             dpad=dpad,
+            holding=holding,
             intensity=round(intensity, 3),
             apm=apm,
             summary=summary,
@@ -400,16 +438,11 @@ class GamepadDiscretizer:
             }
         return event
 
-    def _intensity(
-        self,
-        held: dict[str, float],
-        lt: float,
-        rt: float,
-        left: float,
-        right: float,
-        window_ms: float,
-    ) -> float:
-        actions = sum(self._taps.values()) + len(held)
+    def _intensity(self, lt: float, rt: float, left: float, right: float) -> float:
+        # Level-based on purpose: this drives screen-frame triggers, so a button
+        # the player is holding down should keep counting even though the
+        # summary has already said its piece.
+        actions = sum(self._taps.values()) + len(self._down) + len(self._ended)
         button_part = min(1.0, actions / 5.0)
         trigger_part = max(lt, rt)
         # Sticks feed intensity even in "intensity" mode -- that is the point of
@@ -419,39 +452,39 @@ class GamepadDiscretizer:
 
     def _summarize(
         self,
-        buttons: dict[str, dict[str, int]],
-        lt: str,
-        rt: str,
-        dpad: str,
-        left_dir: str,
-        left_mag: str,
-        right_dir: str,
-        right_mag: str,
+        trigger_edges: list[tuple[str, str, float | None]],
+        dpad_edge: str | None,
+        stick_edges: list[tuple[str, str, str]],
     ) -> str:
+        """Describe only what changed this window."""
         parts: list[str] = []
-        for label, bucket in (("LT", lt), ("RT", rt)):
+
+        for name in self._hold_started:
+            parts.append(f"holding {name}")
+        for label, bucket, duration_ms in trigger_edges:
             if bucket == "full":
-                parts.append(f"held {label}")
-            elif bucket in ("mid", "light"):
+                parts.append(f"holding {label}")
+            elif duration_ms is not None:
+                parts.append(f"released {label} after {duration_ms / 1000.0:.1f}s")
+            elif bucket == "idle":
+                parts.append(f"released {label}")
+            else:
                 parts.append(f"{label} {bucket}")
 
-        held_buttons = [n for n, v in buttons.items() if v["held_ms"] > 0]
-        for name in held_buttons:
-            seconds = buttons[name]["held_ms"] / 1000.0
-            parts.append(f"held {name} ({seconds:.1f}s)")
+        if dpad_edge is not None and dpad_edge != "idle":
+            parts.append(f"dpad {dpad_edge}")
+        for label, direction, magnitude in stick_edges:
+            parts.append(f"{label} stick {magnitude} {direction}")
 
-        if dpad != "idle":
-            parts.append(f"dpad {dpad}")
+        for name, (total_ms, announced) in sorted(self._ended.items()):
+            seconds = total_ms / 1000.0
+            # "released" only makes sense if the hold was announced earlier;
+            # one that began and ended inside a single window never was.
+            verb = "released" if announced else "held"
+            preposition = "after" if announced else "for"
+            parts.append(f"{verb} {name} {preposition} {seconds:.1f}s")
 
-        if self.cfg.sticks_mode == "full":
-            for label, direction, magnitude in (
-                ("left", left_dir, left_mag),
-                ("right", right_dir, right_mag),
-            ):
-                if direction != "idle":
-                    parts.append(f"{label} stick {magnitude} {direction}")
-
-        tapped = [(n, v["taps"]) for n, v in buttons.items() if v["taps"] > 0]
+        tapped = [(n, c) for n, c in sorted(self._taps.items()) if c > 0]
         if tapped:
             rendered = ", ".join(f"{n} x{c}" if c > 1 else n for n, c in tapped)
             parts.append(f"tapped {rendered}")
@@ -460,7 +493,8 @@ class GamepadDiscretizer:
 
     def _reset_window(self, now: float) -> None:
         self._taps = {}
-        self._held_ms = {}
+        self._ended = {}
+        self._hold_started = []
         self._transitions = 0
         self._window_start = now
         self._pending_flush = False

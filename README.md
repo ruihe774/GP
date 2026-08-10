@@ -86,7 +86,8 @@ and `type`.
 ```json
 {"t":12.48,"seq":41,"type":"gamepad.activity","device":"2dc8:200f:usb-…","window_ms":500,
  "buttons":{"A":{"taps":3,"held_ms":0}},"triggers":{"LT":"idle","RT":"full"},
- "dpad":"idle","intensity":0.72,"apm":84,"summary":"held RT, tapped A x3"}
+ "dpad":"idle","holding":["RT"],"intensity":0.72,"apm":84,
+ "summary":"holding RT, tapped A x3"}
 {"t":30.10,"seq":88,"type":"speech.segment","blob":"blobs/000088-speech.pcm",
  "dur_ms":1840,"sample_rate":24000,"encoding":"pcm_s16le","rms_dbfs":-22.4}
 {"t":12.50,"seq":42,"type":"screen.frame","blob":"blobs/000042-frame.jpg",
@@ -98,6 +99,28 @@ structured fields are there for policy and debugging.
 
 ## Design notes
 
+**Summaries are edge-triggered.** A hold is announced once when it starts and
+once when it ends; the windows between say nothing and are suppressed entirely
+if nothing else happened. Repeating `held RT (0.5s)` twice a second for a trigger
+the player is leaning on is pure cost and reads as noise:
+
+```
+   0.5s  holding RT                                     holding: RT
+   1.0s  tapped A                                       holding: RT
+   1.5s  tapped A                                       holding: RT
+   2.0s  holding LB                                     holding: LB,RT
+   2.5s  (suppressed - nothing new)
+   3.0s  released RT after 2.5s, released LB after 1.2s
+   3.5s  -> gamepad.idle
+```
+
+The `holding` field carries current state on any event that *is* emitted, so a
+reader always knows what is still down without the summary repeating it. A press
+that starts and ends inside one window reads `held A for 0.3s` instead, since it
+was never announced as ongoing. `intensity` deliberately stays level-based: it
+drives screen-frame triggers, so a held button must keep counting even while the
+summary is quiet.
+
 **Everything is discovered, nothing is named.** Gamepads are found by
 ioctl capability probe across all `/dev/input/event*` using udev's own heuristic
 (`ABS_X`+`ABS_Y` plus a `BTN_JOYSTICK`/`BTN_GAMEPAD`-range key, minus pointers
@@ -105,11 +128,13 @@ and touchpads), so a pad nobody has tested works. Audio leaves the PipeWire
 target unset so WirePlumber routes it — and re-routes it when you switch
 headsets. Screen geometry comes from whatever the portal negotiates.
 
-**Sticks are configurable and quiet by default.** `sticks_mode=intensity` (the
-default) lets stick displacement feed the scalar `intensity` that drives frame
-triggers, but never describes direction in the summary — it is mostly "the
-player is moving around" and it dominates event volume. `full` describes them;
-`off` ignores them. A window containing only stick motion emits no event at all.
+**Sticks are configurable and silent by default.** `sticks_mode=off` (the
+default) ignores them entirely, so simply moving around never drives a screen
+capture — which also makes a drifting stick harmless. `intensity` lets stick
+displacement feed the activity scalar without ever describing direction, since
+that is mostly "the player is moving around" and it dominates event volume.
+`full` describes direction and magnitude. Under `intensity`, a window containing
+only stick motion still emits no event at all.
 
 **The AEC reference is the whole system output**, captured from the default
 sink's monitor (`stream.capture.sink=true`), not just the agent's voice. The

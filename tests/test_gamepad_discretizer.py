@@ -44,30 +44,102 @@ class TestButtons:
         out = disc.flush(0.5)
         assert out.summary == "tapped RB"
 
-    def test_long_press_is_a_hold_not_a_tap(self):
+    def test_press_and_release_inside_one_window_reports_duration(self):
         disc = make(tap_max_ms=220)
         disc.feed(event(ev.EV_KEY, ev.BTN_SOUTH, 1), 0.0)
         disc.feed(event(ev.EV_KEY, ev.BTN_SOUTH, 0), 0.9)
         out = disc.flush(1.0)
         assert out.buttons["A"]["taps"] == 0
-        assert out.buttons["A"]["held_ms"] == pytest.approx(680, abs=5)
-        assert "held A" in out.summary
-
-    def test_hold_spanning_windows_is_not_double_counted(self):
-        disc = make(tap_max_ms=200)
-        disc.feed(event(ev.EV_KEY, ev.BTN_SOUTH, 1), 0.0)
-        first = disc.flush(1.0)
-        second = disc.flush(2.0)
-        # 1.0s held minus the 0.2s tap grace, then a further full second.
-        assert first.buttons["A"]["held_ms"] == pytest.approx(800, abs=5)
-        assert second.buttons["A"]["held_ms"] == pytest.approx(1000, abs=5)
+        assert out.buttons["A"]["held_ms"] == pytest.approx(900, abs=5)
+        # Never announced as ongoing, so "held ... for", not "released ... after".
+        assert out.summary == "held A for 0.9s"
 
     def test_summary_orders_holds_before_taps(self):
         disc = make()
         disc.feed(event(ev.EV_ABS, ev.ABS_RZ, 1023), 0.0)
         tap(disc, ev.BTN_SOUTH, 0.1)
         out = disc.flush(0.5)
-        assert out.summary.index("held RT") < out.summary.index("tapped A")
+        assert out.summary.index("holding RT") < out.summary.index("tapped A")
+
+
+class TestEdgeTriggeredHolds:
+    """A hold is announced once when it starts and once when it ends.
+
+    Repeating "held RT (0.5s)" every window is token cost with no information.
+    """
+
+    def test_hold_is_announced_once_then_goes_quiet(self):
+        disc = make(tap_max_ms=200)
+        disc.feed(event(ev.EV_KEY, ev.BTN_SOUTH, 1), 0.0)
+
+        first = disc.flush(0.5)
+        assert first.summary == "holding A"
+
+        for at in (1.0, 1.5, 2.0, 2.5):
+            assert disc.flush(at) is None, "an ongoing hold has nothing new to say"
+
+    def test_release_reports_total_duration(self):
+        disc = make(tap_max_ms=200)
+        disc.feed(event(ev.EV_KEY, ev.BTN_SOUTH, 1), 0.0)
+        assert disc.flush(0.5).summary == "holding A"
+        assert disc.flush(1.0) is None
+        disc.feed(event(ev.EV_KEY, ev.BTN_SOUTH, 0), 1.2)
+        out = disc.flush(1.5)
+        assert out.summary == "released A after 1.2s"
+        assert out.buttons["A"]["held_ms"] == pytest.approx(1200, abs=5)
+
+    def test_trigger_hold_is_announced_once(self):
+        disc = make()
+        disc.feed(event(ev.EV_ABS, ev.ABS_RZ, 1023), 0.0)
+        assert disc.flush(0.5).summary == "holding RT"
+        assert disc.flush(1.0) is None
+        assert disc.flush(1.5) is None
+
+    def test_trigger_release_reports_how_long_it_was_held(self):
+        disc = make()
+        disc.feed(event(ev.EV_ABS, ev.ABS_RZ, 1023), 0.0)
+        disc.flush(0.5)   # the hold is timed from this announcement
+        assert disc.flush(1.0) is None
+        disc.feed(event(ev.EV_ABS, ev.ABS_RZ, 0), 1.4)
+        assert disc.flush(1.5).summary == "released RT after 1.0s"
+
+    def test_holding_field_reports_current_state(self):
+        disc = make()
+        disc.feed(event(ev.EV_ABS, ev.ABS_RZ, 1023), 0.0)
+        disc.feed(event(ev.EV_KEY, ev.BTN_TL, 1), 0.0)
+        first = disc.flush(0.5)
+        assert first.holding == ["LB", "RT"]
+        # A later window that has news carries the still-held state with it.
+        tap(disc, ev.BTN_SOUTH, 1.0)
+        later = disc.flush(1.5)
+        assert later.summary == "tapped A"
+        assert later.holding == ["LB", "RT"]
+
+    def test_dpad_direction_is_edge_triggered(self):
+        disc = make()
+        disc.feed(event(ev.EV_ABS, ev.ABS_HAT0Y, -1), 0.0)
+        assert disc.flush(0.5).summary == "dpad N"
+        assert disc.flush(1.0) is None, "still N -- no news"
+        disc.feed(event(ev.EV_ABS, ev.ABS_HAT0X, 1), 1.2)
+        assert disc.flush(1.5).summary == "dpad NE"
+
+    def test_intensity_stays_level_based_during_a_hold(self):
+        """Frame triggers must keep seeing the hold even while the summary is quiet."""
+        disc = make()
+        disc.feed(event(ev.EV_ABS, ev.ABS_RZ, 1023), 0.0)
+        disc.flush(0.5)
+        assert disc.flush(1.0) is None
+        assert disc.last_intensity > 0.0
+
+    def test_a_held_button_keeps_the_pad_out_of_idle(self):
+        disc = make(tap_max_ms=200)
+        disc.feed(event(ev.EV_KEY, ev.BTN_SOUTH, 1), 0.0)
+        disc.flush(0.5)
+        for at in (1.0, 1.5, 2.0):
+            assert disc.flush(at) is None
+        disc.feed(event(ev.EV_KEY, ev.BTN_SOUTH, 0), 2.2)
+        assert disc.flush(2.5).summary.startswith("released A")
+        assert isinstance(disc.flush(3.0), GamepadIdle), "idle only after the release"
 
 
 class TestTriggers:
@@ -83,10 +155,10 @@ class TestTriggers:
         else:
             assert out.triggers["RT"] == expected
 
-    def test_full_trigger_reads_as_held(self):
+    def test_full_trigger_reads_as_holding(self):
         disc = make()
         disc.feed(event(ev.EV_ABS, ev.ABS_RZ, 1023), 0.0)
-        assert disc.flush(0.5).summary == "held RT"
+        assert disc.flush(0.5).summary == "holding RT"
 
 
 class TestDpad:
@@ -117,11 +189,13 @@ class TestSuppression:
         assert isinstance(disc.flush(1.0), GamepadIdle)
         assert disc.flush(1.5) is None, "idle must not repeat"
 
-    def test_held_trigger_keeps_emitting(self):
+    def test_held_trigger_does_not_keep_emitting(self):
+        """Regression: this used to re-announce the hold twice a second."""
         disc = make()
         disc.feed(event(ev.EV_ABS, ev.ABS_RZ, 1023), 0.0)
         assert disc.flush(0.5).triggers["RT"] == "full"
-        assert disc.flush(1.0).triggers["RT"] == "full"
+        assert disc.flush(1.0) is None
+        assert disc.flush(1.5) is None
 
 
 class TestSticksModes:

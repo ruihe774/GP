@@ -115,6 +115,9 @@ class GamepadActivity(Event):
     buttons: dict[str, dict[str, int]] = field(default_factory=dict)
     triggers: dict[str, str] = field(default_factory=dict)
     dpad: str = "idle"
+    #: buttons and triggers currently held. The summary announces a hold once at
+    #: each edge, so this is how a reader knows what is still down.
+    holding: list[str] = field(default_factory=list)
     #: present only when sticks_mode == "full"
     sticks: dict[str, dict[str, Any]] | None = None
     intensity: float = 0.0
@@ -125,6 +128,8 @@ class GamepadActivity(Event):
         b = super().body()
         if b.get("sticks") is None:
             b.pop("sticks", None)
+        if not b.get("holding"):
+            b.pop("holding", None)
         return b
 
 
