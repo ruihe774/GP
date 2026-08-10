@@ -1,6 +1,11 @@
 # Example configuration. Every key is optional; unspecified sections keep
-# defaults. Use with:  gpagent record -c gpagent.example.toml
+# defaults, and every value shown here IS the default. Use with:
+#   gpagent record -c gpagent.example.toml
+#   gpagent commentate -c gpagent.example.toml
 # Anything here can also be set ad hoc:  --set screen.long_edge=1280
+#
+# [gamepad] [audio] [screen] [triggers] are Component A (capture).
+# [agent] [speak] are Component B (the commentary agent).
 
 [gamepad]
 window_ms = 500        # aggregation window
@@ -40,13 +45,101 @@ jpeg_quality = 75
 pipeline_fps = 2       # constant cheap rate into the latest-frame holder
 
 [triggers]
-# Global floor between frames, binding on EVERY trigger. This is the main cost
-# knob: the per-trigger throttles below only limit their own kind, so without
-# this the triggers take turns and the combined rate far exceeds any of them.
-min_interval_s = 5.0
-heartbeat_s = 10.0
-gamepad_intensity = 0.35
+# Global floor between frames, binding on EVERY trigger: the per-trigger
+# throttles below only limit their own kind, so without this the triggers take
+# turns and the combined rate far exceeds any of them.
+#
+# This is a FRESHNESS knob, not a cost knob. The agent sends at most one frame
+# per response and only if it is newer than the last one sent, so extra frames
+# cost local JPEG encoding and nothing on the bill. What this controls is how
+# stale the screenshot is when the agent comments.
+min_interval_s = 2.0
+heartbeat_s = 3.0          # the metronome; scene only fires on real transitions
+gamepad_intensity = 0.35   # a held trigger reads 0.44, three taps in a window 0.40
 gamepad_throttle_s = 2.0   # leading-edge throttle, not a debounce
-scene_threshold = 0.06
+scene_threshold = 0.06     # change since the PREVIOUS SAMPLE, not the last sent
 scene_throttle_s = 3.0
-dedup_threshold = 0.01     # drop frames too similar to the last one sent
+dedup_threshold = 0.01     # drop frames too similar to the last one SENT
+
+[agent]
+model = "gpt-realtime-2.1-mini"   # -mini for testing; gpt-realtime-2.1 for real
+# alloy | ash | ballad | cedar | coral | echo | marin | sage | shimmer | verse
+voice = "marin"
+
+# ISO-639-1 code the player speaks and the agent answers in, e.g. "ja".
+# Unset means the model follows whatever it hears. Passed to input
+# transcription (where it improves accuracy) and named in the instructions,
+# since the API has no output-language parameter.
+# language = "ja"
+
+# Replace the built-in persona (see agent/persona.py). `persona` wins over
+# `persona_file`. Write it in English whatever `language` is set to: it is
+# instructions to the model, not something anyone hears.
+# persona_file = "~/.config/gpagent/persona.txt"
+
+# high is ~765 tokens for a 1024x576 frame, low a flat 85. Measured over 151 s
+# of play, low saves about 15% of the *total* bill -- less than it looks, since
+# output audio is the largest line -- and remarks get vaguer, reacting to tone
+# rather than to the screen.
+image_detail = "high"
+max_image_age_s = 20.0        # never attach a screenshot older than this
+image_on_unprompted = true    # attach frames to remarks, not just replies
+max_output_tokens = 320       # backstop against rambling; hitting it truncates
+
+# Client-side context trimming, both OFF because it was measured and it lost:
+# the API re-bills the whole conversation each turn, so trimming looks like an
+# obvious win, but deleting an item invalidates the prompt-cache prefix behind
+# it and cached input is ~10x cheaper. Keeping every image billed 31008 image
+# tokens for $0.0204; keeping the last two billed 8721 for $0.0268. The
+# server's truncation_retention_ratio is the mechanism that belongs here.
+prune_after_s = 0.0           # 0 leaves it to the server
+keep_images = 0               # 0 for unlimited
+truncation_retention_ratio = 0.8
+
+transcribe_player = true      # readable logs, at a small per-minute cost
+transcribe_model = "gpt-4o-mini-transcribe"
+
+playback = true
+# Must not name a device: the echo canceller references the DEFAULT sink's
+# monitor, and playing anywhere else means the agent hears and answers itself.
+# pipewiresink is rank 0 with no ring buffer and garbles speech; autoaudiosink
+# picks pulsesink, which is built for streamed audio.
+audio_sink = "autoaudiosink"
+
+[speak]
+# When the agent is allowed to talk. Three reasons -- reply, react, ambient --
+# under one global cap. Per-reason rules alone compose badly and take turns.
+
+max_per_min = 6.0        # global ceiling over a sliding minute, binds EVERY reason
+min_gap_s = 8.0          # quiet floor after speaking; binds the unprompted reasons
+
+# `reply` is exempt from the quiet floor -- refusing to answer a direct question
+# is worse than being chatty -- so these two are what stop a player who talks
+# continuously from pulling back-to-back answers. Does not apply after a
+# barge-in: someone who cut you off is not asking you to pause first.
+reply_min_gap_s = 3.0    # measured from the END of the last response
+reply_ttl_s = 8.0        # answering nine seconds late is worse than not answering
+max_reply_audio_ms = 20000
+
+# react: something happened
+scene_threshold = 0.35
+intensity_threshold = 0.6
+burst_windows = 2        # consecutive hot windows before that counts as a burst
+event_cooldown_s = 30.0
+
+# ambient: nothing happened
+ambient_after_s = 75.0
+ambient_requires_activity = true   # do not chat at a paused game in an empty room
+ambient_idle_horizon_s = 45.0
+
+# Cooldowns adapt: every unprompted remark the player ignores multiplies them,
+# talking to the agent shrinks them. An agent being ignored gets quieter.
+backoff_factor = 1.6
+backoff_max = 3
+engagement_boost = 0.6
+engagement_window_s = 60.0
+
+# Deadlock guards. Both gates are absolute while set, so a gate that sticks is
+# a permanently mute agent -- the quietest possible bug to notice.
+speech_gate_timeout_s = 31.0     # a speech.start whose segment never arrives
+response_gate_timeout_s = 45.0   # a response that never completes

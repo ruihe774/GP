@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -150,6 +151,52 @@ class TestAgentResponseIsARecordableEvent:
             sink.write(self.event())
         blobs = [p.name for p in (tmp_path / "s" / "blobs").iterdir()]
         assert blobs == ["1000000-response.pcm"]
+
+
+class TestExampleConfig:
+    """`gpagent.example.toml` documents the defaults, so it must match them.
+
+    It went stale without anyone noticing: two whole sections were missing and
+    `[triggers]` still advertised numbers that had changed, which is worse than
+    no example at all.
+    """
+
+    PATH = Path(__file__).resolve().parent.parent / "gpagent.example.toml"
+
+    def loaded(self) -> dict:
+        import tomllib
+
+        with open(self.PATH, "rb") as fh:
+            return tomllib.load(fh)
+
+    def test_it_parses_and_every_key_is_real(self):
+        from gpagent.config import CaptureConfig
+
+        # from_dict raises on an unknown section or key, so this catches a
+        # renamed field as well as a typo.
+        CaptureConfig.from_dict(self.loaded())
+
+    def test_every_config_section_is_documented(self):
+        from dataclasses import fields
+
+        from gpagent.config import CaptureConfig
+
+        assert {f.name for f in fields(CaptureConfig)} <= set(self.loaded())
+
+    def test_every_documented_value_is_the_current_default(self):
+        from dataclasses import fields
+
+        from gpagent.config import CaptureConfig
+
+        defaults = CaptureConfig()
+        stale = []
+        for section, values in self.loaded().items():
+            target = getattr(defaults, section)
+            known = {f.name for f in fields(target)}
+            for key, value in values.items():
+                if key in known and getattr(target, key) != value:
+                    stale.append(f"{section}.{key}: file={value!r} code={getattr(target, key)!r}")
+        assert not stale, "gpagent.example.toml is out of date:\n  " + "\n  ".join(stale)
 
 
 class TestConfig:
