@@ -179,9 +179,18 @@ class ScreenSource:
         fd = os.dup(session.fd)
         description = (
             f"pipewiresrc fd={fd} path={session.node_id} "
-            # videorate's max-rate property does not limit a variable-framerate
-            # source (the portal negotiates framerate=0/1); it measured 21 fps
-            # against a requested 2. An explicit framerate capsfilter does work.
+            # `max-framerate` is negotiated with the compositor, so mutter never
+            # renders the frames we would only drop: it reads back one 14.7 MB
+            # frame per interval instead of one per repaint. Measured against
+            # gnome-shell 50.1 under constant damage, capture cost it 20% of a
+            # core unthrottled and ~2% at 2 fps. Downstream throttling cannot
+            # win this back -- by then the compositor has already paid.
+            f"! video/x-raw,max-framerate={self.cfg.pipeline_fps}/1 "
+            # A compositor that ignores max-framerate still has to be held to
+            # it. videorate's own max-rate property does not do this for a
+            # variable-framerate source (the portal negotiates framerate=0/1);
+            # it measured 21 fps against a requested 2. A framerate capsfilter
+            # after it does work.
             f"! videorate drop-only=true "
             f"! video/x-raw,framerate={self.cfg.pipeline_fps}/1 "
             f"! videoconvert ! tee name=vt "
