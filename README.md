@@ -165,27 +165,32 @@ when the assumption was that every captured frame gets sent. Component B sends a
 most one frame per response, and only if it is newer than the last one sent, so
 capturing more frames costs local JPEG encoding and nothing on the bill. What the
 floor actually controls is how stale the screenshot is at the moment the agent
-comments — at 5.0 that was 4.2 s on average and 8.0 s at worst, measured on
-sess5. It is now 2.0. Simulated against sess5's real signal timeline:
+comments — measured on sess5 at 5.0, that was **2.7 s on average and 4.6 s at
+worst**. It is now 2.0. `gpagent commentate` reports frame age at send time, so
+this is measurable per session rather than inferred.
 
-| `min_interval_s` | frames/min | mean age at send | worst |
-|---|---|---|---|
-| 5.0 | 7.1 | 4.17 s | 8.00 s |
-| 3.0 | 9.1 | 2.70 s | 4.37 s |
-| **2.0** | **9.5** | **2.53 s** | 5.50 s |
-| 1.0 | 11.1 | 2.20 s | 4.37 s |
+**Only two of the four triggers do anything.** sess5's 28 frames break down as
+25 `scene`, 3 `speech`, and **zero** `gamepad` and `heartbeat`:
 
-Below about 3 s the floor stops being the binding constraint — the per-trigger
-throttles take over — so going lower buys tenths of a second and encodes more.
-Two things that look like improvements and are not: lowering `heartbeat_s`
-*raised* the mean age (2.49 s → 2.74 s), because heartbeat frames compete for the
-same global floor as speech-triggered ones and crowd out the frames that land
-near a response; and relaxing `gamepad_throttle_s`/`scene_throttle_s` changed
-nothing at all, because on this recording neither trigger ever fires — every
-frame comes from `speech` or `heartbeat`.
+- `scene_score` compares against the last *sent* frame, not the previous frame,
+  so the longer the floor suppresses frames the more the screen diverges and the
+  more certain the next comparison is to clear the threshold. Every one of the 28
+  recorded scores was above it (min 0.069 against a 0.06 threshold, median
+  0.173). At these intervals it is not really a scene-change detector — it is a
+  "time has passed in a moving game" detector, and it fires first essentially
+  always, which is why `heartbeat` never gets a turn.
+- `gamepad` cannot realistically fire under the default config.
+  `intensity = 0.45·buttons + 0.30·triggers + 0.35·sticks`, and `sticks_mode`
+  defaults to `off`, so the stick term — the largest weight — is always zero.
+  Holding a trigger flat out yields 0.30, which is *below* the 0.35 threshold on
+  its own; buttons alone need four presses inside one 500 ms window. sess5 peaked
+  at 0.27 with a median of 0.09. Either lower `gamepad_intensity` to ~0.25 or
+  turn on `sticks_mode=intensity` if you want this trigger to participate.
 
-`gpagent commentate` reports the measured frame age at send time, so this is
-checkable on any session rather than inferred.
+So the two rules that actually bind are this floor and `scene_throttle_s` (3.0).
+At a 5.0 floor, the floor bound scene; at 2.0, scene's own throttle does, which
+is the intended effect — `scene_throttle_s` is the knob to reach for next if
+frames still aren't fresh enough.
 
 **VAD is swappable.** `silero` (default) is an ONNX model that rejects noise,
 tones and bass rumble at ≤0.003 against a 0.5 threshold. `webrtc` uses
