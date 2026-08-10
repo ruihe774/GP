@@ -67,6 +67,11 @@ model = "gpt-realtime-2.1-mini"   # -mini for testing; gpt-realtime-2.1 for real
 voice = "marin"
 voice_speed = 1.0          # playback rate; server clamps to [0.25, 1.5]
 
+# minimal | low | medium | high | xhigh. Only sent to reasoning-capable
+# Realtime models (the gpt-realtime-2 family, including gpt-realtime-2.1 and
+# -2.1-mini); unset omits the field and leaves it at the server default.
+# reasoning_effort = "medium"
+
 # ISO-639-1 code the player speaks and the agent answers in, e.g. "ja".
 # Unset means the model follows whatever it hears. Passed to input
 # transcription (where it improves accuracy) and named in the instructions,

@@ -198,29 +198,31 @@ class CommentaryAgent:
                 # such parameter and is handled in the instructions.
                 transcription["language"] = self.cfg.language
             audio_input["transcription"] = transcription
-        return {
-            "type": "session.update",
-            "session": {
-                "type": "realtime",
-                "output_modalities": ["audio"],
-                "instructions": instructions(self.cfg),
-                "truncation": {
-                    "type": "retention_ratio",
-                    "retention_ratio": self.cfg.truncation_retention_ratio,
-                },
-                "audio": {
-                    "input": audio_input,
-                    "output": {
-                        # `rate` is required here even though the SDK's TypedDict
-                        # marks it optional and the docs example omits it: the
-                        # server rejects the session without it.
-                        "format": {"type": "audio/pcm", "rate": SAMPLE_RATE},
-                        "voice": self.cfg.voice,
-                        "speed": self.cfg.voice_speed,
-                    },
+        session: dict[str, Any] = {
+            "type": "realtime",
+            "output_modalities": ["audio"],
+            "instructions": instructions(self.cfg),
+            "truncation": {
+                "type": "retention_ratio",
+                "retention_ratio": self.cfg.truncation_retention_ratio,
+            },
+            "audio": {
+                "input": audio_input,
+                "output": {
+                    # `rate` is required here even though the SDK's TypedDict
+                    # marks it optional and the docs example omits it: the
+                    # server rejects the session without it.
+                    "format": {"type": "audio/pcm", "rate": SAMPLE_RATE},
+                    "voice": self.cfg.voice,
+                    "speed": self.cfg.voice_speed,
                 },
             },
         }
+        if self.cfg.reasoning_effort is not None:
+            # Non-reasoning models (gpt-realtime, gpt-realtime-1.5) reject this
+            # field, so it's only sent when explicitly configured.
+            session["reasoning"] = {"effort": self.cfg.reasoning_effort}
+        return {"type": "session.update", "session": session}
 
     # -- capture events ----------------------------------------------------
 

@@ -17,6 +17,7 @@ from typing import Literal
 __all__ = ["AgentConfig", "SpeakConfig"]
 
 ImageDetail = Literal["auto", "low", "high"]
+ReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh"]
 
 
 @dataclass
@@ -33,6 +34,12 @@ class AgentConfig:
     #: override the built-in persona (see persona.py); `persona` wins over the file
     persona: str | None = None
     persona_file: str | None = None
+
+    #: reasoning effort for reasoning-capable Realtime models (the gpt-realtime-2
+    #: family, which includes gpt-realtime-2.1 and -2.1-mini). None omits the
+    #: `reasoning` block entirely and leaves it at the server's default -- older,
+    #: non-reasoning models (gpt-realtime, gpt-realtime-1.5) reject the field.
+    reasoning_effort: ReasoningEffort | None = None
 
     #: ISO-639-1 code the player speaks and the agent should answer in, e.g.
     #: "ja". None lets the model follow whatever it hears. Half of this is an
