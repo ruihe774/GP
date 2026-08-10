@@ -117,6 +117,21 @@ class PlaybackTimer:
         """Cut the utterance short. Returns how much of it was heard."""
         return self._end(self.played_ms(now))
 
+    def discard(self) -> None:
+        """Drop what is still on the clock without counting it as spoken.
+
+        Only the offline path needs this. `_finish_response` completes the
+        utterance and then, for a non-realtime player, calls `simulate()` to
+        re-arm the timer so the agent can still tell it is mid-sentence if the
+        player interrupts. Nothing cleared that before the next response, so
+        the next response's audio accumulated on top of it and a barge-in
+        truncated with a `heard_ms` spanning two utterances against only the
+        latest item id -- the server answers "Audio content of 7650ms is
+        already shorter than 12970ms" and the truncate is lost.
+        """
+        self._started = None
+        self._pushed_ms = 0.0
+
     def complete(self) -> float:
         """End the utterance normally: all of it was heard."""
         return self._end(self._pushed_ms)
@@ -160,6 +175,9 @@ class NullPlayer:
 
     def flush(self, now: float | None = None) -> float:
         return self.timer.reset(now)
+
+    def discard(self) -> None:
+        self.timer.discard()
 
     async def drain(self) -> float:
         # No waiting: a dry run at speed 0 must not spend real seconds
@@ -297,6 +315,12 @@ class AudioPlayer:
             self._src.send_event(Gst.Event.new_flush_start())
             self._src.send_event(Gst.Event.new_flush_stop(True))
         return heard
+
+    def discard(self) -> None:
+        # A realtime player is already clean here: `drain` completed the
+        # utterance and nothing re-armed the timer. Defined so both players
+        # answer the same calls.
+        self.timer.discard()
 
     async def drain(self) -> float:
         """Wait for queued audio to finish playing, then close the utterance."""

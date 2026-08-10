@@ -203,6 +203,7 @@ class CommentaryAgent:
             "type": "realtime",
             "output_modalities": ["audio"],
             "instructions": instructions(self.cfg),
+            "max_output_tokens": self.cfg.max_output_tokens,
             "truncation": {
                 "type": "retention_ratio",
                 "retention_ratio": self.cfg.truncation_retention_ratio,

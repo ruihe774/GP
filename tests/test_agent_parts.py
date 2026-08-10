@@ -101,6 +101,30 @@ class TestPlaybackTimer:
         timer.push(24000 * 2 * 4, now=100.0)
         assert timer.complete() == pytest.approx(4000.0)
 
+    def test_a_new_utterance_is_measured_on_its_own(self):
+        """Discard drops the last sentence off the clock without counting it.
+
+        Offline, `_finish_response` re-arms the timer with `simulate()` so the
+        agent can tell it is mid-sentence. Without a discard at the next turn,
+        the following utterance accumulated on top and a barge-in truncated
+        with a `heard_ms` covering both -- which the server rejects, so the
+        model never learns it was cut off.
+        """
+        timer = PlaybackTimer(lambda: 0.0)
+        timer.push(24000 * 2 * 4, now=100.0)  # last turn, still on the clock
+        timer.discard()
+        timer.push(24000 * 2, now=110.0)  # this turn: 1 s
+        assert timer.pushed_ms == pytest.approx(1000.0)
+        assert timer.reset(now=110.4) == pytest.approx(400.0)
+
+    def test_discarding_does_not_count_as_spoken(self):
+        timer = PlaybackTimer(lambda: 0.0)
+        timer.push(24000 * 2 * 4, now=100.0)
+        timer.complete()
+        timer.push(24000 * 2 * 4, now=104.0)  # the simulate() re-arm
+        timer.discard()
+        assert timer.total_spoken_ms == pytest.approx(4000.0)
+
     async def test_the_null_player_simulates_an_utterance_taking_time(self):
         clock = _Clock(100.0)
         player = NullPlayer(clock)
