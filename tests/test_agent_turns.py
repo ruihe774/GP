@@ -462,9 +462,67 @@ class TestRecording:
         said = [e for e in recorded if isinstance(e, AgentResponse)][0]
         assert 1.9 <= said.t <= 2.6, f"t={said.t} is not on the capture timeline"
 
+    async def test_a_backlogged_first_event_does_not_skew_the_timeline(self):
+        """Regression: sess6 recorded every response 3.5 s early.
+
+        The first event the agent sees comes out of the queue that built up
+        while `start()` was opening the realtime session, so its lag is the
+        startup delay and not the offset between the clocks. Calibrating on it
+        shifted the agent's whole half of the recording earlier than the
+        player's, which `inspect` showed as replies arriving before the
+        question they answered.
+        """
+        clock = ReplayClock(1000.0)
+        recorded = []
+        agent = CommentaryAgent(
+            make_config(), FakeTransport(), NullPlayer(clock),
+            clock=clock, recorder=recorded.append,
+        )
+        backlogged = pad("tapped A")
+        backlogged.t = 0.0
+        await agent.handle(backlogged, now=1003.5)  # 3.5 s late out of the queue
+
+        prompt = frame(score=1.0)
+        prompt.t = 10.0
+        clock.set(1010.0)
+        await agent.handle(prompt, now=1010.0)  # and everything after is prompt
+        await complete_response(agent)
+
+        said = [e for e in recorded if isinstance(e, AgentResponse)][0]
+        assert said.t == pytest.approx(10.0, abs=0.5), (
+            f"t={said.t}: the startup backlog leaked into the clock offset"
+        )
+
     async def test_recording_is_off_by_default(self, agent):
         await agent.handle(frame(score=1.0), now=100.0)
         await complete_response(agent)  # must not raise without a recorder
+
+
+class TestResponsesThatSayNothing:
+    """One reply in sess6 came back empty and nothing anywhere said why."""
+
+    async def test_a_non_completed_response_is_logged(self, agent):
+        await agent.handle(frame(score=1.0), now=100.0)
+        await agent.on_server_event(
+            {
+                "type": "response.done",
+                "response": {
+                    "status": "incomplete",
+                    "status_details": {"reason": "max_output_tokens"},
+                    "usage": {},
+                },
+            }
+        )
+        notes = [line for line in agent.lines if line.kind == "note"]
+        assert notes, "a response that said nothing must leave a trace"
+        assert "incomplete" in notes[0].text and "max_output_tokens" in notes[0].text
+
+    async def test_a_completed_response_is_not_annotated(self, agent):
+        await agent.handle(frame(score=1.0), now=100.0)
+        await agent.on_server_event(
+            {"type": "response.done", "response": {"status": "completed", "usage": {}}}
+        )
+        assert not [line for line in agent.lines if line.kind == "note"]
 
 
 class TestContextPruning:

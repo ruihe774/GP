@@ -133,6 +133,7 @@ class CommentaryAgent:
         #: clock() - event.t, so agent events land on the capture timeline.
         #: Live these are different bases (bus time vs time.monotonic); in
         #: deterministic replay they are the same and this is zero.
+        #: Estimated as the SMALLEST lag seen, not the first: see `handle`.
         self._t_offset: float | None = None
         #: agent events get their own seq range, well clear of capture's
         self._agent_seq = 1_000_000
@@ -221,8 +222,15 @@ class CommentaryAgent:
 
     async def handle(self, event: Event, now: float | None = None) -> None:
         now = self.clock() if now is None else now
-        if self._t_offset is None:
-            self._t_offset = now - event.t
+        # The two clocks differ by a constant plus however long this event sat
+        # in the queue, so the smallest lag ever seen is the best estimate of
+        # the constant. Taking the *first* sample instead put every recorded
+        # response 3.5 s early in a real session: the agent's first event came
+        # out of a backlog that built up while `start()` opened the realtime
+        # session, and every later event was handled promptly.
+        lag = now - event.t
+        if self._t_offset is None or lag < self._t_offset:
+            self._t_offset = lag
         if self._recorder is not None:
             self._recorder(event)
 
@@ -497,6 +505,15 @@ class CommentaryAgent:
             details = (response.get("usage") or {}).get("output_token_details") or {}
             spoken_ms = int(details.get("audio_tokens") or 0) * 50.0
         now = self.clock()
+        # A response can finish without having said anything -- cancelled,
+        # failed, or stopped at max_output_tokens. Without this the turn is
+        # recorded as a 0 ms response and the player's question just goes
+        # unanswered with nothing in the log to say why.
+        status = response.get("status")
+        if status and status != "completed":
+            detail = response.get("status_details") or {}
+            why = detail.get("reason") or (detail.get("error") or {}).get("message") or ""
+            self._emit(Line(now, "note", f"response {status}" + (f": {why}" if why else "")))
         end = now
         if not self.player.realtime:
             # Nothing waited for the audio, so the sentence ends in the future.

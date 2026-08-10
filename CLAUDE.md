@@ -142,7 +142,7 @@ Config via `--set key=value` (runtime) or TOML files (persistent).
 5. **Timestamps on time-format appsrc:** Buffers need explicit timestamps. Unstamped, sink renders them back-to-back against startup clock — 3 s of audio in 7 ms. `do-timestamp=true` doesn't fix it; it stamps on arrival, compressing the download window.
 6. **Base64 chunk alignment:** `response.output_audio.delta` chunks are base64 of arbitrary byte count. Odd-length pushed as-is shifts all following samples by a byte, rest is white noise.
 7. **Audio sink selection:** Output to default sink (component A's AEC reference). Target a specific device and agent hears itself, replies to itself. Use `autoaudiosink`, which selects `pulsesink` and re-routes with WirePlumber. Do NOT use `pipewiresink` (rank 0, plain GstBaseSink, garbled speech here even with identical buffers).
-8. **Clock mismatch:** Player timestamps (`event.t` from capture) and agent clock (`time.monotonic()`) are different. Mixing them makes frames look hours stale and agent silently blind.
+8. **Clock mismatch:** Player timestamps (`event.t` from capture) and agent clock (`time.monotonic()`) are different. Mixing them makes frames look hours stale and agent silently blind. The offset between them (`_t_offset`) is estimated as the **smallest** `now - event.t` ever seen, not the first: the first event comes out of a backlog built up while `start()` opened the realtime session, and calibrating on it recorded every response 3.5 s early in a real 39-minute session.
 9. **Response lifecycle timeouts:** "Player is talking" and "response in flight" are absolute gates. A stuck gate is permanent silence (quietest possible bug). Both timeout (`speech_start_timeout_s`, `response_timeout_s`).
 
 ## Cost Model

@@ -738,15 +738,25 @@ def _write_wavs(directory: Path, events: list) -> None:
     # A single file laid out on the session timeline, silence in the gaps, so
     # the exchange can be listened to as a conversation rather than as a pile
     # of clips in the wrong order.
+    #
+    # Both event types are stamped when they FINISH -- a speech segment when
+    # VAD closes it, a response when the server stops streaming -- so a clip
+    # starts `dur_ms` before its own `t`. Laying them out at `t` put every one
+    # of them a whole utterance late and made the two sides look interleaved
+    # when they were not.
     timed = [
         e for e in events
         if isinstance(e, (SpeechSegment, AgentResponse)) and e.data
     ]
     if timed:
-        end = max(e.t + len(e.data) / 2 / rate for e in timed)
+        def span(e) -> tuple[float, float]:
+            start = e.t - (e.dur_ms or 0) / 1000.0
+            return start, start + len(e.data) / 2 / e.sample_rate
+
+        end = max(span(e)[1] for e in timed)
         track = bytearray(int(end * rate) * 2 + 2)
         for event in timed:
-            at = int(event.t * rate) * 2
+            at = max(0, int(span(event)[0] * rate)) * 2
             track[at : at + len(event.data)] = event.data
         with wave.open(str(out / "conversation.wav"), "wb") as fh:
             fh.setnchannels(1)
@@ -955,6 +965,7 @@ def _print_line(line) -> None:
         "heard": "you ",
         "player": "mic ",
         "cut": "CUT ",
+        "note": "??  ",
         "error": "ERR ",
         "session": "--  ",
     }

@@ -153,6 +153,55 @@ class TestAgentResponseIsARecordableEvent:
         assert blobs == ["1000000-response.pcm"]
 
 
+class TestConversationTrack:
+    """`inspect --wav` lays both voices out on one timeline; it has to be the
+    timeline they actually happened on.
+
+    Both event types are stamped when they *finish*, so laying a clip down at
+    its own `t` puts it a whole utterance late -- enough, in a real session,
+    to make the agent look like it was talking over the player.
+    """
+
+    def track(self, tmp_path, events):
+        import wave
+
+        from gpagent.cli import _write_wavs
+
+        _write_wavs(tmp_path, events)
+        with wave.open(str(tmp_path / "wav" / "conversation.wav"), "rb") as fh:
+            return fh.readframes(fh.getnframes()), fh.getframerate()
+
+    def loud(self, seconds):
+        return b"\x11\x11" * int(24000 * seconds)
+
+    def test_a_clip_starts_where_the_player_started_talking(self, tmp_path):
+        # Someone talks from 4.0 s to 6.0 s; the segment is stamped at 6.0.
+        pcm, rate = self.track(
+            tmp_path, [SpeechSegment(t=6.0, seq=1, data=self.loud(2.0), dur_ms=2000)]
+        )
+        first = next(i for i in range(0, len(pcm), 2) if pcm[i : i + 2] != b"\x00\x00")
+        assert first / 2 / rate == pytest.approx(4.0, abs=0.05)
+
+    def test_the_two_voices_do_not_land_on_top_of_each_other(self, tmp_path):
+        from gpagent.events import AgentResponse
+
+        # A question ending at 6.0 s, answered for 3 s from 7.0 s.
+        pcm, rate = self.track(
+            tmp_path,
+            [
+                SpeechSegment(t=6.0, seq=1, data=self.loud(2.0), dur_ms=2000),
+                AgentResponse(t=10.0, seq=2, data=self.loud(3.0), dur_ms=3000),
+            ],
+        )
+        voiced = [
+            i / 2 / rate for i in range(0, len(pcm), 2) if pcm[i : i + 2] != b"\x00\x00"
+        ]
+        assert min(voiced) == pytest.approx(4.0, abs=0.05)
+        assert max(voiced) == pytest.approx(10.0, abs=0.05)
+        gap = [t for t in voiced if 6.1 < t < 6.9]
+        assert not gap, "the pause between question and answer was filled in"
+
+
 class TestExampleConfig:
     """`gpagent.example.toml` documents the defaults, so it must match them.
 
