@@ -27,7 +27,7 @@ sudo apt install gstreamer1.0-pipewire gstreamer1.0-plugins-good \
 ## Install
 
 ```bash
-uv venv --system-site-packages
+uv venv --system-site-packages --no-managed-python
 uv pip install -e .     # append [dev] for development
 
 # Download the voice activity detection model (~50 MB)
