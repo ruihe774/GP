@@ -94,6 +94,7 @@ The split exists because **raw media to realtime API costs more than the game**.
 - **Two drivers:**
   - `drive_from_bus` — wall-clock replay
   - `drive_from_session` — reads file, passes `now=event.t`, fully deterministic (no sleeping)
+- **A `commentate` recording holds the agent's own speech too, and `build_cues` drops it.** That is output, not capture. `handle()` records every event it is given, so replaying those fed the new agent the old one's lines and wrote a session holding two interleaved conversations — a before/after comparison read 45 responses for a 22-response run before this was caught. Both drivers go through `build_cues`, so the filter covers them.
 
 ### CLI (`src/gpagent/cli.py`)
 

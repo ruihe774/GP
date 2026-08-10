@@ -8,7 +8,13 @@ from pathlib import Path
 import pytest
 
 from gpagent.bus import CaptureBus
-from gpagent.events import GamepadActivity, ScreenFrame, SessionStart, SpeechSegment
+from gpagent.events import (
+    AgentResponse,
+    GamepadActivity,
+    ScreenFrame,
+    SessionStart,
+    SpeechSegment,
+)
 from gpagent.replay import SIGNAL_INTENSITY, SIGNAL_SPEECH_START, ReplaySource, build_cues
 from gpagent.sinks.jsonl import JsonlSink
 
@@ -54,6 +60,32 @@ class TestCueReconstruction:
     def test_signals_can_be_suppressed(self):
         cues = build_cues([SpeechSegment(t=2.0, seq=1, dur_ms=1000)], signals=False)
         assert [c[1] for c in cues] == ["event"]
+
+    def test_the_old_agents_speech_is_not_replayed_as_capture(self):
+        """A `commentate` recording holds the agent's own output too.
+
+        Replaying it fed the new agent the old one's speech, and since
+        `handle()` records every event it is given, the new session came out
+        holding two interleaved conversations -- which is exactly what made a
+        before/after cost comparison read 45 responses for a 22-response run.
+        """
+        events = [
+            SpeechSegment(t=1.0, seq=1, dur_ms=500),
+            AgentResponse(t=2.0, seq=1_000_000, reason="reply", transcript="old news"),
+            GamepadActivity(t=3.0, seq=2, intensity=0.5, summary="tapped A"),
+        ]
+        replayed = [c[2] for c in build_cues(events) if c[1] == "event"]
+        assert [type(e) for e in replayed] == [SpeechSegment, GamepadActivity]
+
+    def test_a_capture_only_recording_is_unchanged(self):
+        """The filter must not eat the events a `record` session is made of."""
+        events = [
+            SpeechSegment(t=1.0, seq=1, dur_ms=500),
+            ScreenFrame(t=2.0, seq=2, w=4, h=4, trigger="scene"),
+            GamepadActivity(t=3.0, seq=3, intensity=0.5, summary="tapped A"),
+        ]
+        replayed = [c[2] for c in build_cues(events) if c[1] == "event"]
+        assert replayed == events
 
 
 class TestThroughTheBus:

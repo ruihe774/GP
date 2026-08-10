@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from .bus import BusContext
-from .events import Event, GamepadActivity, SpeechSegment
+from .events import AgentResponse, Event, GamepadActivity, SpeechSegment
 from .sinks.jsonl import read_session
 
 log = logging.getLogger(__name__)
@@ -132,9 +132,18 @@ def build_cues(
     segment. Getting this wrong would make barge-in untestable offline: the
     "player is talking" gate would open and close in the same instant, and a
     replay would never catch the agent talking over the player.
+
+    A recording made by `commentate` also holds what the agent said, and that
+    is output, not capture. Replaying it would hand the new agent the old one's
+    speech: `handle()` records every event it is given, so the new session came
+    out holding two interleaved conversations, and the console printed the old
+    agent's lines as if they were this run's. Dropped here rather than at the
+    recorder so the new agent never sees them at all.
     """
     cues: list[tuple[float, int, str, Any]] = []
     for order, event in enumerate(events):
+        if isinstance(event, AgentResponse):
+            continue
         cues.append((event.t, order, "event", event))
         if not signals:
             continue
