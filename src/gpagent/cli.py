@@ -883,8 +883,8 @@ async def _commentate(cfg: CaptureConfig, args) -> int:
     # it, so `gpagent inspect` reads a session the same way whether it came from
     # `record` or from `commentate`.
     sink = None
-    if out_dir is not None and not args.no_media:
-        sink = JsonlSink(out_dir, inline=args.inline)
+    if out_dir is not None:
+        sink = JsonlSink(out_dir, inline=args.inline, media=not args.no_media)
         sink.open()
         if args.replay is None:
             # A replayed recording re-emits its own session.start; only live
@@ -1195,7 +1195,7 @@ def build_parser() -> argparse.ArgumentParser:
     commentate.add_argument(
         "--no-media",
         action="store_true",
-        help="with -o, write only the logs, not the captured audio and frames",
+        help="with -o, write the event stream but no audio or frame payloads",
     )
     commentate.add_argument(
         "--inline", action="store_true", help="base64 blobs into the JSONL"

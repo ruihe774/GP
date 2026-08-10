@@ -277,7 +277,7 @@ max_per_min = 8               # global rate cap
 
 **Tuning speak timing:** Adjust `SpeakPolicy` parameters. Test with `--replay-speed 0 --dry-run` for deterministic offline runs.
 
-**Debugging cost:** Check `inspect --cost` estimates vs. actual API usage in `manifest.json`. Cost meter in `session.py::usage_for_response()`.
+**Debugging cost:** Check `inspect --cost` estimates vs. actual API usage in `manifest.json`. Cost meter in `session.py::usage_for_response()`. Per-response `usage` (and with it the cached-token split) lives on the `agent.response` events in `events.jsonl`, not in `agent.jsonl` — that file is the console story only. `-o DIR --no-media` writes the event stream without the payloads, which is the shape you want when re-running a recording to measure a change rather than to listen to it.
 
 **Finding frame stale:** `commentate` reports frame age at send time. Older frames mean `triggers.min_interval_s` is too high.
 

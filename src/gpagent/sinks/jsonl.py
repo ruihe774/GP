@@ -32,9 +32,15 @@ def session_dir_name(when: datetime | None = None) -> str:
 
 
 class JsonlSink:
-    def __init__(self, directory: str | Path, *, inline: bool = False):
+    def __init__(self, directory: str | Path, *, inline: bool = False, media: bool = True):
         self.directory = Path(directory)
         self.inline = inline
+        #: False writes the event stream but no payloads. The timeline, the
+        #: reasons and the per-response `usage` are what make a session
+        #: analysable afterwards, and they cost kilobytes; the blobs are the
+        #: hundreds of megabytes. Dropping the stream along with them leaves a
+        #: run that can be read but not measured.
+        self.media = media
         self._events: IO[str] | None = None
         self._blobs = self.directory / BLOBS_DIR
         self.counts: dict[str, int] = {}
@@ -49,16 +55,23 @@ class JsonlSink:
 
     def open(self) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
-        if not self.inline:
+        if self.media and not self.inline:
             self._blobs.mkdir(exist_ok=True)
         self._events = open(self.directory / EVENTS_FILE, "w", buffering=1)
 
     def write(self, event: Event) -> None:
         if self._events is None:
             raise RuntimeError("sink is not open")
-        if event.data is not None and not self.inline:
+        inline = self.inline and self.media
+        if not self.media:
+            # A replayed event arrives still carrying the blob path it had in
+            # the source directory. Keeping it would write a reference that
+            # resolves to nothing here, which reads as corruption rather than
+            # as "payloads were not kept".
+            event.blob = None
+        elif event.data is not None and not self.inline:
             event.blob = self._write_blob(event)
-        line = json.dumps(event.to_dict(inline=self.inline), separators=(",", ":"))
+        line = json.dumps(event.to_dict(inline=inline), separators=(",", ":"))
         self._events.write(line + "\n")
         self.counts[event.TYPE] = self.counts.get(event.TYPE, 0) + 1
 

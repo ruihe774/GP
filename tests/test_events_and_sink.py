@@ -93,6 +93,28 @@ class TestSink:
         assert not (tmp_path / "blobs").exists()
         assert list(read_session(tmp_path))[0].data == b"\xff\xd8"
 
+    def test_media_off_keeps_the_event_stream(self, tmp_path):
+        """`--no-media` drops the payloads, not the timeline.
+
+        It used to skip the sink entirely, which left a run readable in the
+        console log but not measurable: per-response `usage` lives on the
+        events, and that is what tells you what a change did to the bill.
+        """
+        with JsonlSink(tmp_path, media=False) as sink:
+            sink.write(ScreenFrame(t=1.0, seq=1, data=b"\xff\xd8", w=4, h=4, trigger="scene"))
+            # As a replayed event arrives: already pointing at the source dir.
+            sink.write(
+                ScreenFrame(
+                    t=2.0, seq=2, blob="blobs/000009-frame.jpg", w=8, h=8, trigger="scene"
+                )
+            )
+
+        assert not (tmp_path / "blobs").exists()
+        events = list(read_session(tmp_path, load_blobs=True))
+        assert [e.w for e in events] == [4, 8], "the frames' metadata still lands"
+        assert all(e.data is None and e.blob is None for e in events)
+        assert sink.bytes_written == 0
+
     def test_malformed_lines_are_skipped(self, tmp_path):
         with JsonlSink(tmp_path) as sink:
             sink.write(SpeechSegment(t=1.0, seq=1, dur_ms=100))
