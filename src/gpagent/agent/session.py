@@ -13,7 +13,10 @@ Conversation shape, per response:
                                plus at most one screenshot (see context.py)
     input_audio_buffer.append  the player's utterance, PCM16 24 kHz mono --
     input_audio_buffer.commit  exactly what capture produced, no conversion
-    response.create            with a per-reason instruction override
+    conversation.item.create   one system item: which reason we are speaking
+                               for (see persona.reason_note)
+    response.create            bare -- persona, language and output cap are all
+                               constant, so they live in session.update
 
 Only `reply` sends audio. `react` and `ambient` are the same shape without it.
 """
@@ -43,7 +46,7 @@ from ..events import (
 )
 from ..tokens import UsageMeter
 from .context import ContextBuffer, Frame
-from .persona import instructions, instructions_for
+from .persona import instructions, reason_note
 from .playback import NullPlayer
 from .policy import SpeakPolicy
 
@@ -311,6 +314,9 @@ class CommentaryAgent:
             # Pushing the new utterance into the same appsrc would queue it
             # behind the old one and play both, late.
             await self._cancel_response(now, why="superseded")
+        # A new utterance starts here, so nothing the last one left on the
+        # playback clock belongs to it. See `PlaybackTimer.discard`.
+        self.player.discard()
         self._accept_audio = True
         self._audio_item_id = None
         with_image = self.cfg.image_on_unprompted or reason == "reply"
@@ -350,15 +356,12 @@ class CommentaryAgent:
                 # a reply turn with nothing in it.
                 log.warning("reply with no audio payload; sending context only")
 
-        await self.transport.send(
-            {
-                "type": "response.create",
-                "response": {
-                    "instructions": instructions_for(self.cfg, reason),
-                    "max_output_tokens": self.cfg.max_output_tokens,
-                },
-            }
-        )
+        # The reason goes in as a system item rather than on
+        # `response.create.instructions`, which would replace the session
+        # persona and, because it varies per turn, break the cached prefix.
+        # See `persona.reason_note`.
+        await self.transport.send(self._reason_item(reason))
+        await self.transport.send({"type": "response.create"})
         self.policy.mark_spoken(reason, now)
         self._response_active = True
         self._response_started = now
@@ -423,6 +426,19 @@ class CommentaryAgent:
                 "type": "message",
                 "role": "user",
                 "content": content,
+            },
+        }
+
+    def _reason_item(self, reason: str) -> dict:
+        """The per-turn nudge, as a system message appended before the response."""
+        self._item_seq += 1
+        return {
+            "type": "conversation.item.create",
+            "item": {
+                "id": f"gprsn{self._item_seq:012d}",
+                "type": "message",
+                "role": "system",
+                "content": [{"type": "input_text", "text": reason_note(reason)}],
             },
         }
 

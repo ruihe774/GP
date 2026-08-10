@@ -22,6 +22,16 @@ JPEG = b"\xff\xd8\xff\xe0fake-jpeg-bytes"
 PCM = b"\x01\x02" * 12000  # 1 s at 24 kHz s16 mono
 
 
+def reason_note_sent(agent) -> str:
+    """The text of the last per-turn system nudge put on the wire."""
+    items = [
+        e
+        for e in agent.transport.sent_of_type("conversation.item.create")
+        if e["item"]["role"] == "system"
+    ]
+    return items[-1]["item"]["content"][0]["text"]
+
+
 def make_config(**agent_kwargs):
     cfg = CaptureConfig()
     for key, value in agent_kwargs.items():
@@ -88,9 +98,10 @@ class TestTheTurnItSends:
 
         order = [e["type"] for e in agent.transport.sent]
         assert order == [
-            "conversation.item.create",
+            "conversation.item.create",  # context: summary + frame
             "input_audio_buffer.append",
             "input_audio_buffer.commit",
+            "conversation.item.create",  # the per-turn system nudge
             "response.create",
         ]
 
@@ -113,7 +124,11 @@ class TestTheTurnItSends:
         await agent.handle(pad("released RT after 2.5s"), now=100.5)
         await agent.handle(speech(), now=101.0)
 
-        items = agent.transport.sent_of_type("conversation.item.create")
+        items = [
+            e
+            for e in agent.transport.sent_of_type("conversation.item.create")
+            if e["item"]["role"] == "user"
+        ]
         assert len(items) == 1, "summaries must be accumulated, not streamed"
         text = items[0]["item"]["content"][0]["text"]
         assert "holding RT" in text and "released RT after 2.5s" in text
@@ -130,30 +145,51 @@ class TestTheTurnItSends:
 
     async def test_each_reason_steers_the_response(self, agent):
         await agent.handle(frame(score=1.0), now=100.0)
-        instructions = agent.transport.sent_of_type("response.create")[0]["response"][
-            "instructions"
-        ]
-        assert "happened" in instructions.lower()
+        assert "happened" in reason_note_sent(agent).lower()
 
-    async def test_the_persona_survives_the_per_response_override(self, agent):
-        """`response.create.instructions` replaces the session's, not adds to it.
+    async def test_the_reason_rides_as_a_system_item_before_the_response(self, agent):
+        """The nudge is a conversation item, not a per-response instruction.
 
-        The first live run against sess5 shipped the reason line alone and got
-        four sentences of encouraging life coaching per turn, because the
-        persona had been thrown away on every response.
+        Carried on `response.create.instructions` it would replace the session
+        persona, so it had to drag the whole persona along -- ~265 tokens that
+        change every turn, sitting where they key the prompt cache. Sending it
+        as a tail item keeps the prefix identical to the previous request.
+        """
+        await agent.handle(frame(score=1.0), now=100.0)
+        sent = agent.transport.sent
+        item = [
+            m
+            for m in sent
+            if m["type"] == "conversation.item.create" and m["item"]["role"] == "system"
+        ][0]
+        assert item["item"]["content"][0]["text"].startswith("Right now:")
+        assert sent.index(item) < sent.index(agent.transport.sent_of_type("response.create")[0])
+
+    async def test_the_response_leaves_the_session_persona_alone(self, agent):
+        """The persona is sent once and never overridden.
+
+        The first live run against sess5 shipped the reason line alone on
+        `response.create.instructions`, which replaces rather than merges, and
+        got four sentences of encouraging life coaching per turn.
         """
         agent.cfg.persona = "you are a lighthouse keeper"
         await agent.handle(frame(score=1.0), now=100.0)
-        instructions = agent.transport.sent_of_type("response.create")[0]["response"][
-            "instructions"
-        ]
-        assert "lighthouse keeper" in instructions
-        assert "happened" in instructions.lower()
+        assert "lighthouse keeper" in agent.session_update()["session"]["instructions"]
+        assert "response" not in agent.transport.sent_of_type("response.create")[0]
+
+    async def test_the_response_carries_no_per_turn_overrides(self, agent):
+        """Everything on `response.create` was constant, so it all moved.
+
+        Anything left here would be re-sent every turn, and the fields that
+        vary are the ones that cost cached prefix.
+        """
+        await agent.handle(frame(score=1.0), now=100.0)
+        assert agent.transport.sent_of_type("response.create")[0] == {"type": "response.create"}
 
     async def test_output_length_is_capped(self, agent):
         await agent.handle(frame(score=1.0), now=100.0)
-        response = agent.transport.sent_of_type("response.create")[0]["response"]
-        assert response["max_output_tokens"] == agent.cfg.max_output_tokens
+        session = agent.session_update()["session"]
+        assert session["max_output_tokens"] == agent.cfg.max_output_tokens
 
     async def test_unanswered_utterances_are_all_sent(self, agent):
         """Three sentences while the agent is busy become one answered thought."""
@@ -362,14 +398,12 @@ class TestLanguage:
         agent = CommentaryAgent(cfg, FakeTransport(), NullPlayer())
         assert "Japanese" in agent.session_update()["session"]["instructions"]
 
-    async def test_it_survives_the_per_response_override(self, agent):
+    async def test_it_is_not_overridden_per_response(self, agent):
         """Same trap the persona fell into: instructions are replaced, not merged."""
         agent.cfg.language = "es"
         await agent.handle(frame(score=1.0), now=100.0)
-        instructions = agent.transport.sent_of_type("response.create")[0]["response"][
-            "instructions"
-        ]
-        assert "Spanish" in instructions
+        assert "Spanish" in agent.session_update()["session"]["instructions"]
+        assert "response" not in agent.transport.sent_of_type("response.create")[0]
 
     def test_an_unknown_code_is_passed_through(self):
         cfg = make_config(language="nds")

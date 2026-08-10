@@ -7,9 +7,9 @@ to also decide whether to speak would be paying twice for one decision and
 getting a worse answer. What the prompt is actually for is length and register
 -- the things the policy cannot control.
 
-Per-response instructions ride on `response.create` and override the session
-ones for that response only, which is how the three reasons get different
-behaviour out of one persona.
+The persona is sent once, in `session.update`, and never resent. The per-turn
+part -- which of the three reasons we are speaking for -- rides as a system
+message item appended just before `response.create`. See `reason_note`.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ __all__ = [
     "LANGUAGE_NAMES",
     "resolve_persona",
     "instructions",
-    "instructions_for",
+    "reason_note",
     "language_name",
 ]
 
@@ -106,14 +106,32 @@ def instructions(cfg: AgentConfig) -> str:
     return text
 
 
-def instructions_for(cfg: AgentConfig, reason: str) -> str:
-    """Per-response instructions: the persona *plus* the reason.
+def reason_note(reason: str) -> str:
+    """The one-line nudge for this turn, to be sent as a system message.
 
-    `response.create.instructions` **replaces** the session instructions for
-    that response, it does not add to them. Sending the reason line alone threw
-    the persona away on every single turn -- the first live run against sess5
-    answered a swearing player with four sentences of encouraging life coaching,
-    which is exactly what a model with no persona and one line of task framing
-    sounds like. The language directive has to ride along for the same reason.
+    This used to be `instructions_for(cfg, reason)`, sent on
+    `response.create.instructions`, and it had to carry the whole persona and
+    language directive along with it: `response.create.instructions`
+    **replaces** the session instructions rather than adding to them, so
+    sending the reason line alone threw the persona away on every turn -- the
+    first live run against sess5 answered a swearing player with four sentences
+    of encouraging life coaching.
+
+    Carrying the persona there was the wrong fix. It put ~265 tokens that vary
+    per turn at a position that keys the prompt cache, so a turn whose reason
+    differed from the previous turn could not reuse the previous turn's prefix
+    and fell back to the last turn with a matching reason. Measured on sess7
+    (65 responses, 39 min): 533 uncached tokens on a median same-reason turn
+    against 1495 when the reason changed, about $0.28 of a $1.62 session, most
+    of it re-billed screenshots.
+
+    So the persona stays in `session.update`, where it is constant and cached,
+    and only this line varies. As a conversation item it is appended at the
+    tail, leaving the whole prefix byte-identical to the previous request.
+
+    The item persists in history, unlike per-response instructions -- a long
+    session accumulates one stale line per turn. They are ~15 tokens each and
+    sit inside the cached prefix, and deleting them per turn would invalidate
+    exactly the prefix this change exists to preserve.
     """
-    return f"{instructions(cfg)}\nRight now: {RESPONSE_INSTRUCTIONS[reason]}"
+    return f"Right now: {RESPONSE_INSTRUCTIONS[reason]}"
