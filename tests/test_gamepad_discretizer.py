@@ -7,7 +7,7 @@ import pytest
 from conftest import make_gamepad
 from gpagent.capture import evdev_raw as ev
 from gpagent.capture.gamepad import GamepadDiscretizer, resolve_layout
-from gpagent.config import GamepadConfig
+from gpagent.config import GamepadConfig, TriggerConfig
 from gpagent.events import GamepadActivity, GamepadIdle
 
 
@@ -25,6 +25,63 @@ def tap(disc: GamepadDiscretizer, code: int, at: float, duration: float = 0.05) 
     disc.feed(event(ev.EV_KEY, code, 1), at)
     disc.feed(event(ev.EV_KEY, code, 0), at + duration)
     return at + duration
+
+
+class TestIntensityReachesTheFrameTrigger:
+    """`intensity` exists to drive screen-frame triggers.
+
+    With `sticks_mode="off"` -- the default -- the stick term is zero, and
+    before the weights were renormalised that silently capped the scalar at
+    0.75 and put `triggers.gamepad_intensity` (0.35) out of reach: sess5
+    recorded zero gamepad-triggered frames in 151 s of play. These assert the
+    threshold is actually reachable, which is the whole point of the scalar.
+    """
+
+    THRESHOLD = TriggerConfig().gamepad_intensity
+
+    def hold_trigger(self, sticks_mode: str, value: float = 1.0) -> float:
+        disc = make(sticks_mode)
+        raw = int(value * 1023)
+        disc.feed(event(ev.EV_ABS, ev.ABS_RZ, raw), 0.0)
+        disc.flush(0.5)
+        return disc.last_intensity
+
+    def test_a_fully_held_trigger_crosses_the_default_threshold(self):
+        assert self.hold_trigger("off") >= self.THRESHOLD
+
+    def test_a_burst_of_button_presses_crosses_it(self):
+        disc = make("off")
+        t = 0.0
+        for code in (ev.BTN_SOUTH, ev.BTN_EAST, ev.BTN_NORTH):
+            t = tap(disc, code, t, duration=0.02) + 0.02
+        disc.flush(0.5)
+        assert disc.last_intensity >= self.THRESHOLD
+
+    def test_ordinary_play_does_not(self):
+        """Selective, not permanently on: one tap is not a burst."""
+        disc = make("off")
+        tap(disc, ev.BTN_SOUTH, 0.0)
+        disc.flush(0.5)
+        assert 0.0 < disc.last_intensity < self.THRESHOLD
+
+    def test_enabling_sticks_does_not_change_the_scale(self):
+        """Renormalisation must not inflate the scalar when sticks are on."""
+        disc = make("intensity")
+        disc.feed(event(ev.EV_ABS, ev.ABS_RZ, 1023), 0.0)
+        disc.flush(0.5)
+        with_sticks = disc.last_intensity
+        assert with_sticks == pytest.approx(0.30, abs=0.01)
+        assert self.hold_trigger("off") > with_sticks
+
+    def test_it_stays_bounded(self):
+        disc = make("off")
+        disc.feed(event(ev.EV_ABS, ev.ABS_RZ, 1023), 0.0)
+        disc.feed(event(ev.EV_ABS, ev.ABS_Z, 1023), 0.0)
+        t = 0.0
+        for code in (ev.BTN_SOUTH, ev.BTN_EAST, ev.BTN_NORTH, ev.BTN_WEST, ev.BTN_TL):
+            t = tap(disc, code, t, duration=0.01) + 0.01
+        disc.flush(0.5)
+        assert disc.last_intensity <= 1.0
 
 
 class TestButtons:

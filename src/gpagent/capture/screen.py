@@ -54,6 +54,9 @@ class ScreenSource:
         self._lock = threading.Lock()
         self._latest: tuple[bytes, int, int] | None = None
         self._thumb: np.ndarray | None = None
+        #: the previous sample, for scene-change detection
+        self._prev_thumb: np.ndarray | None = None
+        #: the last frame the model actually saw, for dedup
         self._last_sent_thumb: np.ndarray | None = None
         self._task: asyncio.Task | None = None
         self._frames_seen = 0
@@ -233,6 +236,25 @@ class ScreenSource:
     # -- sampling ----------------------------------------------------------
 
     def _scene_score(self, thumb: np.ndarray | None) -> float:
+        """How much the screen changed since the *previous sample*.
+
+        Measured against the previous sample rather than the last frame we sent,
+        which is what makes it a scene-change detector rather than a clock. The
+        last-sent comparison grows with however long the frame policy has been
+        suppressing frames, so it clears any fixed threshold given enough time:
+        in sess5 it fired 25 of 28 frames, every one at exactly the 5 s floor,
+        with every recorded score above the threshold. That left
+        `scene_threshold` selecting nothing and `heartbeat` never firing at all.
+
+        The last-sent comparison is still the right question for dedup -- see
+        `_change_since_sent` -- just not for "did something happen".
+        """
+        if thumb is None or self._prev_thumb is None:
+            return 1.0
+        return float(np.abs(thumb - self._prev_thumb).mean() / 255.0)
+
+    def _change_since_sent(self, thumb: np.ndarray | None) -> float:
+        """How much the screen changed since the model last saw it."""
         if thumb is None or self._last_sent_thumb is None:
             return 1.0
         return float(np.abs(thumb - self._last_sent_thumb).mean() / 255.0)
@@ -277,13 +299,20 @@ class ScreenSource:
                 continue
 
             score = self._scene_score(thumb)
+            # The baseline advances on every sample, whatever happens next --
+            # skipping it when no frame goes out would turn this straight back
+            # into a "time since we last sent" measure.
+            self._prev_thumb = thumb
+
             trigger = self.policy.decide(scene_score=score)
             if trigger is None:
                 continue
 
             # A frame the model has already seen is not worth paying for again,
-            # whichever trigger asked for it.
-            if self._last_sent_thumb is not None and score < self.policy.cfg.dedup_threshold:
+            # whichever trigger asked for it. This is the *last sent*
+            # comparison, not the sample-to-sample one.
+            changed = self._change_since_sent(thumb)
+            if self._last_sent_thumb is not None and changed < self.policy.cfg.dedup_threshold:
                 self._deduped += 1
                 continue
 

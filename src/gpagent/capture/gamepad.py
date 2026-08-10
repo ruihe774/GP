@@ -438,6 +438,11 @@ class GamepadDiscretizer:
             }
         return event
 
+    #: relative contribution of each input family to the activity scalar
+    W_BUTTONS = 0.45
+    W_TRIGGERS = 0.30
+    W_STICKS = 0.35
+
     def _intensity(self, lt: float, rt: float, left: float, right: float) -> float:
         # Level-based on purpose: this drives screen-frame triggers, so a button
         # the player is holding down should keep counting even though the
@@ -447,8 +452,26 @@ class GamepadDiscretizer:
         trigger_part = max(lt, rt)
         # Sticks feed intensity even in "intensity" mode -- that is the point of
         # keeping them: they carry activity signal without costing tokens.
-        stick_part = 0.0 if self.cfg.sticks_mode == "off" else max(left, right)
-        return min(1.0, 0.45 * button_part + 0.30 * trigger_part + 0.35 * stick_part)
+        sticks_on = self.cfg.sticks_mode != "off"
+        stick_part = max(left, right) if sticks_on else 0.0
+
+        # Renormalise over the families that are actually enabled, so the scalar
+        # means the same thing whatever `sticks_mode` is. Without this, the
+        # default `sticks_mode="off"` silently zeroes the largest weight and
+        # caps intensity at 0.75: a trigger held flat out reached only 0.30
+        # against a 0.35 trigger threshold, so `triggers.gamepad_intensity` was
+        # unreachable by anything short of mashing four buttons inside one
+        # 500 ms window. sess5 recorded zero gamepad-triggered frames in 151 s
+        # of play, with a peak intensity of 0.27.
+        total = self.W_BUTTONS + self.W_TRIGGERS + self.W_STICKS
+        enabled = total if sticks_on else total - self.W_STICKS
+        scale = total / enabled
+        raw = (
+            self.W_BUTTONS * button_part
+            + self.W_TRIGGERS * trigger_part
+            + self.W_STICKS * stick_part
+        )
+        return min(1.0, scale * raw)
 
     def _summarize(
         self,

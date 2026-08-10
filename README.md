@@ -169,28 +169,36 @@ comments — measured on sess5 at 5.0, that was **2.7 s on average and 4.6 s at
 worst**. It is now 2.0. `gpagent commentate` reports frame age at send time, so
 this is measurable per session rather than inferred.
 
-**Only two of the four triggers do anything.** sess5's 28 frames break down as
-25 `scene`, 3 `speech`, and **zero** `gamepad` and `heartbeat`:
+**Two of the four triggers used to be dead, and the recorded trigger mix is how
+you can tell.** sess5's 28 frames were 25 `scene`, 3 `speech`, and zero
+`gamepad` and `heartbeat`. Both causes are fixed; a 22 s capture after the fix
+reports `heartbeat=3, scene=3`.
 
-- `scene_score` compares against the last *sent* frame, not the previous frame,
-  so the longer the floor suppresses frames the more the screen diverges and the
-  more certain the next comparison is to clear the threshold. Every one of the 28
-  recorded scores was above it (min 0.069 against a 0.06 threshold, median
-  0.173). At these intervals it is not really a scene-change detector — it is a
-  "time has passed in a moving game" detector, and it fires first essentially
-  always, which is why `heartbeat` never gets a turn.
-- `gamepad` cannot realistically fire under the default config.
-  `intensity = 0.45·buttons + 0.30·triggers + 0.35·sticks`, and `sticks_mode`
-  defaults to `off`, so the stick term — the largest weight — is always zero.
-  Holding a trigger flat out yields 0.30, which is *below* the 0.35 threshold on
-  its own; buttons alone need four presses inside one 500 ms window. sess5 peaked
-  at 0.27 with a median of 0.09. Either lower `gamepad_intensity` to ~0.25 or
-  turn on `sticks_mode=intensity` if you want this trigger to participate.
+*`scene` was a clock, not a detector.* `scene_score` compared against the last
+frame *sent*, so the longer the frame policy suppressed frames the more the
+screen diverged, and the comparison cleared any fixed threshold given enough
+time — every one of sess5's 28 scores was above the 0.06 threshold, and every
+frame landed at exactly the 5 s floor. `scene_threshold` was selecting nothing
+and `heartbeat` never got a turn. It now measures **sample to sample**, so it
+fires on actual transitions and the baseline advances on every sample whether or
+not a frame goes out. The last-sent comparison is still exactly the right
+question for **dedup** — "has the model already seen this?" — so that is what it
+is now used for, and only that.
 
-So the two rules that actually bind are this floor and `scene_throttle_s` (3.0).
-At a 5.0 floor, the floor bound scene; at 2.0, scene's own throttle does, which
-is the intended effect — `scene_throttle_s` is the knob to reach for next if
-frames still aren't fresh enough.
+Because `scene` is now selective, `heartbeat_s` drops 10.0 → 3.0 and becomes the
+metronome: it is what guarantees a reasonably fresh screenshot during ordinary
+play, with `dedup_threshold` suppressing the repeats when the screen is static.
+
+*`gamepad` was unreachable.* `intensity` weights buttons 0.45, triggers 0.30 and
+sticks 0.35, but `sticks_mode` defaults to `off`, which silently zeroed the
+largest weight and capped the scalar at 0.75. A trigger held flat out reached
+only 0.30 — *below* the 0.35 threshold on its own — and buttons alone needed four
+presses inside one 500 ms window. sess5 peaked at 0.27. The weights are now
+**renormalised over the families actually enabled**, so the scalar means the same
+thing whatever `sticks_mode` is: a held trigger reads 0.44, three button presses
+in a window read 0.40, and one tap still reads 0.13. Turning sticks on leaves the
+old values unchanged. On sess5 that takes gamepad-triggered windows from 0 to 3
+of 71 — selective, which is the point.
 
 **VAD is swappable.** `silero` (default) is an ONNX model that rejects noise,
 tones and bass rumble at ≤0.003 against a 0.5 threshold. `webrtc` uses

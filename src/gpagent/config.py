@@ -126,9 +126,13 @@ class TriggerConfig:
     #: makes scene the effective clock. At 5.0 the floor bound scene; at 2.0 its
     #: own 3.0 s throttle does.
     min_interval_s: float = 2.0
-    #: Rarely reached: `scene` fires first almost every time (see above), so
-    #: this is the fallback for a genuinely static screen, not a regular source.
-    heartbeat_s: float = 10.0
+    #: The metronome. `scene` only fires on real transitions now that it is
+    #: measured sample-to-sample, so this is what guarantees the model gets a
+    #: reasonably fresh screenshot during ordinary play, and it has to be short
+    #: enough to be the freshness floor on its own. Frames cost local encoding
+    #: and nothing on the bill, and `dedup_threshold` suppresses repeats when
+    #: the screen is static, so a short interval is cheap.
+    heartbeat_s: float = 3.0
     gamepad_intensity: float = 0.35
     #: leading-edge throttle: fire at once, then at most once per interval
     gamepad_throttle_s: float = 2.0
