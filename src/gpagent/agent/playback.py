@@ -19,7 +19,25 @@ reproducibly garbled speech here even though the buffers reaching it were
 sample-for-sample correct. `autoaudiosink` selects `pulsesink`, a
 `GstAudioBaseSink` with a real ring buffer -- built for exactly this: clock
 drift, silence on underrun, and backpressure upstream. Same bytes, same
-timestamps, clean playback.
+timestamps, clean playback. Confirmed on a second, unrelated output device --
+not a quirk of one sound card.
+
+Root cause, traced in pipewire's own source (src/gst/gstpipewiresink.c):
+`gst_pipewire_sink_render` sizes its audio pool buffers off PipeWire's
+`clock.quantum-limit` (~340 ms at 24 kHz mono by default), not off whatever
+GstBuffer arrives. Our appsrc is `is-live=false block=false max-bytes=0` --
+unbound and unsynced on purpose -- so a single `push()` of a longer utterance
+routinely exceeds that pool size and hits the split loop, which copies the
+*whole original buffer's* PTS/duration onto every split fragment
+(`gst_buffer_copy_into(b, buffer, GST_BUFFER_COPY_METADATA, 0, -1)`, audio
+branch). Since commit d5e2cc94c ("gst: sink: update clock before every
+trigger process", 2025-04-18, first released in 1.5.81), that per-fragment
+duration feeds `update_time()`'s DLL rate correction directly -- a dozen
+fragments of one utterance each claim to *be* the entire utterance at the
+same timestamp, and the graph clock chases the resulting noise. Confirmed
+still present, unfixed, in 1.6.2 (tested), the latest release (1.6.8), and
+current pipewire master as of 2026-08 -- this is not something a future
+`autoaudiosink` fallback removal would survive.
 
 Timing is accounted in `PlaybackTimer`, separately from GStreamer and with an
 injectable clock, because barge-in depends on it: `conversation.item.truncate`
