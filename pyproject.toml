@@ -7,6 +7,9 @@ dependencies = [
     "numpy>=2.0",
     "onnxruntime>=1.20",
     "pillow>=11.0",
+    # Component B: the realtime session. The `realtime` extra pulls in the
+    # websocket transport; `client.realtime.connect` is GA, not beta, as of 2.x.
+    "openai[realtime]>=2.5",
 ]
 
 [project.optional-dependencies]
@@ -27,5 +30,6 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
     "hardware: touches real devices (gamepad/mic/screen); deselected by default",
+    "network: talks to the OpenAI API and spends money; deselected by default",
 ]
-addopts = "-m 'not hardware'"
+addopts = "-m 'not hardware and not network'"

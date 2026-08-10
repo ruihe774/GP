@@ -10,6 +10,7 @@ import logging
 import os
 import signal
 import sys
+import time
 import wave
 from datetime import datetime, timezone
 from pathlib import Path
@@ -750,6 +751,217 @@ def _write_contact_sheet(directory: Path, events: list, columns: int = 4) -> Non
     print(f"\nwrote contact sheet with {len(thumbs)} frames to {path}")
 
 
+# -- commentate ------------------------------------------------------------
+
+
+def cmd_commentate(args) -> int:
+    cfg = _build_config(args)
+    if args.model:
+        cfg.agent.model = args.model
+    if args.voice:
+        cfg.agent.voice = args.voice
+    if args.image_detail:
+        cfg.agent.image_detail = args.image_detail
+    if args.no_playback or args.dry_run:
+        cfg.agent.playback = False
+    if args.replay is None and args.speed == 0.0:
+        raise SystemExit("--speed 0 only makes sense with --replay")
+    return asyncio.run(_commentate(cfg, args))
+
+
+async def _commentate(cfg: CaptureConfig, args) -> int:
+    from .agent.playback import make_player
+    from .agent.session import CommentaryAgent, ReplayClock, drive_from_bus, drive_from_session
+    from .agent.transport import OpenAITransport, RecordingTransport
+
+    out_dir = Path(args.output) if args.output else None
+    deterministic = args.replay is not None and args.speed == 0.0
+    clock = ReplayClock() if deterministic else None
+
+    if args.dry_run:
+        transport = RecordingTransport()
+    else:
+        from .agent.env import MissingAPIKey, load_api_key
+
+        try:
+            transport = OpenAITransport(cfg.agent.model, load_api_key())
+        except MissingAPIKey as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+
+    player = make_player(
+        cfg.agent.playback, clock or time.monotonic, sink=cfg.agent.audio_sink
+    )
+    agent = CommentaryAgent(
+        cfg,
+        transport,
+        player,
+        clock=clock or time.monotonic,
+        log_path=(out_dir / "agent.jsonl") if out_dir else None,
+        on_line=None if args.quiet else _print_line,
+    )
+
+    mode = "dry run" if args.dry_run else cfg.agent.model
+    source = f"replay {args.replay}" if args.replay else "live capture"
+    print(f"commentating: {source} -> {mode}")
+    if not args.dry_run and not cfg.agent.playback:
+        print("(playback disabled: nothing will come out of the speakers)")
+
+    await agent.start()
+    try:
+        if deterministic:
+            await drive_from_session(agent, args.replay, clock)
+        else:
+            bus = await _build_bus(cfg, args)
+            try:
+                await drive_from_bus(agent, bus)
+            finally:
+                await bus.stop()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        await agent.close()
+
+    _print_agent_report(agent, args, out_dir)
+    return 0
+
+
+async def _build_bus(cfg: CaptureConfig, args):
+    """Either a recording played back in real time, or the real thing."""
+    from .bus import CaptureBus
+
+    if args.replay is not None:
+        from .replay import ReplaySource
+
+        source = ReplaySource(args.replay, speed=args.speed)
+        bus = CaptureBus([source])
+        await bus.start()
+        # Stop the bus once the recording runs out, so the run terminates.
+        asyncio.create_task(_stop_when_finished(source, bus))
+        return bus
+
+    sources = []
+    if cfg.gamepad.enabled:
+        from .capture.gamepad import GamepadSource
+
+        sources.append(GamepadSource(cfg.gamepad))
+    if cfg.audio.enabled:
+        from .capture.audio import AudioSource
+
+        sources.append(AudioSource(cfg.audio))
+    if cfg.screen.enabled:
+        from .capture.screen import ScreenSource
+
+        sources.append(ScreenSource(cfg.screen, cfg.triggers))
+    if not sources:
+        raise SystemExit("all sources disabled; nothing to commentate on")
+    bus = CaptureBus(sources)
+    await bus.start()
+    return bus
+
+
+async def _stop_when_finished(source, bus) -> None:
+    await source.finished.wait()
+    # Let anything already queued drain before pulling the rug out.
+    await asyncio.sleep(1.0)
+    await bus.stop()
+
+
+def _print_line(line) -> None:
+    marks = {
+        "ask": "    ",
+        "say": "say ",
+        "heard": "you ",
+        "player": "mic ",
+        "cut": "CUT ",
+        "error": "ERR ",
+        "session": "--  ",
+    }
+    prefix = marks.get(line.kind, "    ")
+    text = line.text
+    if line.kind == "ask":
+        sent = line.extra.get("sent") or []
+        if sent:
+            text += "  |  " + ", ".join(sent)
+    print(f"[{line.t:7.2f}] {prefix} {text}")
+
+
+def _print_agent_report(agent, args, out_dir: Path | None) -> None:
+    report = agent.report()
+    usage = report["usage"]
+    print("\nagent")
+    print(f"  responses       {report['responses']}  {report['by_reason']}")
+    if report["declined"]:
+        print(f"  stayed quiet    {report['declined']}")
+    print(
+        f"  frames          {report['frames_sent']} sent of {report['frames_seen']} captured"
+    )
+    print(f"  spoke           {usage['spoken_s']}s")
+
+    tok = usage["tokens"]
+    cost = usage["cost"]
+    print(f"\nreported usage ({usage['model']})")
+    print(f"  input audio     {tok['input_audio']:>8d} tok  ${cost['in_audio_usd']:.4f}")
+    print(f"  input image     {tok['input_image']:>8d} tok  ${cost['in_image_usd']:.4f}")
+    print(f"  input text      {tok['input_text']:>8d} tok  ${cost['in_text_usd']:.4f}")
+    print(f"  input cached    {tok['input_cached']:>8d} tok  ${cost['in_cached_usd']:.4f}")
+    if tok["input_unattributed"]:
+        print(
+            f"  input other     {tok['input_unattributed']:>8d} tok  ${cost['in_other_usd']:.4f}"
+        )
+    print(f"  output audio    {tok['output_audio']:>8d} tok  ${cost['out_audio_usd']:.4f}")
+    print(f"  output text     {tok['output_text']:>8d} tok  ${cost['out_text_usd']:.4f}")
+    print(f"  total                        ${cost['total_usd']:.4f}", end="")
+
+    # Span, not the last timestamp: live, the clock is `time.monotonic`, whose
+    # absolute value is the machine's uptime and made every $/min read as $0.0001.
+    duration = (agent.lines[-1].t - agent.lines[0].t) if len(agent.lines) > 1 else 0.0
+    if duration > 0:
+        print(f"   (${cost['total_usd'] / (duration / 60.0):.4f}/min)")
+    else:
+        print()
+    if args.dry_run:
+        print("  (dry run: token counts are estimates, not a bill)")
+
+    if args.replay:
+        _compare_with_estimate(args.replay, agent, tok, cost)
+
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with open(out_dir / "agent-usage.json", "w") as fh:
+            json.dump(report, fh, indent=2)
+        print(f"\nwrote {out_dir}/agent.jsonl and {out_dir}/agent-usage.json")
+
+
+def _compare_with_estimate(directory: str, agent, tok: dict, cost: dict) -> None:
+    """The reconciliation Component A never got to do.
+
+    Both sides are priced at the *same* model's rates, so the comparison is of
+    policy against policy and not of one model's price list against another's.
+    """
+    from .tokens import estimate_events
+
+    estimate = estimate_events(read_session(directory))
+    capture = estimate.cost(agent.meter.rates)
+    print("\nagainst `gpagent inspect` (everything captured, sent in full)")
+    print(f"  {'':16s}{'captured':>12s}{'sent':>12s}")
+    print(f"  {'image tok':16s}{estimate.image_tokens:>12d}{tok['input_image']:>12d}")
+    print(f"  {'audio tok':16s}{estimate.audio_tokens:>12d}{tok['input_audio']:>12d}")
+    print(f"  {'text tok':16s}{estimate.text_tokens:>12d}{tok['input_text']:>12d}")
+    print(
+        f"  {'input usd':16s}{capture['total_usd']:>12.4f}{cost['input_usd']:>12.4f}"
+        f"   (same rates)"
+    )
+    if capture["total_usd"] > 0:
+        share = cost["input_usd"] / capture["total_usd"] * 100
+        print(f"  the agent's input cost was {share:.0f}% of sending everything")
+    print(
+        "  note: 'sent' can exceed 'captured'. `inspect` counts each item once;\n"
+        "        the API re-bills the whole conversation as input on every turn,\n"
+        "        which is what agent.keep_images and agent.prune_after_s control."
+    )
+
+
 # -- replay ----------------------------------------------------------------
 
 
@@ -818,6 +1030,46 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("--contact-sheet", action="store_true", help="montage frames to png")
     inspect.add_argument("-q", "--quiet", action="store_true", help="stats only, no timeline")
     inspect.set_defaults(func=cmd_inspect)
+
+    commentate = sub.add_parser(
+        "commentate", help="watch, and talk about it (Component B)"
+    )
+    commentate.add_argument(
+        "--replay",
+        metavar="DIR",
+        help="drive from a recorded session instead of live capture",
+    )
+    commentate.add_argument(
+        "--speed",
+        type=float,
+        default=1.0,
+        help="replay speed; 0 means as fast as possible, deterministically",
+    )
+    commentate.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="never connect: print what would be sent, and what it would cost",
+    )
+    commentate.add_argument("--model", help="override agent.model")
+    commentate.add_argument("--voice", help="override agent.voice")
+    commentate.add_argument(
+        "--image-detail", choices=["auto", "low", "high"], help="override agent.image_detail"
+    )
+    commentate.add_argument(
+        "--no-playback", action="store_true", help="do not open the audio sink"
+    )
+    commentate.add_argument("-o", "--output", help="directory for agent.jsonl and usage")
+    commentate.add_argument("-q", "--quiet", action="store_true", help="no live output")
+    _add_mapping_args(commentate)
+    commentate.add_argument("--no-gamepad", action="store_true")
+    commentate.add_argument("--no-audio", action="store_true")
+    commentate.add_argument("--no-screen", action="store_true")
+    commentate.add_argument(
+        "--pick-screen",
+        action="store_true",
+        help="show the screen-capture picker instead of reusing the last choice",
+    )
+    commentate.set_defaults(func=cmd_commentate)
 
     replay = sub.add_parser("replay", help="re-emit a session with original timing")
     replay.add_argument("directory")

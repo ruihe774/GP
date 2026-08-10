@@ -1,11 +1,20 @@
-# gpagent — Component A: gameplay capture & discretization
+# gpagent — a "friend on the couch" commentary agent
 
-Captures what a player is doing — gamepad, microphone, screen — and turns it into a
-sparse stream of typed events cheap enough to feed a realtime multimodal model.
+Watches someone play a video game and comments on it like a friend sitting next
+to them. Two halves:
 
-This is **Component A** of a "friend on the couch" commentary agent. Component B
-(the `gpt-realtime-2.1` session and voice playback) is not built yet; the
-interfaces here are shaped to feed it directly.
+- **Component A — capture.** Gamepad, microphone and screen, turned into a sparse
+  stream of typed events cheap enough to feed a realtime multimodal model.
+- **Component B — the agent.** Consumes that stream, decides *when* there is
+  something worth saying, says it with `gpt-realtime-2.1`, and plays it aloud.
+  See [Component B](#component-b--the-commentary-agent).
+
+```bash
+gpagent record -o sess -d 60        # capture
+gpagent inspect sess                # look at what was captured
+gpagent commentate --replay sess    # let the agent talk about it
+gpagent commentate                  # ...or do both live
+```
 
 ## Why discretization
 
@@ -21,6 +30,11 @@ game. Everything here exists to emit only the moments that carry information.
 Note the ordering: **screen frames cost more than the microphone**, so the frame
 trigger policy is the more valuable knob. `detail: "low"` (a flat 85 tokens per
 image) is a further large lever available to Component B.
+
+These are the numbers for *capture*. Once Component B is in front of them the
+ordering changes — it sends at most one frame per response, and what it says
+costs more than anything it is sent. See [Cost, measured](#cost-measured) for
+figures reconciled against real API usage.
 
 ## Requirements
 
@@ -51,6 +65,7 @@ gpagent record -o sess -d 60       # capture a minute
 gpagent inspect sess               # timeline, stats, estimated cost
 gpagent inspect sess --wav --contact-sheet   # listen to it, look at it
 gpagent replay sess                # re-emit with original timing
+gpagent commentate --replay sess   # run the agent over it (Component B)
 ```
 
 First `record` raises a portal permission dialog. Approve it once — the
@@ -154,15 +169,17 @@ tones and bass rumble at ≤0.003 against a 0.5 threshold. `webrtc` uses
 ## Tests
 
 ```bash
-pytest              # 90 tests, no hardware, ~0.1 s
-pytest -m hardware  # 5 more, against real devices
+pytest              # 250 tests, no hardware, no network, ~1 s
+pytest -m hardware  # 8 more, against real devices
+pytest -m network   # 2 more, against the real API (spends money)
 ```
 
 The suite is deliberately hardware-free: synthetic capability bitmaps for device
 classification, synthetic `input_event` structs for the discretizer, scripted
-probabilities for the segmenter, and a virtual clock for the trigger policy.
+probabilities for the segmenter, and a virtual clock for the trigger policy and
+the speaking policy.
 
-## Verification checklist
+## Verifying Component A
 
 Automated tests do not cover acoustics or the feel of the discretizer. Run this
 by hand:
@@ -288,7 +305,243 @@ If speech goes missing while game audio is playing, the first thing to try is
 `--set audio.echo_cancel=false`. If speech then appears, the canceller was
 eating it and `echo_suppression_level` is the knob.
 
-## Known gotchas
+---
+
+# Component B — the commentary agent
+
+Holds a `gpt-realtime-2.1` session, decides when to speak, and speaks.
+
+```bash
+gpagent commentate                                     # live capture, live API
+gpagent commentate --replay sess5                      # a recording, live API
+gpagent commentate --replay sess5 --speed 0 --dry-run  # deterministic, no network
+```
+
+The API key comes from `OPENAI_API_KEY` or from `.env` at the repo root (which is
+gitignored). It is never logged; `load_api_key` returns a `Secret` whose `repr`
+is blanked, because an ordinary `str` leaks through any traceback that happens to
+have it in scope — pytest renders the arguments of every frame it prints, which
+is how it first got out.
+
+## The actual problem: when to talk
+
+The API integration is the easy half. The agent has no user turn to respond to
+most of the time, so restraint has to come from somewhere, and the choice made
+here is that it comes from the **policy, not the prompt**: the model is only ever
+asked for a response at a moment already judged worth speaking at. Asking it to
+also decide whether to speak would pay twice for one decision and get a worse
+answer.
+
+`agent/policy.py::SpeakPolicy` mirrors `capture/triggers.py::TriggerPolicy` —
+pure logic, injectable clock, inputs pushed in, `decide()` names a reason or
+returns None. Three reasons:
+
+| reason | when | bound by |
+|---|---|---|
+| `reply` | the player said something | the global cap only |
+| `react` | scene change, or a burst of input | quiet floor + `event_cooldown_s` |
+| `ambient` | it has been quiet a while | quiet floor + `ambient_after_s` |
+
+and two rules over them:
+
+- **A global cap** (`max_per_min`, sliding 60 s window) binding *every* reason.
+  This is Component A's frame-trigger lesson carried over: three rules each
+  obeying only their own cooldown take turns and produce a combined rate far
+  above what any of them allows. `tests/test_speak_policy.py` asserts the
+  combined rate with all three reasons pending at 4 Hz for ten minutes.
+- **A quiet floor** (`min_gap_s`) after the agent stops talking, binding only the
+  two unprompted reasons. `reply` is exempt: if the player asks a question two
+  seconds after the agent finishes a sentence, answering is correct and refusing
+  is broken. Nothing is exempt from the cap.
+
+**Cooldowns adapt.** Every unprompted remark the player doesn't answer multiplies
+them by `backoff_factor`; talking to the agent multiplies by `engagement_boost`
+(<1) and resets the streak. An agent being ignored gets quieter on its own.
+
+**A wanted reply expires** (`reply_ttl_s`). If the agent was busy or capped when
+the player spoke, answering nine seconds later is worse than not answering — the
+moment has gone and the audio is stale. Conversely, utterances that arrive while
+the agent is mid-sentence are *accumulated*, so three sentences of thinking out
+loud get answered as one thought rather than as their tail.
+
+**Both hard gates expire.** "The player is talking" and "a response is in flight"
+are absolute — while set, nothing can be said. A gate that sticks is a
+permanently mute agent, which is the quietest possible bug to notice, so a
+`speech.start` whose segment never arrives (VAD false start) and a
+`response.create` that never completes both time out.
+
+Tests assert positive behaviour first. Component A's most expensive bug was a VAD
+that returned zero for everything and passed every test, because every test
+asserted a negative. A policy that never speaks passes "never talks over the
+player", "respects the cooldown" and "obeys the rate cap" perfectly.
+
+## What gets sent
+
+Gamepad summaries are **accumulated and flushed at speak time**, not streamed.
+91 windows in 151 s would otherwise become 91 conversation turns, and be billed
+whether or not the agent ever had a reason to speak. Same rule for frames, which
+matters more: **at most one image per response, and only if it is newer than the
+last one sent**. Capture rate and send rate are decoupled — sess5 triggers 28
+frames, the agent pays for 14.
+
+```
+conversation.item.create   summaries + at most one screenshot
+input_audio_buffer.append  the player's utterance, PCM16 24 kHz mono, unconverted
+input_audio_buffer.commit
+response.create            persona + a per-reason instruction
+```
+
+`turn_detection` is `null`: capture already ran a VAD, and a commentator must be
+able to speak with no user turn at all.
+
+## Cost, measured
+
+Real `response.done` usage from `gpagent commentate --replay sess5`, 151 s of
+play, `gpt-realtime-2.1-mini`, priced at that model's rates. Compare with
+`gpagent inspect sess5`, whose estimates had never been reconciled against a bill:
+
+| | `image_detail: high` | `image_detail: low` |
+|---|---|---|
+| input audio | 1676 tok · $0.0072 | 1761 tok · $0.0080 |
+| input image | 31008 tok · $0.0089 | 6500 tok · $0.0020 |
+| input text | 9976 tok · $0.0022 | 8230 tok · $0.0019 |
+| input cached | 27134 tok · $0.0023 | 10110 tok · $0.0009 |
+| **output audio** | 1011 tok · **$0.0202** | 1085 tok · **$0.0217** |
+| output text | 659 tok · $0.0016 | 669 tok · $0.0016 |
+| **total** | **$0.0423** ($0.0168/min) | **$0.0361** ($0.0143/min) |
+
+Three things this changes about the Component A budget:
+
+1. **Output audio is now the largest single line** — about half the bill, and
+   entirely controlled by how often and how long the agent talks. That is why the
+   speaking policy, not the frame policy, is the centre of this component.
+2. **`gpagent inspect` counts each item once; the API re-bills the whole
+   conversation as input on every turn.** So 14 images sent can bill 31008 image
+   tokens. Estimates from a capture are a lower bound on input, not a forecast.
+3. **Images are no longer 88% of input.** One frame per response at most brings
+   them to roughly a third of input at high detail, and `detail: "low"` is a 15%
+   saving on the *total*, not the 9x it looks like from the input table alone.
+
+At low detail the remarks stay plausible but get vaguer — they react to the
+player's tone rather than the screen ("nice stealth mode vibes" vs "let me know
+who shows up"). High is the default; `--image-detail low` is there when the bill
+matters more than the HUD.
+
+### Trimming the context made it more expensive
+
+The obvious lever, given that the whole conversation is re-billed each turn, is
+to delete old items. Measured, it loses:
+
+| | image tokens | input cost |
+|---|---|---|
+| keep every image | 31008 | **$0.0204** |
+| keep the last two | 8721 | $0.0268 |
+
+Deleting an item invalidates the prompt-cache prefix behind it, and cached input
+is ~10x cheaper than fresh. Fewer tokens, more money. Both client-side trimming
+knobs (`agent.keep_images`, `agent.prune_after_s`) therefore **default to off**;
+the server's `truncation.retention_ratio` is the right mechanism, since it drops
+history in amortized batches specifically to keep the cache prefix intact. The
+knobs remain for hard bounds on very long sessions.
+
+## Playback, and not hearing yourself
+
+Output goes to the **default sink**, because Component A's echo canceller uses
+that sink's monitor as its AEC reference. Target a specific device and the agent
+hears itself and replies to itself, forever. The requirement is the routing, not
+a particular element — `agent.audio_sink` defaults to `autoaudiosink`, which
+names no device, so WirePlumber puts it on the default sink and re-routes it when
+the default changes. `test_playback_stream_lands_on_the_default_sink` asserts
+this against the live PipeWire graph rather than against the element name.
+
+**Barge-in.** `speech.start` fires at VAD detection time, before the segment
+exists. On it the agent sends `response.cancel`, flushes the player, and sends
+`conversation.item.truncate` with the milliseconds actually heard, so the model's
+idea of what it said matches what the player heard. Audio arriving after the
+cancel is dropped rather than played, or the player hears a fragment of the
+sentence that was just cut off.
+
+## Offline development
+
+`gpagent.replay.ReplaySource` implements the same `CaptureSource` protocol the
+real sources do, so `CaptureBus([ReplaySource("sess5")])` is indistinguishable
+from live capture. It also reconstructs the signals the live sources publish
+(`gamepad.intensity`, `speech.start`), which never appear in `events.jsonl` —
+`speech.start` is placed at the *start* of each utterance, not just before the
+segment event, or the "player is talking" gate would open and close in the same
+instant and barge-in would be impossible to reproduce offline.
+
+Two drivers over one agent:
+
+- `drive_from_bus` — live capture, and wall-clock replay.
+- `drive_from_session` — reads the file directly and passes `now=event.t`. No
+  sleeping, no wall clock, fully deterministic. This is `--speed 0`.
+
+`--dry-run` never connects. It prints the turn it would have sent and answers
+itself with a synthesised `response.done`, so the policy's response lifecycle,
+barge-in and the cost meter are all exercised offline. A dry run that dropped
+requests would leave the agent waiting forever for a response that never lands,
+which is the exact failure it exists to catch.
+
+## Verifying against a real game
+
+Automated tests cover none of the feel. Run this by hand, from the desktop
+session:
+
+1. `gpagent commentate` with a game running and a pad connected. Approve the
+   portal dialog once.
+2. **Ask it something out loud.** It should answer within a couple of seconds,
+   in voice, having seen the screen.
+3. **Play quietly for a minute or two.** It should remark unprompted
+   occasionally — and if you ignore it, notice it getting less frequent.
+4. **Interrupt it mid-sentence.** It must stop immediately, and its next reply
+   must not act as though it finished the sentence.
+5. **The decisive one: let it talk for 30 s and stay silent.** Then check the
+   session for `speech.segment` events in that window — there must be zero. If
+   there are any, the agent is hearing itself and will eventually reply to
+   itself; check that playback is going to the default sink.
+6. `gpagent commentate -o out` then read `out/agent.jsonl` — every decision,
+   including the ones where it chose to stay quiet and why.
+
+## Component B gotchas
+
+- `session.audio.output.format` requires `rate`, even though the SDK's TypedDict
+  marks it optional and the docs example omits it. The server rejects the session
+  without it. Caught by `pytest -m network`, which exists for exactly this class
+  of bug: the mocked tests structurally cannot find a payload the server rejects.
+- `response.create.instructions` **replaces** the session instructions for that
+  response; it does not add to them. Sending only a per-reason line threw the
+  persona away on every turn — the first live run answered a swearing player with
+  four sentences of encouraging life coaching. `instructions_for()` sends persona
+  plus reason.
+- `AsyncRealtimeConnection.send()` routes a dict through
+  `async_maybe_transform(event, RealtimeClientEventParam)`, which **silently
+  drops keys the installed SDK's TypedDicts don't know**. Every payload this
+  package sends is asserted to survive that transform intact, so an SDK upgrade
+  that starts eating a field (a dropped `turn_detection: null` would hand
+  turn-taking back to the server) fails a test instead of degrading the agent.
+- `pipewiresink` is the obvious sink and the wrong one: rank 0, a plain
+  `GstBaseSink` with no ring buffer, and it garbled speech here even when the
+  buffers reaching it were sample-for-sample identical to what the model sent.
+  `autoaudiosink` selects `pulsesink`, a `GstAudioBaseSink` built for streamed
+  audio.
+- An appsrc audio pipeline **cannot preroll before it has data**, and it has none
+  until someone speaks. Left unprimed the state change never completes: `start()`
+  stalls for its full timeout, the clock never starts, and `set_state(NULL)`
+  blocks forever. 20 ms of priming silence fixes all three.
+- Buffers pushed into a `format=time` appsrc need explicit timestamps.
+  Unstamped, the sink renders them back to back against a clock that has been
+  running since startup — 3 s of audio came out in 7 ms. `do-timestamp=true` is
+  not the fix either: it stamps buffers as they *arrive*, compressing a 10 s
+  reply into the second it took to download.
+- `response.output_audio.delta` chunks are base64 of an arbitrary byte count and
+  nothing promises an even one. A single odd-length chunk pushed as-is shifts
+  every following sample by a byte and the rest of the utterance is white noise.
+- The player's timestamps and `event.t` are **different clocks**: `event.t`
+  counts from the start of capture, the agent runs on `time.monotonic()`. Mixing
+  them makes every frame look hours stale and the agent silently blind.
+
+## Component A gotchas
 
 - The portal tears down the ScreenCast session, and with it the PipeWire node,
   as soon as the client's D-Bus connection is collected. `ScreenCastSession`

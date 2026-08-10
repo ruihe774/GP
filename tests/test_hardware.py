@@ -64,6 +64,129 @@ def test_audio_pipeline_starts_and_delivers_both_branches():
     assert described["echo_cancel_active"], "AEC should engage when a sink exists"
 
 
+def test_playback_names_no_device():
+    """Naming a device is how the echo canceller silently stops working."""
+    from gpagent.agent.config import AgentConfig
+    from gpagent.agent.playback import AudioPlayer
+
+    for text in (AudioPlayer.PIPELINE, AudioPlayer.SINK, AgentConfig().audio_sink):
+        assert "device=" not in text
+        assert "target-object" not in text
+
+
+def test_playback_stream_lands_on_the_default_sink():
+    """The AEC reference is the *default* sink's monitor.
+
+    Asserting the element name would prove nothing -- what matters is where
+    WirePlumber actually routes the stream, so this looks at the live graph.
+    """
+    import json
+    import subprocess
+
+    from gpagent.agent.playback import SAMPLE_RATE, AudioPlayer
+
+    def graph():
+        raw = subprocess.run(
+            ["pw-dump", "-N"], capture_output=True, text=True, timeout=8, check=True
+        ).stdout
+        return json.loads(raw)
+
+    async def run():
+        player = AudioPlayer()
+        await player.start()
+        player.push(b"\x00\x00" * SAMPLE_RATE * 2)  # 2 s of silence
+        await asyncio.sleep(1.0)
+        objects = graph()
+        await player.drain()
+        await player.stop()
+        return objects
+
+    try:
+        objects = asyncio.run(run())
+    except (OSError, subprocess.SubprocessError):
+        pytest.skip("pw-dump unavailable")
+
+    nodes = {
+        o["id"]: (o.get("info", {}).get("props", {}) or {})
+        for o in objects
+        if o.get("type") == "PipeWire:Interface:Node"
+    }
+    default = None
+    for o in objects:
+        if o.get("type") == "PipeWire:Interface:Metadata":
+            for entry in o.get("metadata") or []:
+                if entry.get("key") == "default.audio.sink":
+                    value = entry.get("value")
+                    default = value.get("name") if isinstance(value, dict) else value
+    assert default, "no default sink configured"
+
+    ours = [
+        i
+        for i, props in nodes.items()
+        if props.get("media.class") == "Stream/Output/Audio"
+        and "python" in str(props.get("application.process.binary", "")).lower()
+    ]
+    assert ours, "our playback stream is not in the graph at all"
+    for node in ours:
+        assert not nodes[node].get("target.object"), "playback must not pin a device"
+
+    targets = {
+        (o.get("info", {}).get("props", {}) or {}).get("link.input.node")
+        for o in objects
+        if o.get("type") == "PipeWire:Interface:Link"
+        and (o.get("info", {}).get("props", {}) or {}).get("link.output.node") in ours
+    }
+    assert {nodes.get(t, {}).get("node.name") for t in targets} == {default}
+
+
+def test_playback_is_paced_and_tears_down_cleanly():
+    """Regression guard for the three bugs that made speech unlistenable."""
+    import math
+    import struct
+    import time
+
+    from gpagent.agent.playback import SAMPLE_RATE, AudioPlayer
+
+    async def run():
+        player = AudioPlayer()
+        started = time.monotonic()
+        await player.start()
+        start_took = time.monotonic() - started
+
+        # Two seconds of 440 Hz in 50 ms chunks, pushed as fast as the loop
+        # will go -- the model streams far faster than real time. Every other
+        # chunk is an odd number of bytes, which used to shift every following
+        # sample and turn the rest of the utterance into white noise.
+        phase = 0.0
+        began = time.monotonic()
+        for i in range(40):
+            n = SAMPLE_RATE // 20
+            samples = [
+                int(6000 * math.sin(2 * math.pi * 440 * j / SAMPLE_RATE + phase))
+                for j in range(n)
+            ]
+            phase += 2 * math.pi * 440 * n / SAMPLE_RATE
+            pcm = struct.pack(f"<{n}h", *samples)
+            player.push(pcm + b"\x00" if i % 2 else pcm)
+        push_took = time.monotonic() - began
+
+        spoken = await player.drain()
+        wall = time.monotonic() - began
+        stopped = time.monotonic()
+        await player.stop()
+        return start_took, push_took, spoken, wall, time.monotonic() - stopped
+
+    start_took, push_took, spoken, wall, stop_took = asyncio.run(run())
+
+    assert start_took < 2.0, f"start stalled for {start_took:.1f}s (unprimed preroll?)"
+    assert push_took < 1.0, "pushing must not block on playback"
+    assert 1900 <= spoken <= 2100, f"expected ~2 s of playback, got {spoken}"
+    # The one that matters: audio must be paced by the clock, not rendered as
+    # fast as it arrived. Untimestamped buffers come out in a fraction of this.
+    assert 1.9 <= wall <= 2.6, f"2 s of audio took {wall:.2f}s of wall clock"
+    assert stop_took < 2.0, f"teardown blocked for {stop_took:.1f}s"
+
+
 def test_screencast_portal_is_available():
     import gi
 

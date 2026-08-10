@@ -12,11 +12,15 @@ from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from .agent.config import AgentConfig, SpeakConfig
+
 __all__ = [
     "GamepadConfig",
     "AudioConfig",
     "ScreenConfig",
     "TriggerConfig",
+    "AgentConfig",
+    "SpeakConfig",
     "CaptureConfig",
 ]
 
@@ -127,6 +131,10 @@ class CaptureConfig:
     audio: AudioConfig = field(default_factory=AudioConfig)
     screen: ScreenConfig = field(default_factory=ScreenConfig)
     triggers: TriggerConfig = field(default_factory=TriggerConfig)
+    #: Component B. Capture does not read these, but they ride in the same file
+    #: and the same --set machinery, and land in the session manifest.
+    agent: AgentConfig = field(default_factory=AgentConfig)
+    speak: SpeakConfig = field(default_factory=SpeakConfig)
 
     # -- (de)serialization -------------------------------------------------
 
