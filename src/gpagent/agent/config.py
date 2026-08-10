@@ -25,6 +25,10 @@ class AgentConfig:
     #: `-mini` is the cheap one; use it for anything that is not a real session
     model: str = "gpt-realtime-2.1-mini"
     voice: str = "marin"
+    #: Output audio playback rate, a multiple of normal speed. Server clamps
+    #: to [0.25, 1.5]; it's a post-processing rate change, not composition,
+    #: so it doesn't affect wording or timing of pauses.
+    voice_speed: float = 1.0
 
     #: override the built-in persona (see persona.py); `persona` wins over the file
     persona: str | None = None

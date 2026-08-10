@@ -99,13 +99,18 @@ gpagent commentate --language ja --voice cedar
 ```
 Speak Japanese (or any ISO 639-1 language code). Voice choices: `alloy`, `ash`, `ballad`, `cedar`, `coral`, `echo`, `marin`, `sage`, `shimmer`, `verse`.
 
+```bash
+gpagent commentate --voice-speed 1.3
+```
+Speed up or slow down the agent's actual voice (clamped to `[0.25, 1.5]`). Not to be confused with `--replay-speed`, which controls how fast a recorded session is re-emitted.
+
 **Control the bill:**
 ```bash
 # Lower detail on images (cheaper, slightly vaguer)
 gpagent commentate --image-detail low --replay my_session
 
 # Slow down playback for longer context
-gpagent commentate --replay my_session --speed 0.5
+gpagent commentate --replay my_session --replay-speed 0.5
 ```
 
 ## Recording Conversations

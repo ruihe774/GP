@@ -815,14 +815,16 @@ def cmd_commentate(args) -> int:
         cfg.agent.model = args.model
     if args.voice:
         cfg.agent.voice = args.voice
+    if args.voice_speed is not None:
+        cfg.agent.voice_speed = args.voice_speed
     if args.image_detail:
         cfg.agent.image_detail = args.image_detail
     if args.language:
         cfg.agent.language = args.language
     if args.no_playback or args.dry_run:
         cfg.agent.playback = False
-    if args.replay is None and args.speed == 0.0:
-        raise SystemExit("--speed 0 only makes sense with --replay")
+    if args.replay is None and args.replay_speed == 0.0:
+        raise SystemExit("--replay-speed 0 only makes sense with --replay")
     return asyncio.run(_commentate(cfg, args))
 
 
@@ -832,7 +834,7 @@ async def _commentate(cfg: CaptureConfig, args) -> int:
     from .agent.transport import OpenAITransport, RecordingTransport
 
     out_dir = Path(args.output) if args.output else None
-    deterministic = args.replay is not None and args.speed == 0.0
+    deterministic = args.replay is not None and args.replay_speed == 0.0
     clock = ReplayClock() if deterministic else None
 
     if args.dry_run:
@@ -924,7 +926,7 @@ async def _build_bus(cfg: CaptureConfig, args):
     if args.replay is not None:
         from .replay import ReplaySource
 
-        source = ReplaySource(args.replay, speed=args.speed)
+        source = ReplaySource(args.replay, speed=args.replay_speed)
         bus = CaptureBus([source])
         await bus.start()
         # Stop the bus once the recording runs out, so the run terminates.
@@ -1063,7 +1065,7 @@ def _compare_with_estimate(directory: str, agent, tok: dict, cost: dict) -> None
 def cmd_replay(args) -> int:
     directory = Path(args.directory)
     events = list(read_session(directory, load_blobs=True))
-    return asyncio.run(_replay(events, args.speed))
+    return asyncio.run(_replay(events, args.replay_speed))
 
 
 async def _replay(events: list, speed: float) -> int:
@@ -1135,7 +1137,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="drive from a recorded session instead of live capture",
     )
     commentate.add_argument(
-        "--speed",
+        "--replay-speed",
         type=float,
         default=1.0,
         help="replay speed; 0 means as fast as possible, deterministically",
@@ -1151,6 +1153,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=VOICES,
         help="override agent.voice (default: %(default)s)",
         default=None,
+    )
+    commentate.add_argument(
+        "--voice-speed",
+        type=float,
+        default=None,
+        help="override agent.voice_speed; output playback rate, clamped to [0.25, 1.5]",
     )
     commentate.add_argument(
         "--language",
@@ -1186,7 +1194,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     replay = sub.add_parser("replay", help="re-emit a session with original timing")
     replay.add_argument("directory")
-    replay.add_argument("--speed", type=float, default=1.0)
+    replay.add_argument("--replay-speed", type=float, default=1.0)
     replay.set_defaults(func=cmd_replay)
     return parser
 

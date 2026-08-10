@@ -90,7 +90,7 @@ The split exists because **raw media to realtime API costs more than the game**.
 
 ### Replay (`src/gpagent/replay.py`)
 
-- `ReplaySource` — reads `events.jsonl` and re-emits with original timing (or deterministic if `--speed 0`). Reconstructs signals that don't appear in the file (`gamepad.intensity`, `speech.start`). Same protocol as live sources.
+- `ReplaySource` — reads `events.jsonl` and re-emits with original timing (or deterministic if `--replay-speed 0`). Reconstructs signals that don't appear in the file (`gamepad.intensity`, `speech.start`). Same protocol as live sources.
 - **Two drivers:**
   - `drive_from_bus` — wall-clock replay
   - `drive_from_session` — reads file, passes `now=event.t`, fully deterministic (no sleeping)
@@ -256,7 +256,7 @@ max_per_min = 8               # global rate cap
 
 **Adding a new input type:** Implement `CaptureSource`, emit events to bus. Follow discretization pattern (edge-trigger, accumulate state in `holding` field).
 
-**Tuning speak timing:** Adjust `SpeakPolicy` parameters. Test with `--speed 0 --dry-run` for deterministic offline runs.
+**Tuning speak timing:** Adjust `SpeakPolicy` parameters. Test with `--replay-speed 0 --dry-run` for deterministic offline runs.
 
 **Debugging cost:** Check `inspect --cost` estimates vs. actual API usage in `manifest.json`. Cost meter in `session.py::usage_for_response()`.
 

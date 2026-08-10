@@ -65,6 +65,7 @@ dedup_threshold = 0.01     # drop frames too similar to the last one SENT
 model = "gpt-realtime-2.1-mini"   # -mini for testing; gpt-realtime-2.1 for real
 # alloy | ash | ballad | cedar | coral | echo | marin | sage | shimmer | verse
 voice = "marin"
+voice_speed = 1.0          # playback rate; server clamps to [0.25, 1.5]
 
 # ISO-639-1 code the player speaks and the agent answers in, e.g. "ja".
 # Unset means the model follows whatever it hears. Passed to input

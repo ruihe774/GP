@@ -213,6 +213,7 @@ class CommentaryAgent:
                         # server rejects the session without it.
                         "format": {"type": "audio/pcm", "rate": SAMPLE_RATE},
                         "voice": self.cfg.voice,
+                        "speed": self.cfg.voice_speed,
                     },
                 },
             },
