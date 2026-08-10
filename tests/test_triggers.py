@@ -119,6 +119,31 @@ class TestGlobalFloor:
         per_minute = len(fired) / 2.0
         assert per_minute <= 12.5, f"{per_minute}/min still too many"
 
+    def test_the_shipped_defaults_are_bounded(self):
+        """Guards the *default* config, not a config the test invented.
+
+        The floor was lowered from 5.0 to 2.0 once Component B stopped billing
+        per captured frame. That is a real relaxation of the rule that fixed the
+        36 frames/min regression, so the shipped numbers get their own ceiling.
+        """
+        clock = Clock()
+        policy = TriggerPolicy(TriggerConfig(), clock)
+        fired = []
+        for _ in range(480):  # 4 minutes at 2 Hz, everything always active
+            policy.on_intensity(1.0)
+            policy.on_speech_start()
+            trigger = policy.decide(scene_score=1.0)
+            if trigger:
+                policy.mark_emitted(trigger)
+                fired.append(clock.now)
+            clock.advance(0.5)
+
+        assert fired, "the defaults must still capture something"
+        gaps = [b - a for a, b in zip(fired, fired[1:])]
+        assert all(gap >= 2.0 - 1e-9 for gap in gaps), f"floor violated: {gaps}"
+        per_minute = len(fired) / 4.0
+        assert per_minute <= 30.0, f"{per_minute}/min is more than the floor allows"
+
     def test_floor_applies_across_different_trigger_kinds(self):
         policy, clock = make(min_interval_s=5.0)
         policy.on_intensity(1.0)

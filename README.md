@@ -160,6 +160,33 @@ speaker/mic device that echo would otherwise be detected as speech and billed.
 near-continuous, so a debounce would fire late or starve frames. The first frame
 of a burst is the informative one.
 
+**`triggers.min_interval_s` is a freshness knob, not a cost knob.** It was 5.0
+when the assumption was that every captured frame gets sent. Component B sends at
+most one frame per response, and only if it is newer than the last one sent, so
+capturing more frames costs local JPEG encoding and nothing on the bill. What the
+floor actually controls is how stale the screenshot is at the moment the agent
+comments — at 5.0 that was 4.2 s on average and 8.0 s at worst, measured on
+sess5. It is now 2.0. Simulated against sess5's real signal timeline:
+
+| `min_interval_s` | frames/min | mean age at send | worst |
+|---|---|---|---|
+| 5.0 | 7.1 | 4.17 s | 8.00 s |
+| 3.0 | 9.1 | 2.70 s | 4.37 s |
+| **2.0** | **9.5** | **2.53 s** | 5.50 s |
+| 1.0 | 11.1 | 2.20 s | 4.37 s |
+
+Below about 3 s the floor stops being the binding constraint — the per-trigger
+throttles take over — so going lower buys tenths of a second and encodes more.
+Two things that look like improvements and are not: lowering `heartbeat_s`
+*raised* the mean age (2.49 s → 2.74 s), because heartbeat frames compete for the
+same global floor as speech-triggered ones and crowd out the frames that land
+near a response; and relaxing `gamepad_throttle_s`/`scene_throttle_s` changed
+nothing at all, because on this recording neither trigger ever fires — every
+frame comes from `speech` or `heartbeat`.
+
+`gpagent commentate` reports the measured frame age at send time, so this is
+checkable on any session rather than inferred.
+
 **VAD is swappable.** `silero` (default) is an ONNX model that rejects noise,
 tones and bass rumble at ≤0.003 against a 0.5 threshold. `webrtc` uses
 `webrtcdsp`'s built-in detector at zero extra cost — note it is *edge-reported*

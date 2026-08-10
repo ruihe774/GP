@@ -896,6 +896,9 @@ def _print_agent_report(agent, args, out_dir: Path | None) -> None:
     print(
         f"  frames          {report['frames_sent']} sent of {report['frames_seen']} captured"
     )
+    if report["frame_age_s"]:
+        age = report["frame_age_s"]
+        print(f"  frame age       {age['mean']}s mean, {age['max']}s worst at send time")
     print(f"  spoke           {usage['spoken_s']}s")
 
     tok = usage["tokens"]

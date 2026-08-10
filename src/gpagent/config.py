@@ -111,7 +111,23 @@ class TriggerConfig:
     #: throttles only limit their own kind, so without a global rule the
     #: triggers take turns and the combined rate is far higher than any one of
     #: them allows -- measured at 36 frames/min with a 1.5 s floor.
-    min_interval_s: float = 5.0
+    #:
+    #: This was 5.0 when frames were billed as captured. Component B sends at
+    #: most one frame per response and only if it is newer than the last one
+    #: sent, so the capture rate no longer moves the bill -- it buys *freshness*
+    #: instead, and 5.0 was leaving the model looking at a screenshot 4.2 s old
+    #: on average (8.0 s at worst) at the moment it commented.
+    #:
+    #: 2.0 is just past the knee. Simulated over sess5's real signal timeline:
+    #: 5.0 -> 4.17 s mean age, 3.0 -> 2.70 s, 2.0 -> 2.53 s, 1.0 -> 2.20 s. Below
+    #: about 3 s the floor stops being the binding constraint and the per-trigger
+    #: throttles take over, so going lower buys little and encodes more.
+    min_interval_s: float = 2.0
+    #: Leave this well above `min_interval_s`. Heartbeat frames compete for the
+    #: same global floor as speech-triggered ones, and speech-triggered frames
+    #: are the ones that land near a response: dropping the heartbeat to 6 s
+    #: raised the frame rate to 12.3/min and made the mean age *worse* (2.49 s
+    #: -> 2.74 s) by crowding out better-timed frames.
     heartbeat_s: float = 10.0
     gamepad_intensity: float = 0.35
     #: leading-edge throttle: fire at once, then at most once per interval

@@ -123,6 +123,8 @@ class CommentaryAgent:
         self._image_items: list[str] = []
         self._item_seq = 0
         self._last_prune = 0.0
+        #: age of each frame at the moment it was attached, for tuning capture
+        self._frame_ages: list[float] = []
         self._pump: asyncio.Task | None = None
         self._watchdog: asyncio.Task | None = None
         self.spoke = 0
@@ -267,8 +269,14 @@ class CommentaryAgent:
             if ctx.text:
                 detail.append(f'"{ctx.text}"')
             if ctx.frame:
+                # Frame age is the whole point of the capture-side trigger
+                # interval now that at most one frame is sent per response:
+                # it buys freshness, not tokens.
+                age = now - ctx.frame.t
+                self._frame_ages.append(age)
                 detail.append(
-                    f"frame {ctx.frame.w}x{ctx.frame.h} {self.cfg.image_detail}"
+                    f"frame {ctx.frame.w}x{ctx.frame.h} {self.cfg.image_detail} "
+                    f"({age:.1f}s old)"
                 )
 
         if reason == "reply":
@@ -560,6 +568,12 @@ class CommentaryAgent:
             "declined": dict(self.policy.declined),
             "frames_seen": self.context.frames_seen,
             "frames_sent": self.context.frames_sent,
+            "frame_age_s": {
+                "mean": round(sum(self._frame_ages) / len(self._frame_ages), 2),
+                "max": round(max(self._frame_ages), 2),
+            }
+            if self._frame_ages
+            else None,
             "usage": self.meter.to_dict(),
         }
 
