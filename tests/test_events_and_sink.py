@@ -305,6 +305,17 @@ class TestConfig:
     def test_to_dict_is_json_serializable(self):
         json.dumps(CaptureConfig().to_dict())
 
+    def test_merge_dict_overlays_onto_non_default_instance(self):
+        cfg = CaptureConfig()
+        cfg.apply_overrides({"gamepad.sticks_mode": "full"})
+        cfg.merge_dict({"audio": {"vad_backend": "webrtc"}})
+        assert cfg.gamepad.sticks_mode == "full", "sections absent from the dict are untouched"
+        assert cfg.audio.vad_backend == "webrtc"
+
+    def test_merge_dict_rejects_unknown_key(self):
+        with pytest.raises(ValueError):
+            CaptureConfig().merge_dict({"gamepad": {"nonexistent": 1}})
+
 
 class TestTokens:
     def test_audio_is_one_token_per_100ms(self):

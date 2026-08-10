@@ -161,20 +161,24 @@ class CaptureConfig:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> CaptureConfig:
-        cfg = cls()
-        for f in fields(cls):
+    def merge_dict(self, data: dict[str, Any]) -> None:
+        """Overlay a config dict onto self. Sections/keys absent from `data` are untouched."""
+        for f in fields(type(self)):
             section = data.get(f.name)
             if not isinstance(section, dict):
                 continue
-            target = getattr(cfg, f.name)
+            target = getattr(self, f.name)
             known = {sf.name for sf in fields(target)}
             for key, value in section.items():
                 if key in known:
                     setattr(target, key, value)
                 else:
                     raise ValueError(f"unknown config key: {f.name}.{key}")
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CaptureConfig:
+        cfg = cls()
+        cfg.merge_dict(data)
         return cfg
 
     @classmethod

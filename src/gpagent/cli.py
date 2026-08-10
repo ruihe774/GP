@@ -11,6 +11,7 @@ import os
 import signal
 import sys
 import time
+import tomllib
 import wave
 from datetime import UTC, datetime
 from pathlib import Path
@@ -65,7 +66,18 @@ def _parse_set(values: list[str]) -> dict[str, Any]:
 
 
 def _build_config(args) -> CaptureConfig:
-    cfg = CaptureConfig.load(getattr(args, "config", None))
+    cfg = CaptureConfig()
+    replay_dir = getattr(args, "replay", None)
+    if replay_dir:
+        saved = _read_manifest(Path(replay_dir)).get("config")
+        if isinstance(saved, dict):
+            try:
+                cfg.merge_dict(saved)
+            except ValueError as exc:
+                raise SystemExit(f"bad config in {replay_dir}/manifest.json: {exc}") from exc
+    if getattr(args, "config", None):
+        with open(args.config, "rb") as fh:
+            cfg.merge_dict(tomllib.load(fh))
     try:
         cfg.apply_overrides(_parse_set(getattr(args, "set", []) or []))
     except ValueError as exc:
@@ -912,6 +924,8 @@ async def _commentate(cfg: CaptureConfig, args) -> int:
     mode = "dry run" if args.dry_run else cfg.agent.model
     source = f"replay {args.replay}" if args.replay else "live capture"
     print(f"commentating: {source} -> {mode}")
+    if args.replay and isinstance(_read_manifest(Path(args.replay)).get("config"), dict):
+        print(f"  using recorded config from {args.replay} (pass -c/--set/flags to override)")
     if not args.dry_run and not cfg.agent.playback:
         print("(playback disabled: nothing will come out of the speakers)")
 
