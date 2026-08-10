@@ -7,6 +7,7 @@ agent that sent nothing at all would satisfy "never talks over the player" and
 
 from __future__ import annotations
 
+import asyncio
 import base64
 
 import pytest
@@ -498,6 +499,112 @@ class TestRecording:
         await complete_response(agent)  # must not raise without a recorder
 
 
+class TestBargeInSpares:
+    """Barge-in stops the agent talking over the player. Nothing else."""
+
+    async def push(self, agent, seconds):
+        await agent.on_server_event(
+            {"type": "response.output_item.added", "item": {"id": "a1"}}
+        )
+        await agent.on_server_event(
+            {
+                "type": "response.output_audio.delta",
+                "item_id": "a1",
+                "delta": base64.b64encode(b"\x00\x00" * int(24000 * seconds)).decode(),
+            }
+        )
+
+    async def test_a_response_that_has_not_made_a_sound_survives(self, agent):
+        """sess7: four consecutive questions cancelled at 0.0 s, none answered.
+
+        The player talking in short bursts starts a reply, then starts talking
+        again before the first audio arrives ~1.9 s later. Cancelling then
+        stops nothing and costs the answer.
+        """
+        await agent.handle(speech(), now=100.0)
+        assert agent.transport.sent_of_type("response.create"), "a reply was asked for"
+        agent.transport.sent.clear()
+
+        advance(agent, 101.0)
+        await agent.on_speech_start(now=101.0)  # they carry on talking
+
+        assert not agent.transport.sent_of_type("response.cancel")
+        assert agent._response_active, "the answer was thrown away for nothing"
+
+    async def test_a_response_already_speaking_is_still_cut(self, agent):
+        await agent.handle(speech(), now=100.0)
+        await self.push(agent, 4.0)
+        advance(agent, 101.0)  # 1 s of it has been heard
+        await agent.on_speech_start(now=101.0)
+
+        assert agent.transport.sent_of_type("response.cancel")
+        truncate = agent.transport.sent_of_type("conversation.item.truncate")
+        assert truncate and 900 <= truncate[0]["audio_end_ms"] <= 1100
+
+
+class TestTheSessionComesBack:
+    """The API caps a session at 60 minutes, so this is not an edge case."""
+
+    def dropping_transport(self):
+        class Dropping(FakeTransport):
+            def __init__(self):
+                super().__init__()
+                self.connects = 0
+
+            async def connect(self):
+                self.connects += 1
+                self._incoming = asyncio.Queue()  # a new socket, a new stream
+                self._closed = False
+
+            def drop(self):
+                self._incoming.put_nowait(None)
+
+        return Dropping()
+
+    async def started(self, transport):
+        cfg = make_config(reconnect_min_s=0.01, reconnect_max_s=0.01)
+        agent = CommentaryAgent(cfg, transport, NullPlayer())
+        await agent.start()
+        return agent
+
+    async def settle(self):
+        for _ in range(50):
+            await asyncio.sleep(0)
+
+    async def test_a_dropped_socket_is_reopened_and_reseeded(self):
+        transport = self.dropping_transport()
+        agent = await self.started(transport)
+        try:
+            transport.drop()
+            await asyncio.sleep(0.05)
+            assert transport.connects == 2, "the agent went permanently mute"
+            assert len(transport.sent_of_type("session.update")) == 2, "persona not reseeded"
+            assert any("reopened" in line.text for line in agent.lines)
+        finally:
+            await agent.close()
+
+    async def test_closing_does_not_reopen(self):
+        transport = self.dropping_transport()
+        agent = await self.started(transport)
+        await agent.close()
+        await asyncio.sleep(0.05)
+        assert transport.connects == 1
+
+    async def test_a_response_in_flight_does_not_gate_the_new_session(self):
+        """The in-flight gate is absolute, and nothing will ever finish it."""
+        transport = self.dropping_transport()
+        agent = await self.started(transport)
+        try:
+            await agent.handle(frame(score=1.0), now=100.0)
+            assert agent._response_active
+            transport.drop()
+            await asyncio.sleep(0.05)
+            assert not agent._response_active
+            assert not agent._items and not agent._image_items, "stale item ids kept"
+        finally:
+            await agent.close()
+
+
 class TestResponsesThatSayNothing:
     """One reply in sess6 came back empty and nothing anywhere said why."""
 
@@ -516,6 +623,21 @@ class TestResponsesThatSayNothing:
         notes = [line for line in agent.lines if line.kind == "note"]
         assert notes, "a response that said nothing must leave a trace"
         assert "incomplete" in notes[0].text and "max_output_tokens" in notes[0].text
+
+    async def test_our_own_barge_in_is_not_noted_twice(self, agent):
+        """It is already logged as `cut`; noting it too buried the real ones."""
+        await agent.handle(frame(score=1.0), now=100.0)
+        await agent.on_server_event(
+            {
+                "type": "response.done",
+                "response": {
+                    "status": "cancelled",
+                    "status_details": {"reason": "client_cancelled"},
+                    "usage": {},
+                },
+            }
+        )
+        assert not [line for line in agent.lines if line.kind == "note"]
 
     async def test_a_completed_response_is_not_annotated(self, agent):
         await agent.handle(frame(score=1.0), now=100.0)

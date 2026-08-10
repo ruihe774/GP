@@ -145,6 +145,8 @@ class CommentaryAgent:
         self._response_usage: dict[str, Any] = {}
         self._pump: asyncio.Task | None = None
         self._watchdog: asyncio.Task | None = None
+        #: set by close(), so the pump stops reopening the session
+        self._closing = False
         self.spoke = 0
 
     # -- lifecycle ---------------------------------------------------------
@@ -166,6 +168,7 @@ class CommentaryAgent:
         self._emit(Line(self.clock(), "session", f"session open ({self.cfg.model})"))
 
     async def close(self) -> None:
+        self._closing = True
         if self._watchdog is not None:
             self._watchdog.cancel()
         if self._pump is not None:
@@ -260,7 +263,7 @@ class CommentaryAgent:
         """The player has started talking. Get out of the way."""
         now = self.clock() if now is None else now
         self.policy.on_speech_start(now)
-        if self._speaking(now):
+        if self._speaking(now) and self._audible(now):
             await self._cancel_response(now, why="barge-in")
 
     def _speaking(self, now: float) -> bool:
@@ -271,6 +274,19 @@ class CommentaryAgent:
         and that is precisely the window barge-in has to cover.
         """
         return self._response_active or self.player.timer.remaining_ms(now) > 0
+
+    def _audible(self, now: float) -> bool:
+        """Has any of the current sentence actually reached the player?
+
+        Barge-in exists to stop the agent talking over someone. A response
+        that has not made a sound yet is not talking over anyone, and killing
+        it throws away a turn already paid for. In sess7 a player talking in
+        short bursts cancelled four consecutive replies at 0.0 s each and got
+        answers to none of their questions; ten of sixty-six responses were
+        generated, billed and discarded without a sound. Let it through -- the
+        new utterance is already queued and folds into the next turn.
+        """
+        return self.player.timer.played_ms(now) > 0
 
     async def tick(self, now: float | None = None) -> None:
         """Speak if the policy says so. Safe to call as often as you like."""
@@ -441,16 +457,79 @@ class CommentaryAgent:
     # -- server events -----------------------------------------------------
 
     async def _pump_events(self) -> None:
+        delay = self.cfg.reconnect_min_s
+        while not self._closing:
+            try:
+                async for event in self.transport:
+                    delay = self.cfg.reconnect_min_s
+                    try:
+                        await self.on_server_event(event)
+                    except Exception:
+                        log.exception("failed handling %s", event.get("type"))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("realtime connection dropped")
+            if not await self._reconnect(delay):
+                return
+            delay = min(delay * 2, self.cfg.reconnect_max_s)
+
+    async def _reconnect(self, delay: float) -> bool:
+        """Open a fresh session after the socket goes away.
+
+        Not an edge case: the API caps a session at 60 minutes, so on any long
+        session this is the expected end of every hour. sess7 ran 61 minutes
+        and spent its last 82 seconds mute, because the pump simply exited --
+        the quietest possible failure, and the one the timeouts elsewhere in
+        this file exist to avoid.
+
+        History does not come back with us. Reseeding instructions only is a
+        deliberate choice from the design: a couch commentator that forgets
+        what happened four minutes ago is fine, and it keeps recovery to one
+        `session.update`.
+        """
+        if self._closing:
+            return False
+        self._emit(Line(self.clock(), "session", f"connection lost; reopening in {delay:.0f}s"))
         try:
-            async for event in self.transport:
-                try:
-                    await self.on_server_event(event)
-                except Exception:
-                    log.exception("failed handling %s", event.get("type"))
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            raise
+        if self._closing:
+            return False
+        try:
+            await self.transport.close()
+            await self.transport.connect()
+            await self.transport.send(self.session_update())
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("realtime connection dropped")
+            log.warning("reconnect failed", exc_info=True)
+            return True  # keep trying; close() is what ends this loop
+        self._after_reconnect()
+        self._emit(Line(self.clock(), "session", f"session reopened ({self.cfg.model})"))
+        return True
+
+    def _after_reconnect(self) -> None:
+        """Drop everything that referred to the session that just died."""
+        now = self.clock()
+        # Item ids belonged to the old conversation; deleting or truncating
+        # them on the new one would earn an error for each.
+        self._items.clear()
+        self._image_items.clear()
+        self._audio_item_id = None
+        self.player.flush(now)
+        self._accept_audio = True
+        self._reset_response_record()
+        if self._response_active:
+            # The gate is absolute while set, and nothing is ever going to
+            # finish the response it is holding open.
+            self._response_active = False
+            self._response_started = None
+            self.policy.on_response_cancelled(now)
+        if self._watchdog is not None:
+            self._watchdog.cancel()
+            self._watchdog = None
 
     async def on_server_event(self, event: dict) -> None:
         kind = event.get("type")
@@ -511,9 +590,12 @@ class CommentaryAgent:
         # recorded as a 0 ms response and the player's question just goes
         # unanswered with nothing in the log to say why.
         status = response.get("status")
-        if status and status != "completed":
-            detail = response.get("status_details") or {}
-            why = detail.get("reason") or (detail.get("error") or {}).get("message") or ""
+        detail = response.get("status_details") or {}
+        why = detail.get("reason") or (detail.get("error") or {}).get("message") or ""
+        # `client_cancelled` is the server agreeing to a barge-in we asked for,
+        # already logged as `cut`. Noting it too made it two thirds of the
+        # notes in sess7 and buried the two that mattered.
+        if status and status != "completed" and why != "client_cancelled":
             self._emit(Line(now, "note", f"response {status}" + (f": {why}" if why else "")))
         end = now
         if not self.player.realtime:
