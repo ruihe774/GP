@@ -182,12 +182,16 @@ class AudioPlayer:
     # them unstamped in a `format=time` source leaves the sink to render them
     # back to back against a clock that has been running since startup, which
     # is heard as chunks and gaps.
+    #: `volume` ships in gst-plugins-base next to `audioconvert`/`audioresample`,
+    #: which this pipeline already requires unconditionally -- so it applies the
+    #: gain in the pipeline itself rather than scaling PCM samples by hand.
     PIPELINE = (
         "appsrc name=src format=time is-live=false do-timestamp=false "
         "block=false max-bytes=16777216 "
         "caps=audio/x-raw,format=S16LE,rate={rate},channels=1,layout=interleaved "
         "! queue max-size-time=0 max-size-bytes=0 max-size-buffers=0 "
         "! audioconvert ! audioresample "
+        "! volume name=vol volume={volume} "
         "! {sink}"
     )
 
@@ -200,14 +204,17 @@ class AudioPlayer:
         clock: Callable[[], float] = time.monotonic,
         *,
         sink: str | None = None,
+        volume: float = 1.0,
     ):
         #: overridable only so tests can render the timeline somewhere
         #: inspectable; production always uses the default sink
         self.sink = sink or self.SINK
+        self.volume = volume
         self.timer = PlaybackTimer(clock)
         self._gst = None
         self._pipeline = None
         self._src = None
+        self._vol = None
         #: next presentation timestamp, in pipeline running time
         self._pts: int | None = None
         #: trailing bytes of a chunk that did not end on a sample boundary
@@ -222,9 +229,10 @@ class AudioPlayer:
         Gst = ensure_gst()
         self._gst = Gst
         self._pipeline = Gst.parse_launch(
-            self.PIPELINE.format(rate=SAMPLE_RATE, sink=self.sink)
+            self.PIPELINE.format(rate=SAMPLE_RATE, sink=self.sink, volume=self.volume)
         )
         self._src = self._pipeline.get_by_name("src")
+        self._vol = self._pipeline.get_by_name("vol")
         if self._pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
             drain_bus_errors(self._pipeline, "playback")
             raise RuntimeError("playback pipeline failed to start")
@@ -312,12 +320,13 @@ def make_player(
     clock: Callable[[], float] = time.monotonic,
     *,
     sink: str | None = None,
+    volume: float = 1.0,
 ):
     """A real player when asked for and available, a null one otherwise."""
     if not enabled:
         return NullPlayer(clock)
     try:
-        return AudioPlayer(clock, sink=sink)
+        return AudioPlayer(clock, sink=sink, volume=volume)
     except Exception:
         log.warning("playback unavailable; running silent", exc_info=True)
         return NullPlayer(clock)

@@ -106,6 +106,7 @@ playback = true
 # pipewiresink is rank 0 with no ring buffer and garbles speech; autoaudiosink
 # picks pulsesink, which is built for streamed audio.
 audio_sink = "autoaudiosink"
+volume = 1.0                  # linear gain, applied by a gst volume element; 0 is silent
 
 [speak]
 # When the agent is allowed to talk. Three reasons -- reply, react, ambient --

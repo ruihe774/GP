@@ -819,6 +819,8 @@ def cmd_commentate(args) -> int:
         cfg.agent.voice_speed = args.voice_speed
     if args.image_detail:
         cfg.agent.image_detail = args.image_detail
+    if args.volume is not None:
+        cfg.agent.volume = args.volume
     if args.language:
         cfg.agent.language = args.language
     if args.no_playback or args.dry_run:
@@ -849,7 +851,10 @@ async def _commentate(cfg: CaptureConfig, args) -> int:
             return 1
 
     player = make_player(
-        cfg.agent.playback, clock or time.monotonic, sink=cfg.agent.audio_sink
+        cfg.agent.playback,
+        clock or time.monotonic,
+        sink=cfg.agent.audio_sink,
+        volume=cfg.agent.volume,
     )
 
     # One directory holding both halves of the conversation: what was captured
@@ -1178,6 +1183,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     commentate.add_argument(
         "--no-playback", action="store_true", help="do not open the audio sink"
+    )
+    commentate.add_argument(
+        "--volume",
+        type=float,
+        default=None,
+        help="override agent.volume; linear gain, 1.0 is unity (default: %(default)s)",
     )
     commentate.add_argument("-o", "--output", help="directory for agent.jsonl and usage")
     commentate.add_argument("-q", "--quiet", action="store_true", help="no live output")

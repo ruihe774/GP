@@ -97,6 +97,9 @@ class AgentConfig:
     #: garbled speech in testing. Whatever you put here must not name a device,
     #: or the echo canceller stops cancelling.
     audio_sink: str = "autoaudiosink"
+    #: linear gain applied by a `volume` element in the playback pipeline.
+    #: 1.0 is unity, 0.0 is silent; above 1.0 amplifies (and can clip).
+    volume: float = 1.0
     #: hard stop on a rambling response -- output audio is the expensive half
     max_response_s: float = 15.0
 
