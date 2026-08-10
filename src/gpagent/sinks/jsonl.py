@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import IO, Any
 
 from ..events import Event, decode
 
@@ -34,12 +35,12 @@ class JsonlSink:
     def __init__(self, directory: str | Path, *, inline: bool = False):
         self.directory = Path(directory)
         self.inline = inline
-        self._events = None
+        self._events: IO[str] | None = None
         self._blobs = self.directory / BLOBS_DIR
         self.counts: dict[str, int] = {}
         self.bytes_written = 0
 
-    def __enter__(self) -> "JsonlSink":
+    def __enter__(self) -> JsonlSink:
         self.open()
         return self
 
@@ -62,6 +63,7 @@ class JsonlSink:
         self.counts[event.TYPE] = self.counts.get(event.TYPE, 0) + 1
 
     def _write_blob(self, event: Event) -> str:
+        assert event.data is not None, "caller only writes blobs for events carrying data"
         ext = event.BLOB_EXT or "bin"
         name = f"{event.seq:06d}-{event.BLOB_KIND}.{ext}"
         path = self._blobs / name
@@ -75,7 +77,7 @@ class JsonlSink:
             self._events.close()
             self._events = None
         payload = {
-            "written_at": datetime.now(timezone.utc).isoformat(),
+            "written_at": datetime.now(UTC).isoformat(),
             "inline": self.inline,
             "counts": self.counts,
             "blob_bytes": self.bytes_written,

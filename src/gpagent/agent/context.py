@@ -35,7 +35,7 @@ class Frame:
     trigger: str = ""
 
     @classmethod
-    def from_event(cls, event: ScreenFrame, t: float) -> "Frame":
+    def from_event(cls, event: ScreenFrame, t: float) -> Frame:
         """`t` is the *agent's* clock, not `event.t`.
 
         Live, `event.t` counts from the start of capture while the agent runs on

@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import pytest
-
 from conftest import make_gamepad
+
 from gpagent.capture import evdev_raw as ev
 from gpagent.capture.gamepad import GamepadDiscretizer, resolve_layout
-from gpagent.config import GamepadConfig, TriggerConfig
+from gpagent.config import GamepadConfig, SticksMode, TriggerConfig
 from gpagent.events import GamepadActivity, GamepadIdle
 
 
@@ -15,7 +15,7 @@ def event(type_: int, code: int, value: int) -> ev.InputEvent:
     return ev.InputEvent(sec=0, usec=0, type=type_, code=code, value=value)
 
 
-def make(sticks_mode: str = "intensity", **kwargs) -> GamepadDiscretizer:
+def make(sticks_mode: SticksMode = "intensity", **kwargs) -> GamepadDiscretizer:
     info = make_gamepad()
     cfg = GamepadConfig(sticks_mode=sticks_mode, **kwargs)
     return GamepadDiscretizer("pad0", resolve_layout(info), info, cfg)
@@ -39,7 +39,7 @@ class TestIntensityReachesTheFrameTrigger:
 
     THRESHOLD = TriggerConfig().gamepad_intensity
 
-    def hold_trigger(self, sticks_mode: str, value: float = 1.0) -> float:
+    def hold_trigger(self, sticks_mode: SticksMode, value: float = 1.0) -> float:
         disc = make(sticks_mode)
         raw = int(value * 1023)
         disc.feed(event(ev.EV_ABS, ev.ABS_RZ, raw), 0.0)

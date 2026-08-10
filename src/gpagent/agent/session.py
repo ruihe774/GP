@@ -26,9 +26,10 @@ import contextlib
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import IO, Any
 
 from ..config import CaptureConfig
 from ..events import (
@@ -111,7 +112,7 @@ class CommentaryAgent:
         self.lines: list[Line] = []
         self._on_line = on_line
         self._log_path = Path(log_path) if log_path else None
-        self._log_fh = None
+        self._log_fh: IO[str] | None = None
 
         #: unanswered utterances, oldest first: (t, pcm, dur_ms)
         self._pending: list[tuple[float, bytes, int]] = []

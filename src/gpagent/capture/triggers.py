@@ -16,7 +16,7 @@ entirely. The first frame of a burst is the informative one.
 from __future__ import annotations
 
 import time
-from typing import Callable
+from collections.abc import Callable
 
 from ..config import TriggerConfig
 
@@ -66,7 +66,11 @@ class TriggerPolicy:
 
         if self._gamepad_pending:
             self._gamepad_pending = False
-            if self._last_gamepad is None or now - self._last_gamepad >= self.cfg.gamepad_throttle_s:
+            throttled = (
+                self._last_gamepad is not None
+                and now - self._last_gamepad < self.cfg.gamepad_throttle_s
+            )
+            if not throttled:
                 return "gamepad"
 
         if scene_score >= self.cfg.scene_threshold and (

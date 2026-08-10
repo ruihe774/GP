@@ -178,7 +178,7 @@ class TestPlaybackTimestamps:
         for _ in range(4):
             player.push(b"\x00\x00" * 2400)  # 100 ms each
         pushed = player._src.pushed
-        for a, b in zip(pushed, pushed[1:]):
+        for a, b in zip(pushed, pushed[1:], strict=False):
             assert b.pts == a.pts + a.duration
         assert all(b.duration == 100_000_000 for b in pushed)
 
@@ -485,7 +485,11 @@ class TestRecordingTransport:
                     "type": "message",
                     "role": "user",
                     "content": [
-                        {"type": "input_image", "image_url": "data:image/jpeg;base64,AA", "detail": "low"}
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/jpeg;base64,AA",
+                            "detail": "low",
+                        }
                     ],
                 },
             }

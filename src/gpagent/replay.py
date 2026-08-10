@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .bus import BusContext
 from .events import Event, GamepadActivity, SpeechSegment
 from .sinks.jsonl import read_session
 
@@ -58,14 +59,14 @@ class ReplaySource:
         self.load_blobs = load_blobs
         self.signals = signals
         self.finished = asyncio.Event()
-        self._ctx = None
+        self._ctx: BusContext | None = None
         self._task: asyncio.Task | None = None
         self._emitted = 0
         self._total = 0
 
     # -- lifecycle ---------------------------------------------------------
 
-    async def start(self, ctx) -> None:
+    async def start(self, ctx: BusContext) -> None:
         self._ctx = ctx
         events = list(read_session(self.directory, load_blobs=self.load_blobs))
         if not events:
@@ -91,6 +92,7 @@ class ReplaySource:
     # -- the replay loop ---------------------------------------------------
 
     async def _run(self, events: list[Event]) -> None:
+        assert self._ctx is not None, "_run only starts after start() sets _ctx"
         cues = build_cues(events, signals=self.signals)
         start = time.monotonic()
         origin = cues[0][0]

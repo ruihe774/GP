@@ -17,7 +17,8 @@ import logging
 import threading
 import time
 from collections import defaultdict
-from typing import Any, AsyncIterator, Callable, Iterable, Protocol
+from collections.abc import AsyncIterator, Callable, Iterable
+from typing import Any, Protocol
 
 from .events import Event, ScreenFrame
 
@@ -32,7 +33,7 @@ class CaptureSource(Protocol):
 
     name: str
 
-    async def start(self, ctx: "BusContext") -> None: ...
+    async def start(self, ctx: BusContext) -> None: ...
     async def stop(self) -> None: ...
     def describe(self) -> dict[str, Any]: ...
 
@@ -40,7 +41,7 @@ class CaptureSource(Protocol):
 class BusContext:
     """Handed to each source: how to emit events and exchange hints."""
 
-    def __init__(self, bus: "CaptureBus") -> None:
+    def __init__(self, bus: CaptureBus) -> None:
         self._bus = bus
 
     @property
@@ -101,7 +102,7 @@ class CaptureBus:
         if self._loop is not None:
             self._queue.put_nowait(None)
 
-    async def __aenter__(self) -> "CaptureBus":
+    async def __aenter__(self) -> CaptureBus:
         await self.start()
         return self
 

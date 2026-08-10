@@ -32,7 +32,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Callable
+from collections.abc import Callable
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -211,10 +212,10 @@ class AudioPlayer:
         self.sink = sink or self.SINK
         self.volume = volume
         self.timer = PlaybackTimer(clock)
-        self._gst = None
-        self._pipeline = None
-        self._src = None
-        self._vol = None
+        self._gst: Any = None
+        self._pipeline: Any = None
+        self._src: Any = None
+        self._vol: Any = None
         #: next presentation timestamp, in pipeline running time
         self._pts: int | None = None
         #: trailing bytes of a chunk that did not end on a sample boundary

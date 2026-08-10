@@ -7,7 +7,6 @@ works on a machine whose hardware nobody has seen.
 from __future__ import annotations
 
 import pytest
-
 from conftest import (
     make_gamepad,
     make_joystick_flightstick,
@@ -15,6 +14,7 @@ from conftest import (
     make_mouse,
     make_touchpad,
 )
+
 from gpagent.capture import evdev_raw as ev
 from gpagent.capture.gamepad import parse_button_map, resolve_layout
 from gpagent.config import GamepadConfig

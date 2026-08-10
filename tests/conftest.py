@@ -11,7 +11,9 @@ def absinfo(minimum: int, maximum: int, value: int = 0) -> ev.AbsInfo:
     return ev.AbsInfo(value=value, minimum=minimum, maximum=maximum, fuzz=0, flat=0, resolution=0)
 
 
-def make_gamepad(path: str = "/dev/input/event99", vid: int = 0x2DC8, pid: int = 0x200F) -> ev.DeviceInfo:
+def make_gamepad(
+    path: str = "/dev/input/event99", vid: int = 0x2DC8, pid: int = 0x200F
+) -> ev.DeviceInfo:
     """An xpad-style pad: two sticks, two analog triggers, a hat, 11 buttons."""
     return ev.DeviceInfo(
         path=path,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pytest
 
@@ -14,8 +16,8 @@ WINDOW = 512
 OUT_PER_WINDOW = WINDOW * OUT_RATE // VAD_RATE  # 768
 
 
-def config(**kwargs) -> AudioConfig:
-    base = dict(
+def config(**kwargs: Any) -> AudioConfig:
+    base: dict[str, Any] = dict(
         vad_rate=VAD_RATE,
         out_rate=OUT_RATE,
         preroll_ms=300,

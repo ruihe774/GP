@@ -15,8 +15,9 @@ import os
 import socket
 import time
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any
 
+from ..bus import BusContext
 from ..config import GamepadConfig
 from ..events import GamepadActivity, GamepadConnected, GamepadDisconnected, GamepadIdle
 from . import evdev_raw as ev
@@ -544,14 +545,14 @@ class GamepadSource:
 
     def __init__(self, cfg: GamepadConfig):
         self.cfg = cfg
-        self._ctx = None
+        self._ctx: BusContext | None = None
         self._devices: dict[str, _Device] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._tasks: list[asyncio.Task] = []
         self._netlink: socket.socket | None = None
         self._rescan_handle: asyncio.TimerHandle | None = None
 
-    async def start(self, ctx) -> None:
+    async def start(self, ctx: BusContext) -> None:
         self._ctx = ctx
         self._loop = asyncio.get_running_loop()
         self._rescan()
@@ -620,6 +621,7 @@ class GamepadSource:
         device = _Device(info, fd, discretizer)
         self._devices[info.device_id] = device
         assert self._loop is not None
+        assert self._ctx is not None
         self._loop.add_reader(fd, self._on_readable, info.device_id)
         log.info("gamepad connected: %s (%s)", info.name, info.path)
         self._ctx.emit(
@@ -669,6 +671,7 @@ class GamepadSource:
             pass
 
     async def _flush_loop(self) -> None:
+        assert self._ctx is not None
         interval = self.cfg.window_ms / 1000.0
         while True:
             await asyncio.sleep(interval)
@@ -696,7 +699,9 @@ class GamepadSource:
             sock.setblocking(False)
             sock.bind((0, 2))  # group 2 = udev, readable unprivileged
         except OSError as exc:
-            log.info("netlink hotplug unavailable (%s); polling every %.1fs", exc, self.cfg.rescan_s)
+            log.info(
+                "netlink hotplug unavailable (%s); polling every %.1fs", exc, self.cfg.rescan_s
+            )
             return
         self._netlink = sock
         assert self._loop is not None

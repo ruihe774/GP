@@ -223,6 +223,21 @@ Specific test files:
 - `test_segmenter.py` — VAD context
 - `test_replay_source.py` — replay signal reconstruction
 
+## Linting & Type Checking
+
+`ruff` (lint) and `mypy` (types), configured in `pyproject.toml` under `[tool.ruff]` / `[tool.mypy]`, installed via the `dev` dependency group (`uv sync`).
+
+```bash
+uv run ruff check .   # lint
+uv run mypy           # type check (src + tests)
+```
+
+Both must be clean before committing. Notes on the current config:
+
+- `SIM115` (bare `open()` outside a `with`) is disabled repo-wide: several long-lived handles (`JsonlSink._events`, `OpenAITransport`'s log file, GStreamer pipeline handles) are opened in a `start()`/`open()` method and closed in a paired `close()`, which isn't expressible as a single `with` block.
+- GStreamer/GObject-introspection handles (`gi.repository.Gst` objects — pipelines, elements, buffers) are untyped at the source, so attributes that hold them are explicitly annotated `Any` rather than left to infer as `None` from their `__init__` default. Real `openai` SDK types (`AsyncOpenAI`, `AsyncRealtimeConnection`) are used instead of `Any` wherever the SDK actually exports them.
+- `OpenAITransport.send()` casts its payload to `Any` at the SDK boundary on purpose — the whole point of that layer (see its docstring) is speaking in plain dicts validated at runtime by the SDK's own transform, not by mypy.
+
 ## Configuration Files
 
 Example config layout:

@@ -22,6 +22,7 @@ from typing import Any
 
 import numpy as np
 
+from ..bus import BusContext
 from ..config import ScreenConfig, TriggerConfig
 from ..events import ScreenFrame
 from .gst_util import drain_bus_errors, ensure_gst, pull_bytes
@@ -47,9 +48,9 @@ class ScreenSource:
     def __init__(self, cfg: ScreenConfig, triggers: TriggerConfig):
         self.cfg = cfg
         self.policy = TriggerPolicy(triggers)
-        self._ctx = None
-        self._gst = None
-        self._pipeline = None
+        self._ctx: BusContext | None = None
+        self._gst: Any = None
+        self._pipeline: Any = None
         self._session: ScreenCastSession | None = None
         self._lock = threading.Lock()
         self._latest: tuple[bytes, int, int] | None = None
@@ -69,7 +70,7 @@ class ScreenSource:
 
     # -- lifecycle ---------------------------------------------------------
 
-    async def start(self, ctx) -> None:
+    async def start(self, ctx: BusContext) -> None:
         self._ctx = ctx
         Gst = ensure_gst()
         self._gst = Gst
@@ -283,6 +284,7 @@ class ScreenSource:
             log.info("screen frames resumed after %.0fs", idle)
 
     async def _sample_loop(self) -> None:
+        assert self._ctx is not None
         interval = 1.0 / max(1, self.cfg.pipeline_fps)
         started_at = time.monotonic()
         while True:

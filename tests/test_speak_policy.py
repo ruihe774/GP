@@ -123,7 +123,7 @@ class TestItSpeaks:
             if speak(policy, clock) == "ambient":
                 said.append(clock.now)
         assert len(said) >= 4, f"only {len(said)} ambient remarks in 10 minutes"
-        gaps = [b - a for a, b in zip(said, said[1:])]
+        gaps = [b - a for a, b in zip(said, said[1:], strict=False)]
         assert all(gap >= 75.0 - 1e-9 for gap in gaps), gaps
 
     def test_a_whole_conversation_runs(self):
@@ -390,7 +390,7 @@ class TestBurstsDoNotBecomeBursts:
             clock.advance(0.25)
 
         assert said, "it must still answer a player who is talking to it"
-        gaps = [b - a for a, b in zip(said, said[1:])]
+        gaps = [b - a for a, b in zip(said, said[1:], strict=False)]
         assert min(gaps) >= 3.0, f"back-to-back replies got through: {gaps}"
         assert len(said) / 2.0 <= 6.0, "per-minute cap still holds"
 

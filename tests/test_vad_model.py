@@ -129,9 +129,18 @@ class TestDetection:
         "name,make",
         [
             ("silence", lambda: np.zeros(SR, np.float32)),
-            ("white noise", lambda: np.random.default_rng(0).normal(0, 0.05, SR).astype(np.float32)),
-            ("bass rumble", lambda: (0.4 * np.sin(2 * np.pi * 80 * np.arange(SR) / SR)).astype(np.float32)),
-            ("mid tone", lambda: (0.3 * np.sin(2 * np.pi * 440 * np.arange(SR) / SR)).astype(np.float32)),
+            (
+                "white noise",
+                lambda: np.random.default_rng(0).normal(0, 0.05, SR).astype(np.float32),
+            ),
+            (
+                "bass rumble",
+                lambda: (0.4 * np.sin(2 * np.pi * 80 * np.arange(SR) / SR)).astype(np.float32),
+            ),
+            (
+                "mid tone",
+                lambda: (0.3 * np.sin(2 * np.pi * 440 * np.arange(SR) / SR)).astype(np.float32),
+            ),
         ],
     )
     def test_rejects_non_speech(self, name, make):

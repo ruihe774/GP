@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Callable
+from collections.abc import Callable
 
 import numpy as np
 
@@ -86,9 +86,8 @@ class SpeechSegmenter:
         self.dropped_short = 0
 
         #: how much 24 kHz history to retain
-        self._retain = (
-            _ms_to_samples(cfg.max_segment_ms + cfg.preroll_ms + cfg.hangover_ms + 1000, cfg.out_rate)
-        )
+        retain_ms = cfg.max_segment_ms + cfg.preroll_ms + cfg.hangover_ms + 1000
+        self._retain = _ms_to_samples(retain_ms, cfg.out_rate)
 
     # -- ingestion ---------------------------------------------------------
 
@@ -168,7 +167,7 @@ class SpeechSegmenter:
 
     def _finalize(self, end: int, *, forced: bool) -> None:
         continuation = self._resume_at is not None
-        if continuation:
+        if self._resume_at is not None:
             start_v = self._resume_at
             self._resume_at = None
         else:

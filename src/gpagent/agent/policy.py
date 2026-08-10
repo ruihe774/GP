@@ -32,7 +32,8 @@ from __future__ import annotations
 
 import time
 from collections import deque
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from .config import SpeakConfig
 
@@ -140,18 +141,21 @@ class SpeakPolicy:
         # mute agent and nothing else in the system would notice.
         if self._talking_since is not None:
             if now - self._talking_since <= cfg.speech_gate_timeout_s:
-                return self._decline("player_talking")
+                self._decline("player_talking")
+                return None
             self._talking_since = None
         if self._response_since is not None:
             if now - self._response_since <= cfg.response_gate_timeout_s:
-                return self._decline("response_active")
+                self._decline("response_active")
+                return None
             self._response_since = None
 
         # The global cap, checked before any reason and binding on all of them.
         self._prune(now)
         if len(self._recent) >= cfg.max_per_min:
             self._consume_pending()
-            return self._decline("rate_cap")
+            self._decline("rate_cap")
+            return None
 
         if self._reply_pending:
             if now - (self._reply_since or now) <= cfg.reply_ttl_s:
@@ -162,7 +166,8 @@ class SpeakPolicy:
                 ):
                     # Stays pending -- the question still gets answered, just
                     # not machine-gunned onto the end of the last sentence.
-                    return self._decline("reply_spacing")
+                    self._decline("reply_spacing")
+                    return None
                 self._reply_pending = False
                 return "reply"
             # Too late to be an answer. Drop it rather than replying to a
@@ -172,11 +177,16 @@ class SpeakPolicy:
 
         factor = self.cooldown_factor(now)
 
-        if self._last_spoken_end is not None and now - self._last_spoken_end < cfg.min_gap_s * factor:
+        in_quiet_floor = (
+            self._last_spoken_end is not None
+            and now - self._last_spoken_end < cfg.min_gap_s * factor
+        )
+        if in_quiet_floor:
             # Consume rather than queue, so a burst during the floor cannot
             # produce a ghost remark about it long after the fact.
             self._consume_pending()
-            return self._decline("quiet_floor")
+            self._decline("quiet_floor")
+            return None
 
         if self._react_pending:
             self._react_pending = False

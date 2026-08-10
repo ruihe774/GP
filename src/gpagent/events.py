@@ -11,8 +11,9 @@ relative path in `blob`; `--inline` mode base64s it into the JSON instead.
 from __future__ import annotations
 
 import base64
+from collections.abc import Callable
 from dataclasses import dataclass, field, fields
-from typing import Any, Callable, ClassVar
+from typing import Any, ClassVar
 
 __all__ = [
     "Event",

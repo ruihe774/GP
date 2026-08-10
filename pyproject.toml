@@ -33,3 +33,26 @@ markers = [
     "network: talks to the OpenAI API and spends money; deselected by default",
 ]
 addopts = "-m 'not hardware and not network'"
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.0",
+    "ruff>=0.16.2",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = [
+    "SIM115",  # long-lived file handles opened in start()/open(), closed in a paired close()
+]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src", "tests"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true

@@ -20,8 +20,12 @@ import asyncio
 import contextlib
 import logging
 import threading
+from collections.abc import Callable
 from typing import Any
 
+import numpy as np
+
+from ..bus import BusContext
 from ..config import AudioConfig
 from ..events import SpeechSegment
 from .gst_util import drain_bus_errors, ensure_gst, pull_bytes
@@ -41,12 +45,12 @@ class AudioSource:
 
     def __init__(self, cfg: AudioConfig):
         self.cfg = cfg
-        self._ctx = None
-        self._gst = None
-        self._pipeline = None
+        self._ctx: BusContext | None = None
+        self._gst: Any = None
+        self._pipeline: Any = None
         self._lock = threading.Lock()
         self._segmenter: SpeechSegmenter | None = None
-        self._vad = None
+        self._vad: Callable[[np.ndarray], float] | None = None
         self._task: asyncio.Task | None = None
         self._aec_active = False
         self._webrtc_voice = False
@@ -56,7 +60,7 @@ class AudioSource:
 
     # -- lifecycle ---------------------------------------------------------
 
-    async def start(self, ctx) -> None:
+    async def start(self, ctx: BusContext) -> None:
         self._ctx = ctx
         Gst = ensure_gst()
         self._gst = Gst
@@ -65,8 +69,9 @@ class AudioSource:
         if self.cfg.vad_backend == "silero":
             from .vad import SileroVAD
 
-            self._vad = SileroVAD(self.cfg.model_path, sample_rate=self.cfg.vad_rate)
-            log.info("VAD backend: silero (%s)", self._vad.model_path)
+            silero = SileroVAD(self.cfg.model_path, sample_rate=self.cfg.vad_rate)
+            self._vad = silero
+            log.info("VAD backend: silero (%s)", silero.model_path)
         else:
             log.info("VAD backend: webrtc (webrtcdsp built-in detector)")
 

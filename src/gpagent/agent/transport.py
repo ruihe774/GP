@@ -25,10 +25,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, AsyncIterator, Protocol
+from typing import IO, TYPE_CHECKING, Any, Protocol, cast
 
 from ..tokens import audio_tokens, image_tokens, text_tokens
+
+if TYPE_CHECKING:
+    from openai import AsyncOpenAI
+    from openai.resources.realtime.realtime import (
+        AsyncRealtimeConnection,
+        AsyncRealtimeConnectionManager,
+    )
 
 log = logging.getLogger(__name__)
 
@@ -50,9 +58,9 @@ class OpenAITransport:
     def __init__(self, model: str, api_key: str):
         self.model = model
         self._api_key = api_key
-        self._client = None
-        self._manager = None
-        self._conn = None
+        self._client: AsyncOpenAI | None = None
+        self._manager: AsyncRealtimeConnectionManager | None = None
+        self._conn: AsyncRealtimeConnection | None = None
         self.sent = 0
         self.received = 0
 
@@ -76,7 +84,10 @@ class OpenAITransport:
     async def send(self, event: dict) -> None:
         if self._conn is None:
             raise RuntimeError("transport is not connected")
-        await self._conn.send(event)
+        # Plain dicts by design (see module docstring): the SDK's
+        # `async_maybe_transform` validates and coerces at runtime, and
+        # `tests/test_transport_payloads.py` asserts every payload survives it.
+        await self._conn.send(cast(Any, event))
         self.sent += 1
 
     async def close(self) -> None:
@@ -166,7 +177,7 @@ class RecordingTransport(_QueueTransport):
     def __init__(self, path: str | Path | None = None):
         super().__init__()
         self.path = Path(path) if path else None
-        self._fh = None
+        self._fh: IO[str] | None = None
         self._pending_input = _InputTally()
         self._responses = 0
 

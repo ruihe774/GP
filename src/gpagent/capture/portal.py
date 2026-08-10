@@ -11,6 +11,7 @@ forcing a GLib loop on the whole process.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -73,10 +74,8 @@ class ScreenCastSession:
                 log.debug("portal session already closed", exc_info=True)
             self.connection = None
         if self.fd >= 0:
-            try:
+            with contextlib.suppress(OSError):
                 os.close(self.fd)
-            except OSError:
-                pass
             self.fd = -1
 
 

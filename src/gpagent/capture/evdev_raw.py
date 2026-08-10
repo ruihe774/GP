@@ -11,8 +11,8 @@ import fcntl
 import glob
 import os
 import struct
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Iterator
 
 __all__ = [
     "InputEvent",

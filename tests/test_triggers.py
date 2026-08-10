@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from gpagent.capture.triggers import TriggerPolicy
 from gpagent.config import TriggerConfig
 
@@ -67,7 +65,7 @@ class TestGamepadThrottle:
 
         gamepad_times = [t for t, name in fired if name == "gamepad"]
         assert len(gamepad_times) >= 8, "throttle must keep firing during activity"
-        gaps = [b - a for a, b in zip(gamepad_times, gamepad_times[1:])]
+        gaps = [b - a for a, b in zip(gamepad_times, gamepad_times[1:], strict=False)]
         assert all(gap >= 2.0 - 1e-9 for gap in gaps), "and must respect the interval"
 
     def test_below_threshold_intensity_does_not_trigger(self):
@@ -114,7 +112,7 @@ class TestGlobalFloor:
                 fired.append(clock.now)
             clock.advance(0.5)
 
-        gaps = [b - a for a, b in zip(fired, fired[1:])]
+        gaps = [b - a for a, b in zip(fired, fired[1:], strict=False)]
         assert all(gap >= 5.0 - 1e-9 for gap in gaps), f"floor violated: {gaps}"
         per_minute = len(fired) / 2.0
         assert per_minute <= 12.5, f"{per_minute}/min still too many"
@@ -139,7 +137,7 @@ class TestGlobalFloor:
             clock.advance(0.5)
 
         assert fired, "the defaults must still capture something"
-        gaps = [b - a for a, b in zip(fired, fired[1:])]
+        gaps = [b - a for a, b in zip(fired, fired[1:], strict=False)]
         assert all(gap >= 2.0 - 1e-9 for gap in gaps), f"floor violated: {gaps}"
         per_minute = len(fired) / 4.0
         assert per_minute <= 30.0, f"{per_minute}/min is more than the floor allows"
@@ -200,7 +198,7 @@ class TestHeartbeat:
             clock.advance(0.5)
             if emit(policy, clock) == "heartbeat":
                 times.append(clock.now)
-        gaps = [b - a for a, b in zip(times, times[1:])]
+        gaps = [b - a for a, b in zip(times, times[1:], strict=False)]
         assert times, "an idle session must still send periodic frames"
         assert all(gap >= 10.0 - 1e-9 for gap in gaps)
 

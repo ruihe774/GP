@@ -12,7 +12,7 @@ import signal
 import sys
 import time
 import wave
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -69,8 +69,9 @@ def _build_config(args) -> CaptureConfig:
     try:
         cfg.apply_overrides(_parse_set(getattr(args, "set", []) or []))
     except ValueError as exc:
-        raise SystemExit(str(exc))
-    for section, flag in (("gamepad", "no_gamepad"), ("audio", "no_audio"), ("screen", "no_screen")):
+        raise SystemExit(str(exc)) from exc
+    sections = (("gamepad", "no_gamepad"), ("audio", "no_audio"), ("screen", "no_screen"))
+    for section, flag in sections:
         if getattr(args, flag, False):
             getattr(cfg, section).enabled = False
     if getattr(args, "pick_screen", False):
@@ -90,7 +91,7 @@ def _build_config(args) -> CaptureConfig:
         for device in cfg.gamepad.device_button_map.values():
             parse_button_map(device)
     except ValueError as exc:
-        raise SystemExit(str(exc))
+        raise SystemExit(str(exc)) from exc
     return cfg
 
 
@@ -116,7 +117,8 @@ def cmd_devices(args) -> int:
     print("session")
     session_type = os.environ.get("XDG_SESSION_TYPE", "?")
     print(f"  type            {session_type}")
-    print(f"  display         {os.environ.get('WAYLAND_DISPLAY') or os.environ.get('DISPLAY') or 'none'}")
+    display = os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY") or "none"
+    print(f"  display         {display}")
     if _looks_like_ssh() or not _has_display():
         print("  WARNING: this looks like an SSH/headless session.")
         print("           Gamepad ACLs (uaccess) and the portal both bind to the")
@@ -138,13 +140,16 @@ def cmd_devices(args) -> int:
         print(f"    id            {info.device_id}")
         print(f"    vid:pid       {info.vid:04x}:{info.pid:04x}")
         print(f"    buttons       {' '.join(sorted(layout.buttons.values()))}")
-        print(f"    sticks        left={layout.left_stick is not None} right={layout.right_stick is not None}")
+        sticks = f"left={layout.left_stick is not None} right={layout.right_stick is not None}"
+        print(f"    sticks        {sticks}")
         print(f"    triggers      {', '.join(sorted(layout.triggers)) or 'digital only'}")
         print(f"    dpad          {'hat' if layout.hat else 'buttons'}")
     if not found:
         print("  none detected")
     if unreadable:
-        print(f"  ({unreadable} input nodes not readable by this user -- normal for keyboards/mice)")
+        print(
+            f"  ({unreadable} input nodes not readable by this user -- normal for keyboards/mice)"
+        )
 
     print("\naudio (pipewire)")
     try:
@@ -293,7 +298,8 @@ def cmd_monitor(args) -> int:
     from .capture.gamepad import parse_button_map, resolve_layout
 
     # Output is watched live and is often piped to a file; keep it unbuffered.
-    sys.stdout.reconfigure(line_buffering=True)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
 
     cfg = _build_config(args).gamepad
     pads = ev.find_gamepads()
@@ -415,8 +421,13 @@ def _print_input(raw, info, layout, cfg, elapsed, down, state, seen, show_raw) -
         if state.get(key) != str(raw.value):
             state[key] = str(raw.value)
             if raw.value:
-                name = {("x", -1): "left", ("x", 1): "right", ("y", -1): "up", ("y", 1): "down"}
-                direction = name.get((axis, raw.value), str(raw.value))
+                direction_names = {
+                    ("x", -1): "left",
+                    ("x", 1): "right",
+                    ("y", -1): "up",
+                    ("y", 1): "down",
+                }
+                direction = direction_names.get((axis, raw.value), str(raw.value))
                 seen.add(f"dpad-{direction}")
                 print(
                     f"  {elapsed:8.2f}  dpad      {direction:<8s} "
@@ -448,9 +459,9 @@ def cmd_record(args) -> int:
 
 
 async def _record(cfg: CaptureConfig, directory: Path, args) -> int:
-    from .bus import CaptureBus
+    from .bus import CaptureBus, CaptureSource
 
-    sources = []
+    sources: list[CaptureSource] = []
     if cfg.gamepad.enabled:
         from .capture.gamepad import GamepadSource
 
@@ -480,7 +491,7 @@ async def _record(cfg: CaptureConfig, directory: Path, args) -> int:
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, stop.set)
 
-    started = datetime.now(timezone.utc)
+    started = datetime.now(UTC)
     try:
         await bus.start()
     except Exception as exc:
@@ -520,7 +531,7 @@ async def _record(cfg: CaptureConfig, directory: Path, args) -> int:
         await asyncio.wait_for(consumer, timeout=5)
     consumer.cancel()
 
-    duration = (datetime.now(timezone.utc) - started).total_seconds()
+    duration = (datetime.now(UTC) - started).total_seconds()
     end = SessionEnd(duration_s=round(duration, 2), counters=dict(sink.counts))
     end.t = duration
     end.seq = 10**9
@@ -638,7 +649,10 @@ def cmd_inspect(args) -> int:
             triggers[event.trigger] = triggers.get(event.trigger, 0) + 1
             estimate.image_tokens += image_tokens(event.w, event.h)
             estimate.frames += 1
-            line = f"scr  frame {event.w}x{event.h} via {event.trigger} (scene {event.scene_score:.3f})"
+            line = (
+                f"scr  frame {event.w}x{event.h} via {event.trigger} "
+                f"(scene {event.scene_score:.3f})"
+            )
         elif isinstance(event, AgentResponse):
             said_ms += event.dur_ms
             mark = " CUT" if event.cut else ""
@@ -672,7 +686,10 @@ def cmd_inspect(args) -> int:
     cost = estimate.cost()
     print("\nestimated input cost (approximate -- see tokens.py)")
     print(f"  audio           {estimate.audio_tokens:>8d} tok  ${cost['audio_usd']:.4f}")
-    print(f"  images          {estimate.image_tokens:>8d} tok  ${cost['image_usd']:.4f}  ({estimate.frames} frames)")
+    print(
+        f"  images          {estimate.image_tokens:>8d} tok  ${cost['image_usd']:.4f}"
+        f"  ({estimate.frames} frames)"
+    )
     print(f"  text summaries  {estimate.text_tokens:>8d} tok  ${cost['text_usd']:.4f}")
     print(f"  total                        ${cost['total_usd']:.4f}", end="")
     if minutes:
@@ -750,12 +767,14 @@ def _write_wavs(directory: Path, events: list) -> None:
     ]
     if timed:
         def span(e) -> tuple[float, float]:
+            assert e.data is not None
             start = e.t - (e.dur_ms or 0) / 1000.0
             return start, start + len(e.data) / 2 / e.sample_rate
 
         end = max(span(e)[1] for e in timed)
         track = bytearray(int(end * rate) * 2 + 2)
         for event in timed:
+            assert event.data is not None
             at = max(0, int(span(event)[0] * rate)) * 2
             track[at : at + len(event.data)] = event.data
         with wave.open(str(out / "conversation.wav"), "wb") as fh:
@@ -780,6 +799,7 @@ def _write_contact_sheet(directory: Path, events: list, columns: int = 4) -> Non
 
     thumbs = []
     for event in frames:
+        assert event.data is not None
         image = Image.open(BytesIO(event.data)).convert("RGB")
         image.thumbnail((480, 480))
         thumbs.append((image, event))
@@ -833,12 +853,13 @@ def cmd_commentate(args) -> int:
 async def _commentate(cfg: CaptureConfig, args) -> int:
     from .agent.playback import make_player
     from .agent.session import CommentaryAgent, ReplayClock, drive_from_bus, drive_from_session
-    from .agent.transport import OpenAITransport, RecordingTransport
+    from .agent.transport import OpenAITransport, RecordingTransport, Transport
 
     out_dir = Path(args.output) if args.output else None
     deterministic = args.replay is not None and args.replay_speed == 0.0
     clock = ReplayClock() if deterministic else None
 
+    transport: Transport
     if args.dry_run:
         transport = RecordingTransport()
     else:
@@ -872,7 +893,7 @@ async def _commentate(cfg: CaptureConfig, args) -> int:
                 SessionStart(
                     t=0.0,
                     seq=-1,
-                    started_at=datetime.now(timezone.utc).isoformat(),
+                    started_at=datetime.now(UTC).isoformat(),
                     config=cfg.to_dict(),
                     devices={"source": "live capture", "model": cfg.agent.model},
                 )
@@ -897,6 +918,7 @@ async def _commentate(cfg: CaptureConfig, args) -> int:
     await agent.start()
     try:
         if deterministic:
+            assert clock is not None, "deterministic replay always constructs a ReplayClock"
             await drive_from_session(agent, args.replay, clock)
         else:
             bus = await _build_bus(cfg, args)
@@ -926,7 +948,7 @@ async def _commentate(cfg: CaptureConfig, args) -> int:
 
 async def _build_bus(cfg: CaptureConfig, args):
     """Either a recording played back in real time, or the real thing."""
-    from .bus import CaptureBus
+    from .bus import CaptureBus, CaptureSource
 
     if args.replay is not None:
         from .replay import ReplaySource
@@ -938,7 +960,7 @@ async def _build_bus(cfg: CaptureConfig, args):
         asyncio.create_task(_stop_when_finished(source, bus))
         return bus
 
-    sources = []
+    sources: list[CaptureSource] = []
     if cfg.gamepad.enabled:
         from .capture.gamepad import GamepadSource
 
