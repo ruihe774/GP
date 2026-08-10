@@ -204,11 +204,16 @@ class AudioPlayer:
     #: `volume` ships in gst-plugins-base next to `audioconvert`/`audioresample`,
     #: which this pipeline already requires unconditionally -- so it applies the
     #: gain in the pipeline itself rather than scaling PCM samples by hand.
+    #: No `queue` between appsrc and the sink: appsrc already owns an unbounded
+    #: internal buffer and a dedicated thread that drains it (`block=false
+    #: max-bytes=0`), so `push()` never blocks regardless of what the sink is
+    #: doing. A `queue` would only buy a second thread so real-time sink
+    #: pacing doesn't stall *appsrc's own* pop loop -- not worth it for the
+    #: sub-buffer latency that costs a barge-in.
     PIPELINE = (
         "appsrc name=src format=time is-live=false do-timestamp=false "
-        "block=false max-bytes=16777216 "
+        "block=false max-bytes=0 emit-signals=false "
         "caps=audio/x-raw,format=S16LE,rate={rate},channels=1,layout=interleaved "
-        "! queue max-size-time=0 max-size-bytes=0 max-size-buffers=0 "
         "! audioconvert ! audioresample "
         "! volume name=vol volume={volume} "
         "! {sink}"
