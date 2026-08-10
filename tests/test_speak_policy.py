@@ -36,6 +36,8 @@ def make(**kwargs):
         ambient_after_s=75.0,
         ambient_requires_activity=True,
         ambient_idle_horizon_s=45.0,
+        reply_min_gap_s=3.0,
+        reply_ttl_s=8.0,
         backoff_factor=1.6,
         backoff_max=3,
         engagement_boost=0.6,
@@ -75,16 +77,19 @@ class TestItSpeaks:
         policy.on_speech_segment(dur_ms=2000)
         assert policy.decide() == "reply"
 
-    def test_answers_even_right_after_speaking(self):
-        """A question 2 s after the agent stopped talking still gets answered.
+    def test_answers_shortly_after_speaking(self):
+        """A question 4 s after the agent stopped talking still gets answered.
 
         The quiet floor exists to stop the agent chattering at itself, not to
-        make it ignore the player.
+        make it ignore the player, so it must not apply here. Only the much
+        shorter `reply_min_gap_s` beat does -- see TestBurstsDoNotBecomeBursts,
+        which covers a question that arrives inside that beat (deferred by a
+        second, never dropped).
         """
-        policy, clock = make(min_gap_s=8.0)
+        policy, clock = make(min_gap_s=8.0, reply_min_gap_s=3.0)
         policy.on_scene(1.0)
         assert speak(policy, clock) == "react"
-        clock.advance(2.0)
+        clock.advance(4.0)
         policy.on_speech_start()
         policy.on_speech_segment(dur_ms=1200)
         assert policy.decide() == "reply"
@@ -320,6 +325,76 @@ class TestAdaptiveCooldown:
 # -- the global cap --------------------------------------------------------
 
 
+class TestBurstsDoNotBecomeBursts:
+    """A player who talks continuously must not pull back-to-back answers.
+
+    `reply` is exempt from the quiet floor so a direct question always gets
+    answered, which left the global per-minute cap as the only thing spacing
+    replies out -- and a cap permits its whole allowance in one burst.
+    """
+
+    def test_a_reply_waits_a_beat_after_the_last_response(self):
+        policy, clock = make(reply_min_gap_s=3.0)
+        policy.on_speech_segment(dur_ms=800)
+        assert speak(policy, clock) == "reply"
+        clock.advance(1.0)
+        policy.on_speech_segment(dur_ms=800)
+        assert policy.decide() is None
+        assert policy.declined["reply_spacing"] >= 1
+
+    def test_it_is_answered_as_soon_as_the_beat_passes(self):
+        """Held, not dropped: the question still gets an answer."""
+        policy, clock = make(reply_min_gap_s=3.0)
+        policy.on_speech_segment(dur_ms=800)
+        speak(policy, clock)
+        clock.advance(1.0)
+        policy.on_speech_segment(dur_ms=800)
+        assert policy.decide() is None
+        clock.advance(2.5)
+        assert policy.decide() == "reply"
+
+    def test_the_beat_is_much_shorter_than_the_unprompted_floor(self):
+        policy, clock = make(min_gap_s=8.0, reply_min_gap_s=3.0)
+        policy.on_scene(1.0)
+        assert speak(policy, clock) == "react"
+        clock.advance(4.0)  # past the reply beat, well inside the quiet floor
+        policy.on_speech_segment(dur_ms=800)
+        assert policy.decide() == "reply"
+
+    def test_interrupting_the_agent_skips_the_beat(self):
+        """Someone who cuts you off is not asking you to pause first."""
+        policy, clock = make(reply_min_gap_s=3.0)
+        policy.on_scene(1.0)
+        assert policy.decide() == "react"
+        policy.mark_spoken("react")
+        clock.advance(1.0)
+        policy.on_speech_start()
+        policy.on_response_cancelled()  # barge-in
+        clock.advance(1.0)
+        policy.on_speech_segment(dur_ms=900)
+        assert policy.decide() == "reply"
+
+    def test_continuous_talking_over_a_long_fight(self):
+        """Two minutes of shouting at a boss, one utterance every 1.5 s."""
+        policy, clock = make(reply_min_gap_s=3.0, max_per_min=6.0)
+        said = []
+        for step in range(480):  # 2 minutes at 4 Hz
+            policy.on_gamepad(1.0)  # sustained heavy input, too
+            if step % 6 == 0:
+                policy.on_speech_segment(dur_ms=1200)
+            reason = policy.decide()
+            if reason:
+                policy.mark_spoken(reason)
+                policy.on_response_finished(spoken_ms=2500, now=clock.now + 2.5)
+                said.append(clock.now)
+            clock.advance(0.25)
+
+        assert said, "it must still answer a player who is talking to it"
+        gaps = [b - a for a, b in zip(said, said[1:])]
+        assert min(gaps) >= 3.0, f"back-to-back replies got through: {gaps}"
+        assert len(said) / 2.0 <= 6.0, "per-minute cap still holds"
+
+
 class TestGlobalCap:
     def test_combined_rate_when_everything_fires_at_once(self):
         """The frame-trigger regression, ported.
@@ -347,21 +422,22 @@ class TestGlobalCap:
         assert len(said) / 10.0 <= 6.0
 
     def test_the_cap_binds_replies_too(self):
-        policy, clock = make(max_per_min=2.0)
+        # advance past reply_min_gap_s each time, so this isolates the cap
+        policy, clock = make(max_per_min=2.0, reply_min_gap_s=3.0)
         for _ in range(2):
             policy.on_speech_segment(dur_ms=500)
             assert speak(policy, clock) == "reply"
-            clock.advance(1.0)
+            clock.advance(4.0)
         policy.on_speech_segment(dur_ms=500)
         assert policy.decide() is None
         assert policy.declined["rate_cap"] == 1
 
     def test_the_cap_slides(self):
-        policy, clock = make(max_per_min=2.0)
+        policy, clock = make(max_per_min=2.0, reply_min_gap_s=3.0)
         for _ in range(2):
             policy.on_speech_segment(dur_ms=500)
             speak(policy, clock)
-            clock.advance(1.0)
+            clock.advance(4.0)
         clock.advance(60.0)
         policy.on_speech_segment(dur_ms=500)
         assert policy.decide() == "reply"

@@ -160,8 +160,8 @@ class TestTheTurnItSends:
         for i, t in enumerate((101.0, 102.0, 103.0)):
             await agent.handle(speech(dur_ms=1000, data=bytes([i, i]) * 12000), now=t)
         await complete_response(agent)
-        agent._clock_obj.set(104.0)
-        await agent.tick(104.0)
+        agent._clock_obj.set(106.0)  # past the simulated speech plus the reply beat
+        await agent.tick(106.0)
 
         appends = agent.transport.sent_of_type("input_audio_buffer.append")
         rebuilt = b"".join(base64.b64decode(e["audio"]) for e in appends)
@@ -294,17 +294,24 @@ class TestBargeIn:
         assert agent.player.bytes_played == played_before
 
     async def test_a_new_turn_stops_the_previous_sentence_first(self, agent):
-        """A reply is exempt from the quiet floor, so this really happens.
+        """A defensive invariant, driven directly.
 
-        Without it the new utterance queues behind the old one in the same
-        appsrc and both play, late.
+        The policy will not normally hand out a turn while the previous
+        sentence is still audible -- `_last_spoken_end` sits in the future until
+        it finishes. But if it ever did, pushing the new utterance into the same
+        appsrc would queue it behind the old one and play both, late. Cheap to
+        guarantee, so it is guaranteed.
         """
         await agent.handle(frame(score=1.0), now=100.0)
         await complete_response(agent, audio_tokens=200)  # 10 s of speech
-        agent._clock_obj.set(101.0)
-        await agent.handle(speech(), now=101.0)
+        assert agent._speaking(101.0), "precondition: still mid-sentence"
 
-        assert agent.transport.sent_of_type("conversation.item.truncate")
+        agent._clock_obj.set(101.0)
+        await agent._speak("reply", 101.0)
+
+        truncate = agent.transport.sent_of_type("conversation.item.truncate")
+        assert truncate, "the previous sentence must be stopped and truncated"
+        assert 900 <= truncate[0]["audio_end_ms"] <= 1100
         assert [line for line in agent.lines if line.kind == "cut"]
         assert len(agent.transport.sent_of_type("response.create")) == 2
 

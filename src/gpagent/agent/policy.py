@@ -67,6 +67,7 @@ class SpeakPolicy:
         self._talking_since: float | None = None
         self._response_since: float | None = None
         self._last_spoken_end: float | None = None
+        self._last_end_was_cancel = False
         self._last_reason: dict[str, float] = {}
         self._recent: deque[float] = deque()
 
@@ -117,11 +118,16 @@ class SpeakPolicy:
         now = self._now(now)
         self._response_since = None
         self._last_spoken_end = now
+        self._last_end_was_cancel = False
 
     def on_response_cancelled(self, now: float | None = None) -> None:
         # Being interrupted is not a reason to sulk: the floor still starts
         # here, but the player is plainly engaged.
         self.on_response_finished(now=now)
+        # ...and they interrupted in order to say something, so the reply beat
+        # does not apply. Making someone who cut you off wait three seconds for
+        # an answer is the opposite of what the beat is for.
+        self._last_end_was_cancel = True
 
     # -- decision ----------------------------------------------------------
 
@@ -149,6 +155,14 @@ class SpeakPolicy:
 
         if self._reply_pending:
             if now - (self._reply_since or now) <= cfg.reply_ttl_s:
+                if (
+                    self._last_spoken_end is not None
+                    and not self._last_end_was_cancel
+                    and now - self._last_spoken_end < cfg.reply_min_gap_s
+                ):
+                    # Stays pending -- the question still gets answered, just
+                    # not machine-gunned onto the end of the last sentence.
+                    return self._decline("reply_spacing")
                 self._reply_pending = False
                 return "reply"
             # Too late to be an answer. Drop it rather than replying to a

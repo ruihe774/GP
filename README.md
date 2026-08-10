@@ -378,9 +378,9 @@ returns None. Three reasons:
 
 | reason | when | bound by |
 |---|---|---|
-| `reply` | the player said something | the global cap only |
-| `react` | scene change, or a burst of input | quiet floor + `event_cooldown_s` |
-| `ambient` | it has been quiet a while | quiet floor + `ambient_after_s` |
+| `reply` | the player said something | global cap + `reply_min_gap_s` |
+| `react` | scene change, or a burst of input | quiet floor + `event_cooldown_s` + backoff |
+| `ambient` | it has been quiet a while | quiet floor + `ambient_after_s` + backoff |
 
 and two rules over them:
 
@@ -397,6 +397,18 @@ and two rules over them:
 **Cooldowns adapt.** Every unprompted remark the player doesn't answer multiplies
 them by `backoff_factor`; talking to the agent multiplies by `engagement_boost`
 (<1) and resets the streak. An agent being ignored gets quieter on its own.
+
+**Bursty input must not become bursty speech.** A long fight is well covered on
+the unprompted side — `react` needs `burst_windows` consecutive hot windows, then
+waits out the quiet floor *and* a 30 s cooldown *and* the backoff, so sustained
+combat yields roughly one remark per half-minute and fewer if you ignore them.
+The exposed path was `reply`: exempting it from the quiet floor left the
+per-minute cap as the only spacing, and a cap permits its whole allowance at
+once, so a player shouting at a boss could pull answers back to back.
+`reply_min_gap_s` (3 s, measured from the *end* of the last response) breaks that
+up without making the agent feel slow; a reply held back stays pending and fires
+as soon as the gap clears. It does **not** apply after a barge-in — someone who
+cut you off is not asking you to pause first.
 
 **A wanted reply expires** (`reply_ttl_s`). If the agent was busy or capped when
 the player spoke, answering nine seconds later is worse than not answering — the

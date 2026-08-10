@@ -104,6 +104,15 @@ class SpeakConfig:
     #: quiet floor after the agent stops talking; binds the two *unprompted*
     #: reasons. A direct question is exempt -- see SpeakPolicy.
     min_gap_s: float = 8.0
+    #: Small floor between the end of one response and the start of a reply.
+    #: `reply` is exempt from `min_gap_s` on purpose -- refusing to answer a
+    #: direct question is worse than being chatty -- but "no floor at all" lets
+    #: a player who talks continuously (shouting at a boss fight, say) pull
+    #: back-to-back answers, bounded only by `max_per_min`. This is deliberately
+    #: much smaller than `min_gap_s`: it breaks up bursts without making the
+    #: agent feel slow. A reply held back by this stays pending and fires as
+    #: soon as the gap clears, subject to `reply_ttl_s`.
+    reply_min_gap_s: float = 3.0
     #: how long a wanted reply stays wanted. If the agent was busy or capped
     #: when the player spoke, answering nine seconds later is worse than not
     #: answering: the moment has gone and the audio is stale.
