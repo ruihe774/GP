@@ -18,6 +18,7 @@ from typing import Any
 
 from .config import CaptureConfig
 from .events import (
+    AgentResponse,
     GamepadActivity,
     GamepadConnected,
     GamepadDisconnected,
@@ -31,6 +32,12 @@ from .sinks.jsonl import JsonlSink, read_session, session_dir_name
 from .tokens import DEFAULT_RATES, Estimate, audio_tokens, image_tokens, text_tokens
 
 log = logging.getLogger("gpagent")
+
+#: voices the Realtime API accepts, as of openai 2.53
+VOICES = [
+    "alloy", "ash", "ballad", "cedar", "coral", "echo", "marin", "sage",
+    "shimmer", "verse",
+]
 
 
 # -- helpers ---------------------------------------------------------------
@@ -600,6 +607,7 @@ def cmd_inspect(args) -> int:
     manifest = _read_manifest(directory)
     estimate = Estimate()
     speech_ms = 0.0
+    said_ms = 0.0
     triggers: dict[str, int] = {}
     counts: dict[str, int] = {}
     duration = 0.0
@@ -631,6 +639,11 @@ def cmd_inspect(args) -> int:
             estimate.image_tokens += image_tokens(event.w, event.h)
             estimate.frames += 1
             line = f"scr  frame {event.w}x{event.h} via {event.trigger} (scene {event.scene_score:.3f})"
+        elif isinstance(event, AgentResponse):
+            said_ms += event.dur_ms
+            mark = " CUT" if event.cut else ""
+            text = event.transcript or "(no transcript)"
+            line = f"say  [{event.reason}{mark}] {text}  ({event.dur_ms} ms)"
         elif isinstance(event, SessionEnd):
             duration = max(duration, event.duration_s)
             line = f"session end ({event.duration_s:.1f}s)"
@@ -648,6 +661,9 @@ def cmd_inspect(args) -> int:
     if speech_ms:
         share = speech_ms / (duration * 1000.0) * 100 if duration else 0.0
         print(f"  speech audio    {speech_ms / 1000:.1f}s ({share:.1f}% of session)")
+    if said_ms:
+        share = said_ms / (duration * 1000.0) * 100 if duration else 0.0
+        print(f"  agent spoke     {said_ms / 1000:.1f}s ({share:.1f}% of session)")
     if triggers:
         print(f"  frames by trigger  {', '.join(f'{k}={v}' for k, v in sorted(triggers.items()))}")
     if manifest.get("dropped_events"):
@@ -670,7 +686,7 @@ def cmd_inspect(args) -> int:
 
     if args.wav:
         _write_wavs(directory, events)
-    elif speech_ms:
+    elif speech_ms or said_ms:
         rate = next(
             (e.sample_rate for e in events if isinstance(e, SpeechSegment)), 24000
         )
@@ -697,19 +713,48 @@ def _read_manifest(directory: Path) -> dict[str, Any]:
 
 
 def _write_wavs(directory: Path, events: list) -> None:
+    """Both sides of the conversation, plus one file of the whole thing."""
     out = directory / "wav"
     out.mkdir(exist_ok=True)
     written = 0
+    rate = 24000
     for event in events:
-        if not isinstance(event, SpeechSegment) or not event.data:
+        if isinstance(event, SpeechSegment):
+            kind = "speech"
+        elif isinstance(event, AgentResponse):
+            kind = "agent"
+        else:
             continue
-        path = out / f"{event.seq:06d}-speech.wav"
-        with wave.open(str(path), "wb") as fh:
+        if not event.data:
+            continue
+        rate = event.sample_rate
+        with wave.open(str(out / f"{event.seq:06d}-{kind}.wav"), "wb") as fh:
             fh.setnchannels(1)
             fh.setsampwidth(2)
             fh.setframerate(event.sample_rate)
             fh.writeframes(event.data)
         written += 1
+
+    # A single file laid out on the session timeline, silence in the gaps, so
+    # the exchange can be listened to as a conversation rather than as a pile
+    # of clips in the wrong order.
+    timed = [
+        e for e in events
+        if isinstance(e, (SpeechSegment, AgentResponse)) and e.data
+    ]
+    if timed:
+        end = max(e.t + len(e.data) / 2 / rate for e in timed)
+        track = bytearray(int(end * rate) * 2 + 2)
+        for event in timed:
+            at = int(event.t * rate) * 2
+            track[at : at + len(event.data)] = event.data
+        with wave.open(str(out / "conversation.wav"), "wb") as fh:
+            fh.setnchannels(1)
+            fh.setsampwidth(2)
+            fh.setframerate(rate)
+            fh.writeframes(bytes(track))
+        written += 1
+
     print(f"\nwrote {written} wav file(s) to {out}")
 
 
@@ -762,6 +807,8 @@ def cmd_commentate(args) -> int:
         cfg.agent.voice = args.voice
     if args.image_detail:
         cfg.agent.image_detail = args.image_detail
+    if args.language:
+        cfg.agent.language = args.language
     if args.no_playback or args.dry_run:
         cfg.agent.playback = False
     if args.replay is None and args.speed == 0.0:
@@ -792,6 +839,28 @@ async def _commentate(cfg: CaptureConfig, args) -> int:
     player = make_player(
         cfg.agent.playback, clock or time.monotonic, sink=cfg.agent.audio_sink
     )
+
+    # One directory holding both halves of the conversation: what was captured
+    # and what the agent said back, in one ordered stream with the audio beside
+    # it, so `gpagent inspect` reads a session the same way whether it came from
+    # `record` or from `commentate`.
+    sink = None
+    if out_dir is not None and not args.no_media:
+        sink = JsonlSink(out_dir, inline=args.inline)
+        sink.open()
+        if args.replay is None:
+            # A replayed recording re-emits its own session.start; only live
+            # capture needs one written here.
+            sink.write(
+                SessionStart(
+                    t=0.0,
+                    seq=-1,
+                    started_at=datetime.now(timezone.utc).isoformat(),
+                    config=cfg.to_dict(),
+                    devices={"source": "live capture", "model": cfg.agent.model},
+                )
+            )
+
     agent = CommentaryAgent(
         cfg,
         transport,
@@ -799,6 +868,7 @@ async def _commentate(cfg: CaptureConfig, args) -> int:
         clock=clock or time.monotonic,
         log_path=(out_dir / "agent.jsonl") if out_dir else None,
         on_line=None if args.quiet else _print_line,
+        recorder=sink.write if sink is not None else None,
     )
 
     mode = "dry run" if args.dry_run else cfg.agent.model
@@ -821,8 +891,19 @@ async def _commentate(cfg: CaptureConfig, args) -> int:
         pass
     finally:
         await agent.close()
+        if sink is not None:
+            sink.close(
+                {
+                    "model": cfg.agent.model,
+                    "source": args.replay or "live capture",
+                    "config": cfg.to_dict(),
+                    "agent": agent.report(),
+                }
+            )
 
     _print_agent_report(agent, args, out_dir)
+    if sink is not None:
+        print(f"  full session ({sum(sink.counts.values())} events) -> gpagent inspect {out_dir}")
     return 0
 
 
@@ -1054,7 +1135,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="never connect: print what would be sent, and what it would cost",
     )
     commentate.add_argument("--model", help="override agent.model")
-    commentate.add_argument("--voice", help="override agent.voice")
+    commentate.add_argument(
+        "--voice",
+        choices=VOICES,
+        help="override agent.voice (default: %(default)s)",
+        default=None,
+    )
+    commentate.add_argument(
+        "--language",
+        metavar="CODE",
+        help="ISO-639-1 code to speak, e.g. ja. Default: follow the player.",
+    )
+    commentate.add_argument(
+        "--no-media",
+        action="store_true",
+        help="with -o, write only the logs, not the captured audio and frames",
+    )
+    commentate.add_argument(
+        "--inline", action="store_true", help="base64 blobs into the JSONL"
+    )
     commentate.add_argument(
         "--image-detail", choices=["auto", "low", "high"], help="override agent.image_detail"
     )

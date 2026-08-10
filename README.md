@@ -355,7 +355,12 @@ Holds a `gpt-realtime-2.1` session, decides when to speak, and speaks.
 gpagent commentate                                     # live capture, live API
 gpagent commentate --replay sess5                      # a recording, live API
 gpagent commentate --replay sess5 --speed 0 --dry-run  # deterministic, no network
+gpagent commentate -o chat                             # record the whole conversation
+gpagent commentate --language ja --voice cedar         # speak Japanese
 ```
+
+`--voice` takes `alloy`, `ash`, `ballad`, `cedar`, `coral`, `echo`, `marin`
+(default), `sage`, `shimmer` or `verse`.
 
 The API key comes from `OPENAI_API_KEY` or from `.env` at the repo root (which is
 gitignored). It is never logged; `load_api_key` returns a `Secret` whose `repr`
@@ -445,6 +450,61 @@ response.create            persona + a per-reason instruction
 
 `turn_detection` is `null`: capture already ran a VAD, and a commentator must be
 able to speak with no user turn at all.
+
+## Speaking another language
+
+`--language ja` (any ISO-639-1 code). This is half an API feature and half not:
+
+- **API.** The code is passed as `audio.input.transcription.language`, where the
+  docs say it improves transcription accuracy and latency.
+- **Not API.** The Realtime API has no parameter for *output* language, so that
+  is a line appended to the instructions naming the language in English. It has
+  to be appended in `instructions_for()` as well as the session, since
+  `response.create.instructions` replaces the session's rather than adding to
+  them — the same trap the persona fell into.
+
+The persona itself stays in English whatever the setting: it is instructions to
+the model, not something anyone hears. Codes in `LANGUAGE_NAMES` are expanded to
+a name ("ja" → "Japanese"); anything else is passed through, since the model
+knows more language names than that table does.
+
+Verified live against sess5 with `--language ja`, where the register survives
+translation intact — 「どんどん突っ走っちゃおうぜ」 is the same couch-friend voice
+as the English runs, not a stilted translation of it.
+
+## Recording a whole conversation
+
+`gpagent commentate -o chat` writes a session directory in exactly the format
+`gpagent record` produces, except that it holds **both halves**: the captured
+events and blobs, interleaved in time order with what the agent said back.
+
+```
+chat/events.jsonl     capture events + agent.response, one ordered stream
+chat/blobs/           frames, player speech, and the agent's speech
+chat/agent.jsonl      the decision log, including the times it stayed quiet
+chat/agent-usage.json token and cost totals
+chat/manifest.json    config, source, and the agent's own report
+```
+
+The agent's speech is a first-class event, `agent.response`, carrying the same
+PCM16 24 kHz format `speech.segment` uses plus the reason it fired, the
+transcript, first-audio latency, the API's usage for that response, and whether
+the player cut it off (`cut`, in which case `dur_ms` is what was actually
+*heard*, not what was generated). So everything reads a recorded conversation
+the same way it reads a capture:
+
+```bash
+gpagent inspect chat          # the exchange as a timeline, both sides
+gpagent inspect chat --wav    # per-clip wavs, plus conversation.wav
+```
+
+`conversation.wav` is both voices laid out on the session timeline with silence
+in the gaps, so an exchange can be listened to as a conversation rather than as
+a pile of clips in the wrong order. `--no-media` writes only the logs if the
+audio and frames aren't wanted.
+
+Agent events take a `seq` range starting at 1,000,000, well clear of capture's,
+because blob filenames are built from `seq`.
 
 ## Cost, measured
 

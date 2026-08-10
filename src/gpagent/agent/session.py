@@ -32,6 +32,7 @@ from typing import Any, Callable
 
 from ..config import CaptureConfig
 from ..events import (
+    AgentResponse,
     Event,
     GamepadActivity,
     ScreenFrame,
@@ -41,7 +42,7 @@ from ..events import (
 )
 from ..tokens import UsageMeter
 from .context import ContextBuffer, Frame
-from .persona import instructions_for, resolve_persona
+from .persona import instructions, instructions_for
 from .playback import NullPlayer
 from .policy import SpeakPolicy
 
@@ -97,6 +98,7 @@ class CommentaryAgent:
         clock: Callable[[], float] = time.monotonic,
         log_path: str | Path | None = None,
         on_line: Callable[[Line], None] | None = None,
+        recorder: Callable[[Event], None] | None = None,
     ):
         self.cfg = cfg.agent
         self.speak_cfg = cfg.speak
@@ -125,6 +127,21 @@ class CommentaryAgent:
         self._last_prune = 0.0
         #: age of each frame at the moment it was attached, for tuning capture
         self._frame_ages: list[float] = []
+
+        # -- recording ----------------------------------------------------
+        self._recorder = recorder
+        #: clock() - event.t, so agent events land on the capture timeline.
+        #: Live these are different bases (bus time vs time.monotonic); in
+        #: deterministic replay they are the same and this is zero.
+        self._t_offset: float | None = None
+        #: agent events get their own seq range, well clear of capture's
+        self._agent_seq = 1_000_000
+        self._response_audio = bytearray()
+        self._response_reason = ""
+        self._response_transcript = ""
+        self._response_asked_at: float | None = None
+        self._response_first_audio: float | None = None
+        self._response_usage: dict[str, Any] = {}
         self._pump: asyncio.Task | None = None
         self._watchdog: asyncio.Task | None = None
         self.spoke = 0
@@ -170,13 +187,19 @@ class CommentaryAgent:
             "turn_detection": None,
         }
         if self.cfg.transcribe_player:
-            audio_input["transcription"] = {"model": self.cfg.transcribe_model}
+            transcription: dict[str, Any] = {"model": self.cfg.transcribe_model}
+            if self.cfg.language:
+                # The one place language is a real API setting: it improves
+                # transcription accuracy and latency. Output language has no
+                # such parameter and is handled in the instructions.
+                transcription["language"] = self.cfg.language
+            audio_input["transcription"] = transcription
         return {
             "type": "session.update",
             "session": {
                 "type": "realtime",
                 "output_modalities": ["audio"],
-                "instructions": resolve_persona(self.cfg),
+                "instructions": instructions(self.cfg),
                 "truncation": {
                     "type": "retention_ratio",
                     "retention_ratio": self.cfg.truncation_retention_ratio,
@@ -198,6 +221,10 @@ class CommentaryAgent:
 
     async def handle(self, event: Event, now: float | None = None) -> None:
         now = self.clock() if now is None else now
+        if self._t_offset is None:
+            self._t_offset = now - event.t
+        if self._recorder is not None:
+            self._recorder(event)
 
         if isinstance(event, GamepadActivity):
             self.context.add_summary(now, event.summary)
@@ -306,6 +333,8 @@ class CommentaryAgent:
         self.policy.mark_spoken(reason, now)
         self._response_active = True
         self._response_started = now
+        self._response_reason = reason
+        self._response_asked_at = now
         self.spoke += 1
         self._arm_watchdog()
 
@@ -427,7 +456,12 @@ class CommentaryAgent:
             self._audio_item_id = event.get("item_id") or self._audio_item_id
             delta = event.get("delta")
             if delta:
-                self.player.push(base64.b64decode(delta))
+                pcm = base64.b64decode(delta)
+                if self._response_first_audio is None:
+                    self._response_first_audio = now
+                if self._recorder is not None:
+                    self._response_audio += pcm
+                self.player.push(pcm)
         elif kind == "response.output_item.added":
             self._audio_item_id = (event.get("item") or {}).get("id") or self._audio_item_id
         elif kind == "conversation.item.created":
@@ -435,7 +469,8 @@ class CommentaryAgent:
             if item_id:
                 self._items.append((now, item_id))
         elif kind == "response.output_audio_transcript.done":
-            self._emit(Line(now, "say", event.get("transcript") or ""))
+            self._response_transcript = event.get("transcript") or ""
+            self._emit(Line(now, "say", self._response_transcript))
         elif kind == "conversation.item.input_audio_transcription.completed":
             self._emit(Line(now, "heard", event.get("transcript") or ""))
         elif kind == "response.done":
@@ -453,6 +488,7 @@ class CommentaryAgent:
 
     async def _finish_response(self, event: dict) -> None:
         response = event.get("response") or {}
+        self._response_usage = response.get("usage") or {}
         self.meter.add(response.get("usage"))
         spoken_ms = await self.player.drain()
         if spoken_ms <= 0:
@@ -470,6 +506,7 @@ class CommentaryAgent:
             end = now + spoken_ms / 1000.0
         self._response_active = False
         self._response_started = None
+        self._record_response(now, cut=False)
         self.policy.on_response_finished(spoken_ms=spoken_ms, now=end)
         if self._watchdog is not None:
             self._watchdog.cancel()
@@ -498,8 +535,50 @@ class CommentaryAgent:
         self._response_active = False
         self._response_started = None
         self._audio_item_id = None
+        self._record_response(now, cut=True, heard_ms=heard_ms)
         self.policy.on_response_cancelled(now)
         self._emit(Line(now, "cut", f"{why} after {heard_ms / 1000:.1f}s"))
+
+    def _record_response(self, now: float, *, cut: bool, heard_ms: float = 0.0) -> None:
+        """Write what the agent just said into the session, audio and all.
+
+        Emitted for cancelled responses too, marked `cut`, since "it started
+        saying this and got interrupted" is exactly what you want to see when
+        reading a session back.
+        """
+        if self._recorder is None or self._response_asked_at is None:
+            self._reset_response_record()
+            return
+
+        pcm = bytes(self._response_audio)
+        dur_ms = int(len(pcm) / 2 / (SAMPLE_RATE / 1000.0))
+        latency = (
+            int((self._response_first_audio - self._response_asked_at) * 1000)
+            if self._response_first_audio is not None
+            else 0
+        )
+        event = AgentResponse(
+            data=pcm or None,
+            reason=self._response_reason,
+            transcript=self._response_transcript,
+            dur_ms=int(heard_ms) if cut and heard_ms else dur_ms,
+            sample_rate=SAMPLE_RATE,
+            latency_ms=max(0, latency),
+            cut=cut,
+            usage=self._response_usage,
+        )
+        event.t = now - (self._t_offset or 0.0)
+        event.seq = self._agent_seq
+        self._agent_seq += 1
+        self._recorder(event)
+        self._reset_response_record()
+
+    def _reset_response_record(self) -> None:
+        self._response_audio = bytearray()
+        self._response_transcript = ""
+        self._response_asked_at = None
+        self._response_first_audio = None
+        self._response_usage = {}
 
     def _arm_watchdog(self) -> None:
         if self._watchdog is not None:

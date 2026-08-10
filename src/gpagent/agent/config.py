@@ -30,6 +30,15 @@ class AgentConfig:
     persona: str | None = None
     persona_file: str | None = None
 
+    #: ISO-639-1 code the player speaks and the agent should answer in, e.g.
+    #: "ja". None lets the model follow whatever it hears. Half of this is an
+    #: API setting and half is not: the code is passed to input transcription,
+    #: where it improves accuracy and latency, but the Realtime API has no
+    #: parameter for *output* language, so that is a line in the instructions.
+    #: The persona itself stays in English -- it is instructions to the model,
+    #: not something anyone hears.
+    language: str | None = None
+
     # -- vision -----------------------------------------------------------
     #: "high" is ~765 tok for a 1024x576 frame, "low" a flat 85 -- a 9x lever.
     #: Frames are the dominant input cost, so this and `max_image_age_s` are

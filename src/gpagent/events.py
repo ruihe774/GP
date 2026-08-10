@@ -24,6 +24,7 @@ __all__ = [
     "GamepadIdle",
     "SpeechSegment",
     "ScreenFrame",
+    "AgentResponse",
     "decode",
     "EVENT_TYPES",
 ]
@@ -156,6 +157,33 @@ class SpeechSegment(Event):
 
 
 @dataclass(kw_only=True)
+class AgentResponse(Event):
+    """Something the agent said. Component B's only outbound event.
+
+    Carries the spoken audio as a blob in the same format `SpeechSegment` uses,
+    so a recorded session holds both halves of the conversation and `inspect`
+    can play back either.
+    """
+
+    TYPE: ClassVar[str] = "agent.response"
+    BLOB_EXT: ClassVar[str | None] = "pcm"
+    BLOB_KIND: ClassVar[str] = "response"
+
+    #: which speaking rule fired: reply | react | ambient
+    reason: str = ""
+    transcript: str = ""
+    dur_ms: int = 0
+    sample_rate: int = 24000
+    encoding: str = "pcm_s16le"
+    #: request sent -> first audio out
+    latency_ms: int = 0
+    #: true when the player interrupted and the rest was never heard
+    cut: bool = False
+    #: what the API reported for this response
+    usage: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(kw_only=True)
 class ScreenFrame(Event):
     TYPE: ClassVar[str] = "screen.frame"
     BLOB_EXT: ClassVar[str | None] = "jpg"
@@ -179,6 +207,7 @@ EVENT_TYPES: dict[str, type[Event]] = {
         GamepadIdle,
         SpeechSegment,
         ScreenFrame,
+        AgentResponse,
     )
 }
 

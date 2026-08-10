@@ -21,9 +21,27 @@ from .config import AgentConfig
 __all__ = [
     "DEFAULT_PERSONA",
     "RESPONSE_INSTRUCTIONS",
+    "LANGUAGE_NAMES",
     "resolve_persona",
+    "instructions",
     "instructions_for",
+    "language_name",
 ]
+
+#: Names for the codes people actually use, so the instruction reads as a
+#: sentence rather than an ISO code. Anything not here is passed through: the
+#: model knows far more language names than this table does, and "answer in
+#: nds" is still a workable instruction.
+LANGUAGE_NAMES = {
+    "ar": "Arabic", "bn": "Bengali", "cs": "Czech", "da": "Danish",
+    "de": "German", "el": "Greek", "en": "English", "es": "Spanish",
+    "fi": "Finnish", "fr": "French", "he": "Hebrew", "hi": "Hindi",
+    "hu": "Hungarian", "id": "Indonesian", "it": "Italian", "ja": "Japanese",
+    "ko": "Korean", "nl": "Dutch", "no": "Norwegian", "pl": "Polish",
+    "pt": "Portuguese", "ro": "Romanian", "ru": "Russian", "sv": "Swedish",
+    "th": "Thai", "tr": "Turkish", "uk": "Ukrainian", "vi": "Vietnamese",
+    "zh": "Chinese",
+}
 
 
 DEFAULT_PERSONA = """\
@@ -71,6 +89,23 @@ def resolve_persona(cfg: AgentConfig) -> str:
     return DEFAULT_PERSONA
 
 
+def language_name(code: str) -> str:
+    return LANGUAGE_NAMES.get(code.strip().lower(), code.strip())
+
+
+def instructions(cfg: AgentConfig) -> str:
+    """The persona, plus the language directive if one was asked for."""
+    text = resolve_persona(cfg)
+    if cfg.language:
+        name = language_name(cfg.language)
+        text += (
+            f"\nSpeak {name} at all times. The player speaks {name}; answer in "
+            f"{name} even if they use another language for a word or two, and "
+            f"never comment on which language is being spoken."
+        )
+    return text
+
+
 def instructions_for(cfg: AgentConfig, reason: str) -> str:
     """Per-response instructions: the persona *plus* the reason.
 
@@ -79,6 +114,6 @@ def instructions_for(cfg: AgentConfig, reason: str) -> str:
     the persona away on every single turn -- the first live run against sess5
     answered a swearing player with four sentences of encouraging life coaching,
     which is exactly what a model with no persona and one line of task framing
-    sounds like.
+    sounds like. The language directive has to ride along for the same reason.
     """
-    return f"{resolve_persona(cfg)}\nRight now: {RESPONSE_INSTRUCTIONS[reason]}"
+    return f"{instructions(cfg)}\nRight now: {RESPONSE_INSTRUCTIONS[reason]}"

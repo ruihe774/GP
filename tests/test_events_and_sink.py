@@ -110,6 +110,48 @@ class TestSink:
         assert manifest["duration_s"] == 5.0
 
 
+class TestAgentResponseIsARecordableEvent:
+    """A recorded conversation is only readable if the agent's half survives."""
+
+    def event(self):
+        from gpagent.events import AgentResponse
+
+        return AgentResponse(
+            t=12.5,
+            seq=1_000_000,
+            data=b"\x01\x02" * 100,
+            reason="reply",
+            transcript="that boss has too much health",
+            dur_ms=1200,
+            latency_ms=430,
+            cut=True,
+            usage={"output_tokens": 40},
+        )
+
+    def test_it_survives_a_session_round_trip(self, tmp_path):
+        from gpagent.events import AgentResponse
+        from gpagent.sinks.jsonl import JsonlSink, read_session
+
+        with JsonlSink(tmp_path / "s") as sink:
+            sink.write(self.event())
+        back = list(read_session(tmp_path / "s", load_blobs=True))
+        assert len(back) == 1
+        got = back[0]
+        assert isinstance(got, AgentResponse)
+        assert got.data == b"\x01\x02" * 100
+        assert got.transcript == "that boss has too much health"
+        assert got.reason == "reply" and got.cut is True
+        assert got.usage == {"output_tokens": 40}
+
+    def test_its_audio_goes_to_a_named_blob(self, tmp_path):
+        from gpagent.sinks.jsonl import JsonlSink
+
+        with JsonlSink(tmp_path / "s") as sink:
+            sink.write(self.event())
+        blobs = [p.name for p in (tmp_path / "s" / "blobs").iterdir()]
+        assert blobs == ["1000000-response.pcm"]
+
+
 class TestConfig:
     def test_defaults_are_sane(self):
         cfg = CaptureConfig()

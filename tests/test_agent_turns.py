@@ -15,7 +15,7 @@ from gpagent.agent.playback import NullPlayer
 from gpagent.agent.session import CommentaryAgent, ReplayClock
 from gpagent.agent.transport import FakeTransport
 from gpagent.config import CaptureConfig
-from gpagent.events import GamepadActivity, ScreenFrame, SpeechSegment
+from gpagent.events import AgentResponse, GamepadActivity, ScreenFrame, SpeechSegment
 
 JPEG = b"\xff\xd8\xff\xe0fake-jpeg-bytes"
 PCM = b"\x01\x02" * 12000  # 1 s at 24 kHz s16 mono
@@ -340,6 +340,131 @@ class TestSessionSetup:
         cfg = make_config(transcribe_player=False)
         agent = CommentaryAgent(cfg, FakeTransport(), NullPlayer())
         assert "transcription" not in agent.session_update()["session"]["audio"]["input"]
+
+
+class TestLanguage:
+    """Half an API setting, half a prompt: the API has no output-language field."""
+
+    def test_no_language_leaves_the_model_to_follow_the_player(self, agent):
+        session = agent.session_update()["session"]
+        assert "language" not in session["audio"]["input"]["transcription"]
+        assert "Speak" not in session["instructions"].split("How you talk")[0]
+
+    def test_it_is_passed_to_input_transcription(self):
+        cfg = make_config(language="ja", transcribe_player=True)
+        agent = CommentaryAgent(cfg, FakeTransport(), NullPlayer())
+        transcription = agent.session_update()["session"]["audio"]["input"]["transcription"]
+        assert transcription["language"] == "ja"
+
+    def test_it_names_the_language_in_the_instructions(self):
+        cfg = make_config(language="ja")
+        agent = CommentaryAgent(cfg, FakeTransport(), NullPlayer())
+        assert "Japanese" in agent.session_update()["session"]["instructions"]
+
+    async def test_it_survives_the_per_response_override(self, agent):
+        """Same trap the persona fell into: instructions are replaced, not merged."""
+        agent.cfg.language = "es"
+        await agent.handle(frame(score=1.0), now=100.0)
+        instructions = agent.transport.sent_of_type("response.create")[0]["response"][
+            "instructions"
+        ]
+        assert "Spanish" in instructions
+
+    def test_an_unknown_code_is_passed_through(self):
+        cfg = make_config(language="nds")
+        agent = CommentaryAgent(cfg, FakeTransport(), NullPlayer())
+        assert "nds" in agent.session_update()["session"]["instructions"]
+
+    def test_the_persona_itself_stays_english(self):
+        cfg = make_config(language="ja")
+        agent = CommentaryAgent(cfg, FakeTransport(), NullPlayer())
+        assert "sitting on the couch" in agent.session_update()["session"]["instructions"]
+
+
+class TestRecording:
+    """A session must hold both halves of the conversation."""
+
+    def recording_agent(self):
+        clock = ReplayClock(100.0)
+        recorded = []
+        agent = CommentaryAgent(
+            make_config(), FakeTransport(), NullPlayer(clock),
+            clock=clock, recorder=recorded.append,
+        )
+        agent._clock_obj = clock
+        return agent, recorded
+
+    async def test_capture_events_are_recorded(self):
+        agent, recorded = self.recording_agent()
+        await agent.handle(pad("tapped A"), now=100.0)
+        await agent.handle(frame(seq=2), now=100.5)
+        assert [e.TYPE for e in recorded] == ["gamepad.activity", "screen.frame"]
+
+    async def test_what_the_agent_said_is_recorded_with_its_audio(self):
+        agent, recorded = self.recording_agent()
+        await agent.handle(frame(score=1.0), now=100.0)
+        await agent.on_server_event(
+            {"type": "response.output_item.added", "item": {"id": "a1"}}
+        )
+        await agent.on_server_event(
+            {
+                "type": "response.output_audio.delta",
+                "item_id": "a1",
+                "delta": base64.b64encode(b"\x01\x02" * 24000).decode(),  # 1 s
+            }
+        )
+        await agent.on_server_event(
+            {"type": "response.output_audio_transcript.done", "transcript": "nice one"}
+        )
+        await complete_response(agent)
+
+        said = [e for e in recorded if isinstance(e, AgentResponse)]
+        assert len(said) == 1
+        assert said[0].data == b"\x01\x02" * 24000
+        assert said[0].transcript == "nice one"
+        assert said[0].reason == "react"
+        assert said[0].dur_ms == 1000
+        assert not said[0].cut
+
+    async def test_an_interrupted_response_is_recorded_as_cut(self):
+        agent, recorded = self.recording_agent()
+        await agent.handle(frame(score=1.0), now=100.0)
+        await agent.on_server_event(
+            {"type": "response.output_item.added", "item": {"id": "a1"}}
+        )
+        await agent.on_server_event(
+            {
+                "type": "response.output_audio.delta",
+                "item_id": "a1",
+                "delta": base64.b64encode(b"\x00\x00" * 96000).decode(),  # 4 s
+            }
+        )
+        agent._clock_obj.set(101.0)
+        await agent.on_speech_start(now=101.0)
+
+        said = [e for e in recorded if isinstance(e, AgentResponse)]
+        assert len(said) == 1 and said[0].cut
+        assert 900 <= said[0].dur_ms <= 1100, "records what was heard, not what was sent"
+
+    async def test_agent_events_land_on_the_capture_timeline(self):
+        """Live, the agent clock and event.t are different bases."""
+        clock = ReplayClock(5000.0)  # a monotonic-looking clock...
+        recorded = []
+        agent = CommentaryAgent(
+            make_config(), FakeTransport(), NullPlayer(clock),
+            clock=clock, recorder=recorded.append,
+        )
+        await agent.handle(pad("tapped A"), now=5000.0)  # ...for an event at t=0
+        clock.set(5002.0)
+        await agent.handle(frame(score=1.0), now=5002.0)
+        await complete_response(agent)
+
+        said = [e for e in recorded if isinstance(e, AgentResponse)][0]
+        assert 1.9 <= said.t <= 2.6, f"t={said.t} is not on the capture timeline"
+
+    async def test_recording_is_off_by_default(self, agent):
+        await agent.handle(frame(score=1.0), now=100.0)
+        await complete_response(agent)  # must not raise without a recorder
 
 
 class TestContextPruning:
