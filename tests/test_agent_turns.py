@@ -176,6 +176,28 @@ class TestTheTurnItSends:
             JPEG + bytes([3]),
         ]
 
+    async def test_the_ask_line_names_which_frames_it_sent(self, agent):
+        """Identities, not counts.
+
+        "trail 2 low" tells a reader how much was sent but not what, so the
+        images the model actually saw could not be pulled back out of the
+        recording. `gpagent inspect --sent-sheet` reads this field.
+        """
+        lines = []
+        agent._on_line = lines.append
+        agent.cfg.image_trail = 2
+        for i, t in enumerate([100.0, 101.0, 108.0, 109.0]):
+            await agent.handle(frame(seq=i), now=t)
+        await agent.handle(speech(), now=110.0)
+
+        ask = [ln for ln in lines if ln.kind == "ask"][-1]
+        assert ask.extra["frames"] == {
+            "current": 3,
+            "detail": "high",
+            "trail": [1, 2],
+            "trail_detail": "low",
+        }
+
     async def test_the_trail_is_not_re_sent_on_the_next_turn(self, agent):
         agent.cfg.image_trail = 4
         await agent.handle(frame(seq=0), now=100.0)

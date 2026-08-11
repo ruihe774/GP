@@ -622,7 +622,9 @@ def _print_live(event) -> None:
 
 def cmd_inspect(args) -> int:
     directory = Path(args.directory)
-    events = list(read_session(directory, load_blobs=args.wav or args.contact_sheet))
+    events = list(
+        read_session(directory, load_blobs=args.wav or args.contact_sheet or args.sent_sheet)
+    )
     if not events:
         print("no events")
         return 1
@@ -727,7 +729,26 @@ def cmd_inspect(args) -> int:
         )
     if args.contact_sheet:
         _write_contact_sheet(directory, events)
+    if args.sent_sheet:
+        _write_sent_sheet(directory, events, Path(args.agent_log) if args.agent_log else None)
     return 0
+
+
+def _read_asks(path: Path) -> list[dict[str, Any]]:
+    """The `ask` lines of an agent log, which say what each turn was shown."""
+    asks = []
+    with open(path) as fh:
+        for raw in fh:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                line = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if line.get("kind") == "ask" and line.get("frames"):
+                asks.append(line)
+    return asks
 
 
 def _read_manifest(directory: Path) -> dict[str, Any]:
@@ -836,6 +857,92 @@ def _write_contact_sheet(directory: Path, events: list, columns: int = 4) -> Non
     path = directory / "contact-sheet.png"
     sheet.save(path)
     print(f"\nwrote contact sheet with {len(thumbs)} frames to {path}")
+
+
+def _write_sent_sheet(directory: Path, events: list, agent_log: Path | None = None) -> None:
+    """One row per turn: exactly the images that turn put on the wire.
+
+    `--contact-sheet` montages everything capture recorded, which is the wrong
+    question once a turn carries a trail -- a session captures a thousand frames
+    and sends a few hundred. This reads the `frames` field of the agent log's
+    `ask` lines, which names the `seq` of every image sent and the detail it was
+    sent at, and pulls those blobs back out of the recording.
+
+    The agent log and the blobs need not live together: a replay recorded with
+    `--no-media` has the log but no payloads, so point `--agent-log` at the run
+    and `directory` at the original recording.
+    """
+    from io import BytesIO
+
+    from PIL import Image, ImageDraw
+
+    log = agent_log or directory / "agent.jsonl"
+    if not log.exists():
+        print(f"\nno agent log at {log}; run `commentate -o DIR` or pass --agent-log")
+        return
+    asks = _read_asks(log)
+    if not asks:
+        print(f"\nno turns with frames in {log}")
+        return
+
+    by_seq = {e.seq: e for e in events if isinstance(e, ScreenFrame) and e.data}
+    rows: list[tuple[dict, list[tuple[int, str]]]] = []
+    for ask in asks:
+        meta = ask["frames"]
+        cells = [(seq, meta.get("trail_detail", "low")) for seq in meta.get("trail", [])]
+        cells.append((meta["current"], meta.get("detail", "high")))
+        rows.append((ask, cells))
+
+    print(f"\nturns and the images they sent, from {log}")
+    missing = 0
+    for ask, cells in rows:
+        shown = " ".join(f"#{seq}:{detail}" for seq, detail in cells)
+        missing += sum(1 for seq, _ in cells if seq not in by_seq)
+        print(f"  t={ask['t']:>8.1f}s  {ask['text']:<28s} {shown}")
+    if missing:
+        print(f"  ({missing} blobs not in {directory}; drawn as placeholders)")
+
+    columns = max(len(cells) for _, cells in rows)
+    cell_w, cell_h, label_h, pad, margin = 320, 180, 16, 4, 190
+    sheet = Image.new(
+        "RGB",
+        (margin + columns * (cell_w + pad), len(rows) * (cell_h + label_h + pad)),
+        (18, 18, 18),
+    )
+    draw = ImageDraw.Draw(sheet)
+
+    for row, (ask, cells) in enumerate(rows):
+        y = row * (cell_h + label_h + pad)
+        # Right-align, so the current frame is the last column on every row and
+        # the trail reads left-to-right into it however long it is.
+        offset = columns - len(cells)
+        draw.text((6, y + cell_h // 2 - 12), f"t={ask['t']:.1f}s", fill=(170, 170, 170))
+        draw.text((6, y + cell_h // 2 + 2), ask["text"][:28], fill=(120, 120, 120))
+        for col, (seq, detail) in enumerate(cells):
+            x = margin + (offset + col) * (cell_w + pad)
+            event = by_seq.get(seq)
+            if event is not None and event.data:
+                thumb = Image.open(BytesIO(event.data)).convert("RGB")
+                thumb.thumbnail((cell_w, cell_h))
+                sheet.paste(thumb, (x, y))
+                box = (x, y, x + thumb.width - 1, y + thumb.height - 1)
+            else:
+                box = (x, y, x + cell_w - 1, y + cell_h - 1)
+                draw.rectangle(box, fill=(40, 40, 40))
+                draw.text((x + 8, y + 8), "(blob not here)", fill=(140, 140, 140))
+            # High detail is what the turn is really being asked about; the
+            # trail is context. The border says which at a glance, the label
+            # says it in words.
+            hot = detail == "high"
+            draw.rectangle(box, outline=(90, 200, 120) if hot else (90, 90, 110), width=3)
+            label = f"#{seq} {detail}" + ("" if hot else "  trail")
+            draw.text(
+                (x + 4, y + cell_h + 2), label, fill=(210, 210, 210) if hot else (150, 150, 150)
+            )
+
+    path = directory / "sent-sheet.png"
+    sheet.save(path)
+    print(f"\nwrote {len(rows)} turns to {path}")
 
 
 # -- commentate ------------------------------------------------------------
@@ -1171,6 +1278,16 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("directory")
     inspect.add_argument("--wav", action="store_true", help="convert speech blobs to wav")
     inspect.add_argument("--contact-sheet", action="store_true", help="montage frames to png")
+    inspect.add_argument(
+        "--sent-sheet",
+        action="store_true",
+        help="montage only what the agent sent, one row per turn, labelled by detail",
+    )
+    inspect.add_argument(
+        "--agent-log",
+        metavar="PATH",
+        help="agent.jsonl for --sent-sheet, if not in DIR (e.g. a --no-media replay run)",
+    )
     inspect.add_argument("-q", "--quiet", action="store_true", help="stats only, no timeline")
     inspect.set_defaults(func=cmd_inspect)
 

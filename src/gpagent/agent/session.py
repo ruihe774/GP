@@ -377,13 +377,20 @@ class CommentaryAgent:
         self._arm_watchdog()
 
         cause = self.policy.react_cause if reason == "react" else ""
+        extra: dict[str, Any] = {"sent": detail, "state": self.policy.state(now)}
+        if ctx.frame:
+            # Identities, not just counts. `sent` above is the console story;
+            # this is what lets a reader pull the exact blobs back out of
+            # `events.jsonl` and see what the model was looking at, at which
+            # detail. See `gpagent inspect --sent-sheet`.
+            extra["frames"] = {
+                "current": ctx.frame.seq,
+                "detail": self.cfg.image_detail,
+                "trail": [f.seq for f in ctx.trail],
+                "trail_detail": self.cfg.image_trail_detail,
+            }
         self._emit(
-            Line(
-                now,
-                "ask",
-                f"-> {reason}" + (f" ({cause})" if cause else ""),
-                {"sent": detail, "state": self.policy.state(now)},
-            )
+            Line(now, "ask", f"-> {reason}" + (f" ({cause})" if cause else ""), extra)
         )
 
     def _take_pending(self, now: float) -> list[tuple[bytes, int]]:

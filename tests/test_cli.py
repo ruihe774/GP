@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 from typing import Any
 
 import pytest
 
-from gpagent.cli import _build_config
+from gpagent.cli import _build_config, _write_sent_sheet
 from gpagent.sinks.jsonl import JsonlSink
 
 
@@ -73,3 +74,65 @@ class TestBuildConfigReplayLayer:
         _write_session_with_config(tmp_path, {"gamepad": {"sticks_mode": "full"}})
         cfg = _build_config(_args(replay=None))
         assert cfg.gamepad.sticks_mode == "off"
+
+
+class TestSentSheet:
+    """`--sent-sheet` shows what a turn was shown, not what capture recorded."""
+
+    def _session(self, seqs=(1, 2, 3)) -> list:
+        from io import BytesIO
+
+        from PIL import Image
+
+        from gpagent.events import ScreenFrame
+
+        buf = BytesIO()
+        Image.new("RGB", (64, 36), (90, 90, 90)).save(buf, format="JPEG")
+        return [
+            ScreenFrame(seq=s, t=float(s), w=64, h=36, data=buf.getvalue(), trigger="scene")
+            for s in seqs
+        ]
+
+    def _log(self, directory, frames: dict) -> Any:
+        path = directory / "agent.jsonl"
+        path.write_text(
+            json.dumps({"t": 1.0, "kind": "player", "text": "speech"})
+            + "\n"
+            + json.dumps({"t": 2.0, "kind": "ask", "text": "-> reply", "frames": frames})
+            + "\n"
+        )
+        return path
+
+    def test_it_draws_a_row_of_what_one_turn_sent(self, tmp_path, capsys):
+        events = self._session()
+        self._log(
+            tmp_path,
+            {"current": 3, "detail": "high", "trail": [1, 2], "trail_detail": "low"},
+        )
+        _write_sent_sheet(tmp_path, events)
+        out = capsys.readouterr().out
+        assert "#1:low #2:low #3:high" in out, "detail is named per image, per turn"
+        assert (tmp_path / "sent-sheet.png").exists()
+
+    def test_the_log_can_live_apart_from_the_blobs(self, tmp_path, capsys):
+        """A `--no-media` replay has the log; the payloads are in the recording."""
+        run = tmp_path / "run"
+        run.mkdir()
+        self._log(run, {"current": 3, "detail": "high", "trail": [1], "trail_detail": "low"})
+        _write_sent_sheet(tmp_path, self._session(), run / "agent.jsonl")
+        assert "#1:low #3:high" in capsys.readouterr().out
+        assert (tmp_path / "sent-sheet.png").exists()
+
+    def test_a_missing_blob_is_drawn_rather_than_fatal(self, tmp_path, capsys):
+        self._log(
+            tmp_path,
+            {"current": 3, "detail": "high", "trail": [99], "trail_detail": "low"},
+        )
+        _write_sent_sheet(tmp_path, self._session())
+        assert "1 blobs not in" in capsys.readouterr().out
+        assert (tmp_path / "sent-sheet.png").exists()
+
+    def test_it_says_so_when_there_is_no_agent_log(self, tmp_path, capsys):
+        _write_sent_sheet(tmp_path, self._session())
+        assert "no agent log" in capsys.readouterr().out
+        assert not (tmp_path / "sent-sheet.png").exists()

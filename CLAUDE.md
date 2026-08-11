@@ -103,7 +103,7 @@ Commands:
 - `devices` — what was detected, usability
 - `monitor` — live per-button view, check mapping, detect drift
 - `record` — capture a session
-- `inspect` — timeline, stats, estimated cost, WAV export, contact sheets
+- `inspect` — timeline, stats, estimated cost, WAV export, contact sheets. `--contact-sheet` montages everything *captured*; `--sent-sheet` montages only what the agent *sent*, one row per turn, each image labelled with its `seq` and detail (green border = the high-detail current frame, grey = trail). It reads the `frames` field of the agent log's `ask` lines, so `--agent-log` points it at a run whose blobs live elsewhere (a `--no-media` replay).
 - `replay` — re-emit with original timing
 - `commentate` — run agent over captured or live events
 
@@ -284,5 +284,7 @@ max_per_min = 8               # global rate cap
 **Debugging cost:** Check `inspect --cost` estimates vs. actual API usage in `manifest.json`. Cost meter in `session.py::usage_for_response()`. Per-response `usage` (and with it the cached-token split) lives on the `agent.response` events in `events.jsonl`, not in `agent.jsonl` — that file is the console story only. `-o DIR --no-media` writes the event stream without the payloads, which is the shape you want when re-running a recording to measure a change rather than to listen to it.
 
 **Finding frame stale:** `commentate` reports frame age at send time. Older frames mean `triggers.min_interval_s` is too high.
+
+**Seeing what the model actually looked at:** `ask` lines in `agent.jsonl` carry `sent` (the console story: `frame 1024x576 high (0.8s old)`, `trail 2 low (back to 6.3s)`) and `frames` (the identities: `{"current": 3870, "detail": "high", "trail": [3809, 3837, ...], "trail_detail": "low"}`). `gpagent inspect DIR --sent-sheet [--agent-log RUN/agent.jsonl]` turns the second into one labelled row of images per turn. Use it to check that a trail spans the window instead of clustering — that is the failure mode of the selector, and it is invisible in the token counts.
 
 **Portal issues:** `manifest.json::devices.screen` carries portal diagnostics (handshake time, stalls, portal errors).
