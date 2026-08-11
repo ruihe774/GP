@@ -65,6 +65,10 @@ def frame(seq=1, score=0.0, data=JPEG):
     return ScreenFrame(seq=seq, w=1024, h=576, data=data, trigger="scene", scene_score=score)
 
 
+def decode(image_part) -> bytes:
+    return base64.b64decode(image_part["image_url"].split(",", 1)[1])
+
+
 def pad(summary="tapped A", intensity=0.1):
     return GamepadActivity(summary=summary, intensity=intensity, apm=60)
 
@@ -142,6 +146,54 @@ class TestTheTurnItSends:
         assert image["detail"] == "low"
         assert image["image_url"].startswith("data:image/jpeg;base64,")
         assert base64.b64decode(image["image_url"].split(",", 1)[1]) == JPEG
+
+    async def test_earlier_frames_ride_along_cheaply_and_in_order(self, agent):
+        """The trajectory, not just the destination.
+
+        The trail is the frames capture already paid for and the agent used to
+        throw away. They go on the wire at `image_trail_detail` (85 tokens flat)
+        ahead of the current frame, oldest first, with a line of text saying so
+        -- images in one item carry no timestamps and no stated direction.
+        """
+        agent.cfg.image_trail = 2
+        for i, t in enumerate([100.0, 101.0, 108.0, 109.0]):
+            await agent.handle(frame(seq=i, data=JPEG + bytes([i])), now=t)
+        await agent.handle(speech(), now=110.0)
+
+        content = agent.transport.sent_of_type("conversation.item.create")[0]["item"]["content"]
+        images = [c for c in content if c["type"] == "input_image"]
+        assert [c["detail"] for c in images] == ["low", "low", "high"]
+
+        notes = [c for c in content if c["type"] == "input_text"]
+        assert "oldest first" in notes[-1]["text"]
+        assert content.index(notes[-1]) < content.index(images[0]), "the note introduces them"
+
+        # Spread across the window (not the last two frames), oldest first, and
+        # ending on the frame the model is actually being asked about.
+        assert [decode(c) for c in images] == [
+            JPEG + bytes([1]),
+            JPEG + bytes([2]),
+            JPEG + bytes([3]),
+        ]
+
+    async def test_the_trail_is_not_re_sent_on_the_next_turn(self, agent):
+        agent.cfg.image_trail = 4
+        await agent.handle(frame(seq=0), now=100.0)
+        await agent.handle(frame(seq=1), now=101.0)
+        await agent.handle(speech(), now=102.0)
+        await complete_response(agent)
+
+        advance(agent, 130.0)
+        await agent.handle(frame(seq=2), now=130.0)
+        await agent.handle(speech(), now=131.0)
+        items = [
+            e
+            for e in agent.transport.sent_of_type("conversation.item.create")
+            if e["item"]["role"] == "user"
+        ]
+        assert len(items) == 2
+        second = [c for c in items[1]["item"]["content"] if c["type"] == "input_image"]
+        assert [c["detail"] for c in second] == ["high"], "no duplicate of a billed frame"
 
     async def test_each_reason_steers_the_response(self, agent):
         await agent.handle(frame(score=1.0), now=100.0)

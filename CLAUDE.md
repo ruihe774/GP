@@ -77,7 +77,8 @@ The split exists because **raw media to realtime API costs more than the game**.
 **Key design patterns:**
 - Speaking policy is decision-making, not the prompt. The model is only asked when a moment is already judged worth speaking at.
 - **Gamepad and frames are accumulated and flushed at speak time**, not streamed. 91 windows = 91 turns = 91 bills.
-- At most **one frame per response, and only if newer than last-sent**. Capture and send rates are decoupled.
+- At most **one high-detail frame per response, and only if newer than last-sent**. Capture and send rates are decoupled.
+- Behind it rides a **trail**: `agent.image_trail` (4) earlier frames at `"low"` detail, oldest first, so the model sees the trajectory and not just the destination. Trail frames are picked by **spread first, value second** — the candidate window is split into N equal time buckets and each contributes at most one frame, chosen by `scene_score`. Taking the N newest instead describes the last two seconds N times, because capture triggers throttle rather than debounce. Candidates are **only the gap**: frames newer than the last one sent and older than the current one. "Not sent yet" is not enough — a frame from between two images already in the conversation is nearly newsless, costs a slot that could cover unseen ground, and lands in history older than an image already there.
 - `response.create.instructions` **replaces** (not adds to) session instructions, so it is not used at all. The persona is sent once in `session.update`; the per-turn reason goes in as a system message item (`persona.reason_note`).
 - `response.cancel` on `speech.start` (VAD fires before segment exists). Truncate audio to milliseconds actually heard so model's idea matches player experience.
 - **Barge-in gates:** "player is talking" and "response in flight" are absolute. Both gates timeout to prevent permanent silence.
@@ -160,7 +161,9 @@ From `gpagent.toml` and observed on real sessions:
 - **Input cached:** ~10× cheaper than fresh (prompt-caching).
 - **Output audio:** ~$2 per minute of speaking. **Largest single cost line.** Controlled entirely by speaking policy.
 
-**Frame policy is less valuable than in capture.** Component A's most expensive tuning lever. Component B sends at most one frame per response, so capture rate and send rate decouple. Capture 100, send 14.
+**Frame policy is less valuable than in capture.** Component A's most expensive tuning lever. Component B sends at most one high-detail frame per response, so capture rate and send rate decouple. Capture 100, send 14.
+
+**The trail is sized against TPM, not price.** `image_trail = 4` costs 85 tokens per frame fresh (sess7: 258 trail frames, +$0.11 on a $0.53 replay) and most re-bills land in the cached tier, so the money barely moves. What binds is that cached tokens still count against the rate limit and a trail *stays in history*: 4 frames/turn adds ~20 k tokens/request by turn 60 on top of the ~10.5 k baseline, which is the gotcha-12 `rate_limit` failure made routine. Retiring a spent trail (its value expires the moment a newer one exists, and deleting at the *tail* costs far less cache than the old-item pruning that lost) would flatten that — not implemented yet, and the reason the default stays single digits.
 
 **Context trimming is counterintuitive:** Deleting old items invalidates prompt-cache prefix. Cached input is 10× cheaper; fewer tokens can mean more money. Client-side trimming defaults off; server's `truncation.retention_ratio` is the right mechanism (drops in amortized batches to keep cache prefix intact).
 

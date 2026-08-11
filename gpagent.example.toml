@@ -88,6 +88,22 @@ voice_speed = 1.0          # playback rate; server clamps to [0.25, 1.5]
 # output audio is the largest line -- and remarks get vaguer, reacting to tone
 # rather than to the screen.
 image_detail = "high"
+
+# Earlier frames sent alongside the current one, at image_trail_detail, oldest
+# first. One screenshot says where the player is and nothing about where they
+# came from; capture triggers frames far faster than the agent speaks, so these
+# are frames already taken and otherwise thrown away. Picked for spread across
+# the window and for scene_score inside it, drawn only from the gap between the
+# last frame sent and the current one (see context.ContextBuffer._pick_trail).
+# On sess7: 225 trail frames over 68 turns, +$0.10 of fresh input on a $0.53 hour.
+#
+# Kept single-digit for TPM, not for price: a trail stays in history and is
+# re-sent every turn after it, and input per request is already ~10.5k tokens by
+# minute 60 (sess7 lost two responses to rate_limit). 0 disables.
+image_trail = 4
+image_trail_detail = "low"
+image_trail_max_age_s = 45.0  # looser than max_image_age_s: stale is fine as history
+
 max_image_age_s = 20.0        # never attach a screenshot older than this
 image_on_unprompted = true    # attach frames to remarks, not just replies
 max_output_tokens = 320       # backstop against rambling; hitting it truncates

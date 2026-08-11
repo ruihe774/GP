@@ -7,15 +7,19 @@ import asyncio
 import pytest
 
 from gpagent.agent.config import AgentConfig
-from gpagent.agent.context import ContextBuffer, Frame
+from gpagent.agent.context import ContextBuffer, Frame, TurnContext
 from gpagent.agent.env import ENV_VAR, MissingAPIKey, load_api_key, load_dotenv
 from gpagent.agent.playback import NullPlayer, PlaybackTimer
 from gpagent.agent.transport import RecordingTransport
 from gpagent.tokens import Estimate, UsageMeter, estimate_events, rates_for
 
 
-def frame(seq=1, t=0.0, data=b"\xff\xd8jpeg"):
-    return Frame(seq=seq, t=t, data=data, w=1024, h=576)
+def frame(seq=1, t=0.0, data=b"\xff\xd8jpeg", score=0.0):
+    return Frame(seq=seq, t=t, data=data, w=1024, h=576, scene_score=score)
+
+
+def trail_times(ctx):
+    return [f.t for f in ctx.trail]
 
 
 class TestContextBuffer:
@@ -70,6 +74,99 @@ class TestContextBuffer:
         buf = ContextBuffer(AgentConfig(max_image_age_s=5.0))
         buf.add_frame(frame(t=1.0))
         assert buf.take(100.0).frame is None
+
+    def test_earlier_frames_ride_along_as_a_trail(self):
+        buf = ContextBuffer(AgentConfig(image_trail=4))
+        for i in range(3):
+            buf.add_frame(frame(seq=i, t=float(i)))
+        ctx = buf.take(3.0)
+        assert ctx.frame.t == 2.0, "the current screen is still the newest frame"
+        assert trail_times(ctx) == [0.0, 1.0], "and the trail is older, oldest first"
+        assert buf.trail_sent == 2
+
+    def test_the_trail_spans_the_window_instead_of_the_last_moment(self):
+        """The newest N frames are the wrong N.
+
+        Capture triggers throttle rather than debounce, so a burst clusters
+        frames into a second or two. Taking the most recent ones describes that
+        second four times over and says nothing about where the player came
+        from, which is the whole point of sending more than one.
+        """
+        buf = ContextBuffer(AgentConfig(image_trail=2))
+        for i, t in enumerate([0.0, 1.0, 8.0, 9.0]):
+            buf.add_frame(frame(seq=i, t=t))
+        buf.add_frame(frame(seq=9, t=10.0))
+        assert trail_times(buf.take(10.0)) == [1.0, 9.0]
+
+    def test_the_frame_that_changed_the_screen_wins_its_slot(self):
+        buf = ContextBuffer(AgentConfig(image_trail=2))
+        buf.add_frame(frame(seq=0, t=0.0, score=0.9))
+        buf.add_frame(frame(seq=1, t=1.0, score=0.1))
+        buf.add_frame(frame(seq=2, t=8.0, score=0.1))
+        buf.add_frame(frame(seq=3, t=9.0, score=0.7))
+        buf.add_frame(frame(seq=9, t=10.0))
+        assert trail_times(buf.take(10.0)) == [0.0, 9.0]
+
+    def test_a_frame_is_never_paid_for_twice(self):
+        buf = ContextBuffer(AgentConfig(image_trail=4))
+        buf.add_frame(frame(seq=0, t=0.0))
+        buf.add_frame(frame(seq=1, t=1.0))
+        first = buf.take(2.0)
+        assert trail_times(first) == [0.0]
+
+        buf.add_frame(frame(seq=2, t=3.0))
+        second = buf.take(4.0)
+        assert second.frame.seq == 2
+        assert second.trail == [], "everything older is already in the conversation"
+
+    def test_the_trail_only_covers_ground_the_model_has_not_seen(self):
+        """Candidates start after the newest frame already sent, not merely at
+        "frames not yet sent individually".
+
+        A frame from between two images already in the conversation carries
+        almost no news, and the slot it takes is one that could have covered the
+        stretch nobody has seen.
+        """
+        buf = ContextBuffer(AgentConfig(image_trail=1))
+        buf.add_frame(frame(seq=0, t=0.0, score=0.9))
+        buf.add_frame(frame(seq=1, t=1.0, score=0.1))
+        buf.add_frame(frame(seq=2, t=2.0))
+        assert trail_times(buf.take(2.0)) == [0.0]
+
+        buf.add_frame(frame(seq=3, t=3.0, score=0.9))
+        buf.add_frame(frame(seq=4, t=4.0))
+        assert trail_times(buf.take(4.0)) == [3.0], "not t=1.0, which is behind the last send"
+
+    def test_frames_survive_a_turn_that_sent_no_image(self):
+        buf = ContextBuffer(AgentConfig(image_trail=4))
+        buf.add_frame(frame(seq=0, t=0.0))
+        buf.add_frame(frame(seq=1, t=1.0))
+        buf.take(2.0, with_image=False)
+
+        buf.add_frame(frame(seq=2, t=3.0))
+        assert trail_times(buf.take(3.0)) == [0.0, 1.0], "nothing was covered, so nothing expired"
+
+    def test_the_trail_has_its_own_age_horizon(self):
+        buf = ContextBuffer(AgentConfig(image_trail=4, image_trail_max_age_s=5.0))
+        buf.add_frame(frame(seq=0, t=0.0))
+        buf.add_frame(frame(seq=1, t=9.0))
+        buf.add_frame(frame(seq=2, t=10.0))
+        assert trail_times(buf.take(10.0)) == [9.0]
+
+    def test_the_trail_can_be_turned_off(self):
+        buf = ContextBuffer(AgentConfig(image_trail=0))
+        buf.add_frame(frame(seq=0, t=0.0))
+        buf.add_frame(frame(seq=1, t=1.0))
+        ctx = buf.take(2.0)
+        assert ctx.frame is not None and ctx.trail == []
+        assert buf.trail_sent == 0
+
+    def test_no_trail_rides_along_when_no_frame_does(self):
+        buf = ContextBuffer(AgentConfig(image_trail=4))
+        buf.add_frame(frame(seq=0, t=0.0))
+        buf.add_frame(frame(seq=1, t=1.0))
+        ctx = buf.take(2.0, with_image=False)
+        assert ctx.frame is None and ctx.trail == []
 
     def test_images_can_be_declined_for_this_turn(self):
         buf = ContextBuffer(AgentConfig())
@@ -438,7 +535,13 @@ class TestSdkPayloadDrift:
         from gpagent.config import CaptureConfig
 
         agent = CommentaryAgent(CaptureConfig(), FakeTransport(), NullPlayer())
-        ctx = type("Ctx", (), {"text": "hello", "frame": frame()})()
+        # A real context, trail included: an item carrying several images at
+        # mixed detail is the shape the SDK now has to survive.
+        ctx = TurnContext(
+            text="hello",
+            frame=frame(seq=3, t=2.0),
+            trail=[frame(seq=1, t=0.0), frame(seq=2, t=1.0)],
+        )
         return [
             agent.session_update(),
             agent._context_item(ctx),

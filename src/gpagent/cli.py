@@ -851,6 +851,10 @@ def cmd_commentate(args) -> int:
         cfg.agent.voice_speed = args.voice_speed
     if args.image_detail:
         cfg.agent.image_detail = args.image_detail
+    if args.image_trail is not None:
+        if args.image_trail < 0:
+            raise SystemExit("--image-trail cannot be negative")
+        cfg.agent.image_trail = args.image_trail
     if args.volume is not None:
         cfg.agent.volume = args.volume
     if args.language:
@@ -1030,6 +1034,7 @@ def _print_agent_report(agent, args, out_dir: Path | None) -> None:
         print(f"  stayed quiet    {report['declined']}")
     print(
         f"  frames          {report['frames_sent']} sent of {report['frames_seen']} captured"
+        + (f", +{report['trail_sent']} as trail" if report.get("trail_sent") else "")
     )
     if report["frame_age_s"]:
         age = report["frame_age_s"]
@@ -1216,6 +1221,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     commentate.add_argument(
         "--image-detail", choices=["auto", "low", "high"], help="override agent.image_detail"
+    )
+    commentate.add_argument(
+        "--image-trail",
+        type=int,
+        metavar="N",
+        help="earlier low-detail frames to send with each response (0 disables)",
     )
     commentate.add_argument(
         "--no-playback", action="store_true", help="do not open the audio sink"

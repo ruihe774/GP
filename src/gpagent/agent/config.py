@@ -55,6 +55,30 @@ class AgentConfig:
     #: Frames are the dominant input cost, so this and `max_image_age_s` are
     #: the two knobs that matter.
     image_detail: ImageDetail = "high"
+    #: How many *earlier* frames ride along with the current one, at
+    #: `image_trail_detail`. One screenshot says where the player is; it does not
+    #: say where they came from, and most of what a friend on the couch reacts to
+    #: is the change. Capture triggers frames far faster than the agent speaks, so
+    #: the frames between two responses are otherwise thrown away. Sending a few
+    #: of them, spread across the window and cheap, buys the trajectory for ~85
+    #: tokens each against the ~765 the current frame costs. 0 restores
+    #: one-frame behaviour.
+    #:
+    #: Sized against TPM, not price. Prompt caching makes the money nearly
+    #: irrelevant (~$0.5 of trail over a 66-response session, most of it at the
+    #: cached rate), but cached tokens still count against the rate limit, and a
+    #: trail stays in history and is re-sent every turn after it: at 4 frames it
+    #: adds ~20k tokens/request by turn 60 on top of the ~10.5k baseline, which
+    #: is close to the sess7 `rate_limit` losses (CLAUDE.md, Component B gotcha
+    #: 12). Retiring a spent trail would flatten that and is the obvious next
+    #: step; until then this stays single digits.
+    image_trail: int = 4
+    #: detail for the trail frames -- "low" is the point of the feature
+    image_trail_detail: ImageDetail = "low"
+    #: trail frames older than this are dropped. Looser than `max_image_age_s`
+    #: on purpose: a stale frame is a bad answer to "what is on screen now" but
+    #: a fine answer to "how did we get here".
+    image_trail_max_age_s: float = 45.0
     #: never attach a frame older than this; a stale screenshot is worse than none
     max_image_age_s: float = 20.0
     #: attach a frame to unprompted remarks too, not just replies

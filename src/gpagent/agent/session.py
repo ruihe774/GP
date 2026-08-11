@@ -340,6 +340,12 @@ class CommentaryAgent:
                     f"frame {ctx.frame.w}x{ctx.frame.h} {self.cfg.image_detail} "
                     f"({age:.1f}s old)"
                 )
+            if ctx.trail:
+                reach = now - ctx.trail[0].t
+                detail.append(
+                    f"trail {len(ctx.trail)} {self.cfg.image_trail_detail} "
+                    f"(back to {reach:.1f}s)"
+                )
 
         if reason == "reply":
             utterances = self._take_pending(now)
@@ -407,15 +413,25 @@ class CommentaryAgent:
         content: list[dict] = []
         if ctx.text:
             content.append({"type": "input_text", "text": ctx.text})
-        if ctx.frame:
-            b64 = base64.b64encode(ctx.frame.data).decode("ascii")
+        if ctx.trail:
+            # Images in one item carry no timestamps and nothing says which way
+            # round they go, so a bare pile of screenshots reads as ambiguous at
+            # best and as "the screen is flickering" at worst. One line of text
+            # ahead of them costs ~25 tokens and makes them a sequence.
+            span = ctx.frame.t - ctx.trail[0].t
             content.append(
                 {
-                    "type": "input_image",
-                    "image_url": f"data:image/jpeg;base64,{b64}",
-                    "detail": self.cfg.image_detail,
+                    "type": "input_text",
+                    "text": (
+                        f"[screen] {len(ctx.trail)} earlier frames from the last "
+                        f"{span:.0f}s, oldest first, then the current screen last."
+                    ),
                 }
             )
+            for f in ctx.trail:
+                content.append(self._image_part(f, self.cfg.image_trail_detail))
+        if ctx.frame:
+            content.append(self._image_part(ctx.frame, self.cfg.image_detail))
         # Client-assigned so the item can be pruned without waiting for the
         # server to tell us what it called it.
         self._item_seq += 1
@@ -427,6 +443,14 @@ class CommentaryAgent:
                 "role": "user",
                 "content": content,
             },
+        }
+
+    def _image_part(self, frame, detail: str) -> dict:
+        b64 = base64.b64encode(frame.data).decode("ascii")
+        return {
+            "type": "input_image",
+            "image_url": f"data:image/jpeg;base64,{b64}",
+            "detail": detail,
         }
 
     def _reason_item(self, reason: str) -> dict:
@@ -767,6 +791,7 @@ class CommentaryAgent:
             "declined": dict(self.policy.declined),
             "frames_seen": self.context.frames_seen,
             "frames_sent": self.context.frames_sent,
+            "trail_sent": self.context.trail_sent,
             "frame_age_s": {
                 "mean": round(sum(self._frame_ages) / len(self._frame_ages), 2),
                 "max": round(max(self._frame_ages), 2),
