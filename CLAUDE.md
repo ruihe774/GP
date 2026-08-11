@@ -19,56 +19,44 @@ Gamepad + Microphone + Screen
     Commentary + recorded conversation
 ```
 
-The split exists because **raw media to realtime API costs more than the game**. Capture emits only informative moments; the agent decides when to say something.
+The split exists because raw media to a realtime API costs more than the game. Capture emits only informative moments; the agent decides when to say something.
 
 ## Key Modules
 
 ### Component A: Capture (`src/gpagent/capture/`)
 
-**Purpose:** Convert gamepad, microphone, and screen into a discretized event stream.
+Converts gamepad, microphone, and screen into a discretized event stream.
 
 - `gamepad.py` — gamepad input capture via `/dev/input/event*`. Device discovery via udev heuristics. Emits `gamepad.activity` events with discretized summaries (taps, holds, intensity).
-- `audio.py` — microphone capture via PipeWire. VAD segmentation (Silero ONNX or WebRTC). Emits `speech.segment` events as headerless PCM16 24 kHz mono. AEC uses system default sink monitor as reference.
+- `audio.py` — microphone capture via PipeWire. VAD segmentation (Silero ONNX or WebRTC). Emits `speech.segment` events as headerless PCM16 24 kHz mono. AEC uses the system default sink monitor as reference.
 - `screen.py` — screen capture via xdg-desktop-portal. Portal consent dialog handled once, token cached. JPEG encoding. Emits `screen.frame` events triggered by policy.
-- `segmenter.py` — VAD model interface. Silero loads `.onnx` file; context tensor is 576 wide (64 samples padding + 512 input), not bare 512. Never returns positive for a raw 512-sample input.
+- `segmenter.py` — VAD model interface. Silero's context tensor is 576 wide (64 samples padding + 512 input), not bare 512.
 - `vad.py` — VAD abstraction (Silero or WebRTC backend, configurable).
-- `triggers.py` — `TriggerPolicy` decides when frames are worth emitting. Four triggers:
-  - `gamepad` — activity spike
-  - `scene` — screen changed (sample-to-sample comparison, not drift-accumulated)
-  - `heartbeat` — timeout floor (metronome)
-  - `dedup` — has model seen this already?
-  - **Dead triggers fixed:** `scene` now compares sample-to-sample (was comparing to last-sent, drifting with capture-suppression windows); `gamepad` intensity now normalizes over enabled input families (was capped at 0.75 with sticks off).
+- `triggers.py` — `TriggerPolicy` decides when frames are worth emitting, via four independent reasons (see below).
 - `evdev_raw.py` — raw `/dev/input/event` reading and parsing.
 - `gst_util.py` — GStreamer utility.
-- `portal.py` — xdg-desktop-portal ScreenCast session management. Holds D-Bus connection deliberately; dropping it closes the portal session.
+- `portal.py` — xdg-desktop-portal ScreenCast session management. Holds the D-Bus connection deliberately; dropping it closes the portal session.
 
 **Event types:**
 - `gamepad.activity` — button presses, holds, trigger analog values, stick motion, intensity score, summaries.
-- `speech.segment` — VAD-gated speech as PCM blob, duration, sample rate, encoding.
+- `speech.segment` — VAD-gated speech as a PCM blob, duration, sample rate, encoding.
 - `screen.frame` — JPEG blob, dimensions, trigger reason, scene score.
 
 **Key design patterns:**
-- Summaries are **edge-triggered** — "holding RT" fires once when it starts, once when it ends. Windows in between say nothing.
-- `holding` field carries state on *any* emitted event, so readers always know what's down without repetition.
-- Everything is **discovered, not named** — gamepad capability probes, PipeWire auto-routes, screen geometry from portal.
-- Sticks are **silent by default** (`sticks_mode=off`) — moving the stick never triggers frames.
-- Frame **triggers throttle, not debounce** — first frame of a burst is informative; later ones are noise.
+- Summaries are edge-triggered — "holding RT" fires once when it starts, once when it ends. Windows in between say nothing.
+- The `holding` field carries state on any emitted event, so readers always know what's down without repetition.
+- Everything is discovered, not named — gamepad capability probes, PipeWire auto-routes, screen geometry from the portal.
+- Sticks are silent by default (`sticks_mode=off`) — moving the stick never triggers frames.
+- Frame triggers throttle, not debounce — the first frame of a burst is informative; later ones are noise.
 
 ### Component B: Agent (`src/gpagent/agent/`)
 
-**Purpose:** Consume the event stream, decide when to speak, and call gpt-realtime-2.1.
+Consumes the event stream, decides when to speak, and calls gpt-realtime-2.1.
 
 - `session.py` — main event loop. Holds `AsyncRealtimeConnection` and drives the API. Accumulates gamepad summaries and chooses at most one frame per response. Implements barge-in (cancel response, truncate audio) on player speech. Listens for `response.done`, computes cost and usage.
-- `policy.py` — `SpeakPolicy` pure logic (mirrors `TriggerPolicy`). Three reasons to speak:
-  - `reply` — player asked something (global cap + `reply_min_gap_s` between responses, exempt from quiet floor)
-  - `react` — scene change or input burst (quiet floor + `event_cooldown_s` + backoff)
-  - `ambient` — been quiet a while (quiet floor + `ambient_after_s` + backoff)
-  - **A global cap** (`max_per_min`) binds *all* reasons.
-  - **A quiet floor** (`min_gap_s`) binds `react` and `ambient` only.
-  - Cooldowns adapt: `backoff_factor` on ignored remarks, `engagement_boost` (<1) on player engagement.
-  - Bursty input cannot become bursty speech: `reply` has `reply_min_gap_s` spacing measured from response end.
+- `policy.py` — `SpeakPolicy` pure logic (mirrors `TriggerPolicy`), via three independent reasons to speak (see below).
 - `transport.py` — handles Realtime API message formatting, payload transform validation.
-- `playback.py` — audio output via GStreamer. Appsrc pipeline with 20 ms priming silence (needed for preroll). Buffers need explicit timestamps. Uses `autoaudiosink` (selects `pulsesink`, not `pipewiresink`). Output goes to **default sink** because Component A's AEC uses it as reference.
+- `playback.py` — audio output via GStreamer. Appsrc pipeline with priming silence for preroll; buffers need explicit timestamps. Uses `autoaudiosink` (selects `pulsesink`, not `pipewiresink`). Output goes to the default sink because Component A's AEC uses it as reference.
 - `context.py` — conversation context held by the session.
 - `persona.py` — agent personality and instructions.
 - `env.py` — environment utilities (API key loading as `Secret` to prevent accidental logging).
@@ -76,26 +64,25 @@ The split exists because **raw media to realtime API costs more than the game**.
 
 **Key design patterns:**
 - Speaking policy is decision-making, not the prompt. The model is only asked when a moment is already judged worth speaking at.
-- **Gamepad and frames are accumulated and flushed at speak time**, not streamed. 91 windows = 91 turns = 91 bills.
-- At most **one high-detail frame per response, and only if newer than last-sent**. Capture and send rates are decoupled.
-- Behind it rides a **trail**: `agent.image_trail` (4) earlier frames at `"low"` detail, oldest first, so the model sees the trajectory and not just the destination. Trail frames are picked by **spread first, value second** — the candidate window is split into N equal time buckets and each contributes at most one frame, chosen by `scene_score`. Taking the N newest instead describes the last two seconds N times, because capture triggers throttle rather than debounce. `image_trail_min_gap_s` (1.5) holds a floor between sent images at both ends, because bucketing spreads picks across whatever window it is handed without asking whether the window is worth spreading — a short window yields a short trail, not a redundant one. It sits below capture's `triggers.min_interval_s` (2.0) and so is inert at default settings; it exists so the agent does not lean on a capture-side knob for its own correctness. Candidates are **only the gap**: frames newer than the last one sent and older than the current one. "Not sent yet" is not enough — a frame from between two images already in the conversation is nearly newsless, costs a slot that could cover unseen ground, and lands in history older than an image already there.
-- `response.create.instructions` **replaces** (not adds to) session instructions, so it is not used at all. The persona is sent once in `session.update`; the per-turn reason goes in as a system message item (`persona.reason_note`).
-- `response.cancel` on `speech.start` (VAD fires before segment exists). Truncate audio to milliseconds actually heard so model's idea matches player experience.
-- **Barge-in gates:** "player is talking" and "response in flight" are absolute. Both gates timeout to prevent permanent silence.
+- Gamepad and frames are accumulated and flushed at speak time, not streamed, to bound turns/bills to responses rather than windows.
+- At most one high-detail frame per response, and only if newer than the last one sent. Capture and send rates are decoupled.
+- Behind it rides a trail: `agent.image_trail` earlier frames at `"low"` detail, oldest first, so the model sees the trajectory and not just the destination. Trail frames are picked by spread first, value second — the candidate window is split into N equal time buckets and each contributes at most one frame, chosen by `scene_score`. `image_trail_min_gap_s` holds a floor between sent images at both ends. Candidates are only the gap: frames newer than the last one sent and older than the current one.
+- `response.create.instructions` replaces (not adds to) session instructions. The persona is sent once in `session.update`; the per-turn reason goes in as a system message item (`persona.reason_note`), keeping the request prefix stable for prompt caching.
+- `response.cancel` fires on `speech.start` (VAD fires before the segment event exists). Audio is truncated to milliseconds actually heard so the model's idea matches player experience.
+- Barge-in gates ("player is talking", "response in flight") are absolute and both timeout to prevent permanent silence.
 - `AsyncRealtimeConnection.send()` silently drops unknown keys via SDK transform validation. Every payload is asserted to survive the transform.
 
-### Bus & Events (`src/gpagent/bus.py`, `src/gpagent/events.py`)
+### Bus, Events & Cost (`src/gpagent/bus.py`, `events.py`, `tokens.py`)
 
 - `bus.py` — pub/sub event bus. Sources push events (`CaptureSource` interface), sinks consume them.
 - `events.py` — event dataclass definitions (all events carry `t`, `seq`, `type`).
+- `tokens.py` — token/cost estimation shared by both halves: `Estimate` is Component A's forward-looking guess from a capture, `UsageMeter` is Component B's record of what the API actually billed (folded from `response.done`). Used by `inspect --cost`.
 
 ### Replay (`src/gpagent/replay.py`)
 
 - `ReplaySource` — reads `events.jsonl` and re-emits with original timing (or deterministic if `--replay-speed 0`). Reconstructs signals that don't appear in the file (`gamepad.intensity`, `speech.start`). Same protocol as live sources.
-- **Two drivers:**
-  - `drive_from_bus` — wall-clock replay
-  - `drive_from_session` — reads file, passes `now=event.t`, fully deterministic (no sleeping)
-- **A `commentate` recording holds the agent's own speech too, and `build_cues` drops it.** That is output, not capture. `handle()` records every event it is given, so replaying those fed the new agent the old one's lines and wrote a session holding two interleaved conversations — a before/after comparison read 45 responses for a 22-response run before this was caught. Both drivers go through `build_cues`, so the filter covers them.
+- Two drivers: `drive_from_bus` (wall-clock replay) and `drive_from_session` (reads file, passes `now=event.t`, fully deterministic — no sleeping).
+- A `commentate` recording holds the agent's own speech too; `build_cues` drops it, since that's output, not capture. Both drivers go through `build_cues`.
 
 ### CLI (`src/gpagent/cli.py`)
 
@@ -103,7 +90,7 @@ Commands:
 - `devices` — what was detected, usability
 - `monitor` — live per-button view, check mapping, detect drift
 - `record` — capture a session
-- `inspect` — timeline, stats, estimated cost, WAV export, contact sheets. `--contact-sheet` montages everything *captured*; `--sent-sheet` montages only what the agent *sent*, one row per turn, each image labelled with its `seq` and detail (green border = the high-detail current frame, grey = trail). It reads the `frames` field of the agent log's `ask` lines, so `--agent-log` points it at a run whose blobs live elsewhere (a `--no-media` replay).
+- `inspect` — timeline, stats, estimated cost, WAV export, contact sheets. `--contact-sheet` montages everything captured; `--sent-sheet` montages only what the agent sent, one row per turn, each image labelled with its `seq` and detail (green border = high-detail current frame, grey = trail). Reads the `frames` field of the agent log's `ask` lines, so `--agent-log` points it at a run whose blobs live elsewhere.
 - `replay` — re-emit with original timing
 - `commentate` — run agent over captured or live events
 
@@ -111,122 +98,57 @@ Config via `--set key=value` (runtime) or TOML files (persistent).
 
 ### Configuration
 
-- `src/gpagent/config.py` — capture config loading from `gpagent.toml` or `gpagent.example.toml`
-- `src/gpagent/agent/config.py` — agent config
-- Global defaults in code, overrideable via:
-  - Command-line `--set` flags
-  - TOML files in `~/.config/gpagent/`
-  - Environment variables (API key)
+- `src/gpagent/config.py` (capture) and `src/gpagent/agent/config.py` (agent) hold defaults in code. TOML sections `[gamepad] [audio] [screen] [triggers]` are Component A; `[agent] [speak]` are Component B. Per-device gamepad overrides go under `[gamepad.device_button_map."<vid:pid>"]`.
+- Loaded from `gpagent.toml` or `~/.config/gpagent/`, overridable ad hoc with `--set section.key=value`. `gpagent.example.toml` is the canonical annotated reference — every value in it is the current default, so defaults aren't duplicated here.
 
 ### Sinks & Output
 
 - `src/gpagent/sinks/` — output writers (session directory, manifest, cost estimation)
 
-## Important Gotchas for Agents
-
-### Component A Gotchas
-
-1. **Portal session lifecycle:** `ScreenCastSession` holds D-Bus connection deliberately. Dropping it closes the portal session. `pipewiresrc` fails with "target not found" if this happens.
-2. **Silero VAD context:** The input tensor is **576 wide**, not 512. Bare 512 returns ~0 for everything because ONNX accepts any shape and the graph has no context. Tests pin both the tensor width and a positive detection.
-3. **Frame rate capping:** Cap it at the compositor, with a `video/x-raw,max-framerate=N/1` capsfilter directly on `pipewiresrc`. Mutter honours it and stops rendering frames we would only drop; dropping downstream is too late, because the readback of each 14.7 MB frame has already been paid. Measured on gnome-shell 50.1 under constant damage: capture cost 20% of a core unthrottled, ~0 at 2 fps. `framerate=N/1` is rejected here ("no more input formats") — the stream is variable-rate (`framerate=0/1`), so only `max-framerate` negotiates. The downstream `videorate ! video/x-raw,framerate=N/1` stays as the floor for a compositor that ignores it; `videorate`'s own `max-rate` property is not that floor (it measured 21 fps against a requested 2).
-4. **Scene score bug (fixed):** Was comparing to last-sent frame, so the longer capture-suppression windows let the screen drift and any threshold cleared after enough time. Now compares sample-to-sample, fires on real transitions, and `dedup` (last-sent comparison) is a separate step.
-5. **Gamepad intensity normalization (fixed):** Was weighted as buttons 0.45, triggers 0.30, sticks 0.35, but sticks default to `off` (silently zeroed that weight). Renormalized over actually-enabled families, so the scalar means the same thing regardless of `sticks_mode`.
-6. **WebRTC DSP on double-talk:** `echo-suppression-level=high` suppresses the *player* during double-talk. Talking over game audio is double-talk by definition. Default is `moderate`.
-7. **GStreamer device dedup:** `DeviceMonitor` reports each device 2–3× and a sink shares `node.name` with its monitor. Dedup on `(media.class, node.name)`.
-8. **AEC reference:** Must be the *whole* system output (default sink monitor), not just agent output. Game audio comes through speakers into mic; without system-wide AEC it reads as speech.
-
-### Component B Gotchas
-
-1. **Session audio format:** `session.audio.output.format` requires `rate` even though TypedDict marks it optional and docs omit it. Server rejects without it.
-2. **Instructions replace, not add — so don't send them per response.** `response.create.instructions` **replaces** session instructions. Sending the reason line alone threw the persona away on every turn (first live test answered a swearing player with encouraging life coaching). Dragging the persona along per turn fixed that but cost more: ~265 tokens that change every turn sat where they key the prompt cache, so a turn whose reason differed from the previous turn could not reuse the previous turn's prefix and fell back to the last turn with a matching reason. Measured on sess7: **533 uncached tokens on a median same-reason turn vs 1495 when the reason changed** (~$0.28 of a $1.62 session, mostly re-billed screenshots). Now the persona lives only in `session.update` and the reason rides as a tail system message item, leaving the prefix byte-identical to the previous request. The item persists in history unlike per-response instructions, so a long session accumulates one stale nudge per turn — ~15 tokens each, inside the cached prefix; deleting them per turn would invalidate the prefix this exists to preserve.
-3. **SDK payload transform silently drops keys:** `AsyncRealtimeConnection.send()` silently drops keys the installed SDK doesn't know about. Every payload is asserted to survive the transform intact. An SDK upgrade eating a field (e.g., `turn_detection: null` handing turn-taking back to server) will fail a test.
-4. **Appsrc preroll deadlock:** Appsrc cannot preroll before it has data. Unprimed, state change blocks forever and clock never starts. 20 ms of priming silence fixes all three.
-5. **Timestamps on time-format appsrc:** Buffers need explicit timestamps. Unstamped, sink renders them back-to-back against startup clock — 3 s of audio in 7 ms. `do-timestamp=true` doesn't fix it; it stamps on arrival, compressing the download window.
-6. **Base64 chunk alignment:** `response.output_audio.delta` chunks are base64 of arbitrary byte count. Odd-length pushed as-is shifts all following samples by a byte, rest is white noise.
-7. **Audio sink selection:** Output to default sink (component A's AEC reference). Target a specific device and agent hears itself, replies to itself. Use `autoaudiosink`, which selects `pulsesink` and re-routes with WirePlumber. Do NOT use `pipewiresink` (rank 0, plain GstBaseSink, garbled speech here even with identical buffers).
-8. **Clock mismatch:** Player timestamps (`event.t` from capture) and agent clock (`time.monotonic()`) are different. Mixing them makes frames look hours stale and agent silently blind. The offset between them (`_t_offset`) is estimated as the **smallest** `now - event.t` ever seen, not the first: the first event comes out of a backlog built up while `start()` opened the realtime session, and calibrating on it recorded every response 3.5 s early in a real 39-minute session.
-9. **Response lifecycle timeouts:** "Player is talking" and "response in flight" are absolute gates. A stuck gate is permanent silence (quietest possible bug). Both timeout (`speech_start_timeout_s`, `response_timeout_s`).
-10. **Sessions expire at 60 minutes.** The server closes with "Your session hit the maximum duration of 60 minutes", the event stream ends, and without a reconnect loop the agent is mute for the rest of the run (sess7 lost its last 82 s). `_pump_events` reopens with backoff and reseeds instructions only; history does not come back, and item ids from the dead session must be dropped or every `truncate`/`delete` errors.
-11. **Barge-in only if audible.** Cancel on `speech.start` *only when audio has already reached the player*. A response that has not made a sound is not talking over anyone, and killing it burns a paid turn and leaves the question unanswered — a player talking in short bursts cancelled four consecutive replies at 0.0 s in sess7.
-12. **TPM is a real ceiling on long sessions.** The API re-bills the whole conversation each turn, so input per request grows with session length (~10.5 k tokens by minute 60). At a 40 k TPM org limit that is ~4 requests/min, below `speak.max_per_min = 6`; sess7 lost two responses to `rate_limit`. Non-completed `response.done` statuses are logged as `note` lines — this is how you see it.
-13. **The playback clock has to be cleared between turns, offline.** `_finish_response` completes the utterance and then, for a non-realtime player (`--no-playback`, dry runs), calls `player.simulate()` to re-arm the timer so the agent can still tell it is mid-sentence when the player interrupts. Nothing cleared that before the next response, so the next utterance's audio accumulated on top and a barge-in truncated with a `heard_ms` spanning two utterances against only the latest item id — the server answers "Audio content of 7650ms is already shorter than 12970ms" and the truncate is lost, so the model keeps believing it said the whole thing. `_speak` now calls `player.discard()`. Real playback never hit this (`simulate` is only called when `realtime` is False), which is why it survived three live sessions and only showed up in a replay.
-
-## Cost Model
-
-From `gpagent.toml` and observed on real sessions:
-
-- **Input audio:** $32/1M tokens, ~1 token per 100 ms → $0.019/min open mic. Gated by VAD.
-- **Input image:** $5/1M tokens, ~765 tokens per 1024×576 frame at high detail, ~85 at low detail. At most one per response.
-- **Input text:** $4/1M tokens (gamepad summaries, negligible).
-- **Input cached:** ~10× cheaper than fresh (prompt-caching).
-- **Output audio:** ~$2 per minute of speaking. **Largest single cost line.** Controlled entirely by speaking policy.
-
-**Frame policy is less valuable than in capture.** Component A's most expensive tuning lever. Component B sends at most one high-detail frame per response, so capture rate and send rate decouple. Capture 100, send 14.
-
-**The trail is sized against TPM, not price.** `image_trail = 4` costs 85 tokens per frame fresh (sess7: 258 trail frames, +$0.11 on a $0.53 replay) and most re-bills land in the cached tier, so the money barely moves. What binds is that cached tokens still count against the rate limit and a trail *stays in history*: 4 frames/turn adds ~20 k tokens/request by turn 60 on top of the ~10.5 k baseline, which is the gotcha-12 `rate_limit` failure made routine. Retiring a spent trail (its value expires the moment a newer one exists, and deleting at the *tail* costs far less cache than the old-item pruning that lost) would flatten that — not implemented yet, and the reason the default stays single digits.
-
-**Context trimming is counterintuitive:** Deleting old items invalidates prompt-cache prefix. Cached input is 10× cheaper; fewer tokens can mean more money. Client-side trimming defaults off; server's `truncation.retention_ratio` is the right mechanism (drops in amortized batches to keep cache prefix intact).
-
-## Testing Strategy
-
-- `tests/` — 250+ tests, no hardware, no network, ~1 s.
-- Synthetic capability bitmaps for device classification.
-- Synthetic `input_event` structs for discretizer.
-- Scripted probabilities for segmenter.
-- Virtual clock for trigger and speak policies.
-- `pytest -m hardware` — 8 more tests against real devices (optional).
-- `pytest -m network` — 2 more tests against real API (spends money, finds SDK payload bugs the mocked tests can't).
-
-**Avoid negative tests:** A VAD that returns zero for everything passes "never says nothing is speech" perfectly. Assert positive behavior first. Test that `SpeakPolicy` never speaks also passes "respects cooldown", "obeys rate cap" perfectly.
-
 ## Key Concepts
-
-### Discretization
-
-Only send the moments that carry information. VAD gates speech. Trigger policy gates frames. Gamepad events emit only on state changes (edge-triggered). Eliminates streaming raw media.
 
 ### Trigger Policy (Capture)
 
 Four independent reasons to emit a frame, each with its own floor and cooldown:
-- `gamepad` — activity intensity crosses threshold
-- `scene` — screen changed (sample-to-sample, not accumulated drift)
+- `gamepad` — activity intensity crosses threshold, normalized over enabled input families
+- `scene` — screen changed (sample-to-sample comparison, not accumulated drift)
 - `heartbeat` — timeout floor (metronome, keeps agent fresh)
 - `dedup` — model already saw this (last-sent comparison)
 
-Each reason can fire independently; a global cap binds all four together so one hyperactive trigger doesn't starve the others.
+A global cap binds all four together so one hyperactive trigger doesn't starve the others.
 
 ### Speak Policy (Agent)
 
 Three independent reasons to say something, each with floor and cooldown:
-- `reply` — player said something (exempt from quiet floor, has `reply_min_gap_s` spacing)
-- `react` — scene or input burst (needs `burst_windows` hot windows, then quiet floor + cooldown + backoff)
-- `ambient` — been quiet (needs `ambient_after_s` quiet + cooldown + backoff)
+- `reply` — player said something (exempt from the quiet floor, has `reply_min_gap_s` spacing measured from response end)
+- `react` — scene or input burst (needs `burst_windows` hot windows, then quiet floor + `event_cooldown_s` + backoff)
+- `ambient` — been quiet a while (needs `ambient_after_s` quiet + cooldown + backoff)
 
-Global cap (`max_per_min`) over all three. Cooldowns adapt on engagement (backoff on silence, reset on player talk).
+A global cap (`max_per_min`) binds all three; a quiet floor (`min_gap_s`) binds `react` and `ambient` only. Cooldowns adapt: `backoff_factor` on ignored remarks, `engagement_boost` (<1) on player engagement.
 
 ### Barge-In
 
-Player cuts off agent mid-sentence:
-- `speech.start` fires at VAD detection (before segment event).
-- Agent sends `response.cancel`, truncating audio to seconds heard.
-- `conversation.item.truncate` with milliseconds heard so model's idea matches reality.
-- Audio after cancel is dropped, not played.
+Player cuts off the agent mid-sentence:
+1. `speech.start` fires at VAD detection (before the segment event).
+2. Agent sends `response.cancel`.
+3. `conversation.item.truncate` with milliseconds heard so the model's idea matches reality.
+4. Audio after cancel is dropped, not played.
 
-## Running Tests
+## Cost Model
+
+Output audio (speaking) is the dominant cost line and is controlled entirely by the speak policy's rate cap. Input images are the next lever: cost is per-frame, not per-pixel-stream, because Component B sends at most one high-detail frame per response regardless of how many Component A captured — capture rate and send rate are fully decoupled. Cached input tokens are far cheaper than fresh ones (prompt caching), which is why context is never trimmed client-side: deleting old items invalidates the cache prefix ahead of them, so trimming can raise cost even though it shrinks the conversation. The server's `truncation.retention_ratio` is the sanctioned mechanism — it drops in amortized batches that don't disturb the prefix. Exact per-token rates live in `tokens.py::MODEL_RATES`, not here.
+
+## Testing Strategy
+
+Default `pytest` run needs no hardware and no network (device capability bitmaps, `input_event` structs, VAD probabilities, and trigger/speak-policy clocks are all synthetic/virtual). Two marked tiers opt into real resources:
 
 ```bash
-pytest                    # 250 tests, no hardware
-pytest -m hardware        # + 8 hardware tests
-pytest -m network         # + 2 API tests (spends money)
-pytest tests/test_speak_policy.py::test_rate_cap_holds_globally
+pytest               # default: no hardware, no network
+pytest -m hardware   # + real input devices
+pytest -m network    # + real API calls — spends money, catches SDK payload bugs mocked tests can't
 ```
 
-Specific test files:
-- `test_speak_policy.py` — asserts combined rate of all three reasons
-- `test_triggers.py` — frame policy logic
-- `test_gamepad_discretizer.py` — input mapping and summaries
-- `test_segmenter.py` — VAD context
-- `test_replay_source.py` — replay signal reconstruction
+Avoid negative tests: assert positive behavior first. A policy that never speaks trivially passes "respects cooldown" and "obeys rate cap".
 
 ## Linting & Type Checking
 
@@ -240,51 +162,36 @@ uv run mypy           # type check (src + tests)
 Both must be clean before committing. Notes on the current config:
 
 - `SIM115` (bare `open()` outside a `with`) is disabled repo-wide: several long-lived handles (`JsonlSink._events`, `OpenAITransport`'s log file, GStreamer pipeline handles) are opened in a `start()`/`open()` method and closed in a paired `close()`, which isn't expressible as a single `with` block.
-- GStreamer/GObject-introspection handles (`gi.repository.Gst` objects — pipelines, elements, buffers) are untyped at the source, so attributes that hold them are explicitly annotated `Any` rather than left to infer as `None` from their `__init__` default. Real `openai` SDK types (`AsyncOpenAI`, `AsyncRealtimeConnection`) are used instead of `Any` wherever the SDK actually exports them.
-- `OpenAITransport.send()` casts its payload to `Any` at the SDK boundary on purpose — the whole point of that layer (see its docstring) is speaking in plain dicts validated at runtime by the SDK's own transform, not by mypy.
-
-## Configuration Files
-
-Example config layout:
-
-```toml
-[gamepad]
-sticks_mode = "off"           # or "intensity", "full"
-button_map = { BTN_NORTH = "X" }  # override spec
-
-[gamepad.device_button_map."2dc8:200f"]
-BTN_NORTH = "X"               # per-device overrides
-
-[audio]
-vad_backend = "silero"        # or "webrtc"
-echo_cancel = true
-echo_suppression_level = "moderate"
-
-[screen]
-long_edge = 1280              # max dimension
-detail = "high"               # or "low" for API
-
-[capture.triggers]
-gamepad_threshold = 0.35
-scene_threshold = 0.06
-heartbeat_s = 3.0
-min_interval_s = 2.0
-
-[agent]
-reply_min_gap_s = 3.0         # space out consecutive replies
-max_per_min = 8               # global rate cap
-```
+- GStreamer/GObject-introspection handles (`gi.repository.Gst` objects) are untyped at the source, so attributes that hold them are explicitly annotated `Any` rather than left to infer as `None`. Real `openai` SDK types (`AsyncOpenAI`, `AsyncRealtimeConnection`) are used instead of `Any` wherever the SDK actually exports them.
+- `OpenAITransport.send()` casts its payload to `Any` at the SDK boundary on purpose — that layer speaks in plain dicts validated at runtime by the SDK's own transform, not by mypy.
 
 ## Common Workflows for Agents
 
-**Adding a new input type:** Implement `CaptureSource`, emit events to bus. Follow discretization pattern (edge-trigger, accumulate state in `holding` field).
+**Adding a new input type:** Implement `CaptureSource`, emit events to the bus. Follow the discretization pattern (edge-trigger, accumulate state in `holding` field).
 
 **Tuning speak timing:** Adjust `SpeakPolicy` parameters. Test with `--replay-speed 0 --dry-run` for deterministic offline runs.
 
-**Debugging cost:** Check `inspect --cost` estimates vs. actual API usage in `manifest.json`. Cost meter in `session.py::usage_for_response()`. Per-response `usage` (and with it the cached-token split) lives on the `agent.response` events in `events.jsonl`, not in `agent.jsonl` — that file is the console story only. `-o DIR --no-media` writes the event stream without the payloads, which is the shape you want when re-running a recording to measure a change rather than to listen to it.
+**Debugging cost:** Check `inspect --cost` estimates vs. actual API usage in `manifest.json`. Cost meter in `session.py::usage_for_response()`. Per-response `usage` (and the cached-token split) lives on `agent.response` events in `events.jsonl`, not `agent.jsonl` (console story only). `-o DIR --no-media` writes the event stream without payloads — the shape to use when re-running a recording to measure a change rather than to listen to it.
 
 **Finding frame stale:** `commentate` reports frame age at send time. Older frames mean `triggers.min_interval_s` is too high.
 
-**Seeing what the model actually looked at:** `ask` lines in `agent.jsonl` carry `sent` (the console story: `frame 1024x576 high (0.8s old)`, `trail 2 low (back to 6.3s)`) and `frames` (the identities: `{"current": 3870, "detail": "high", "trail": [3809, 3837, ...], "trail_detail": "low"}`). `gpagent inspect DIR --sent-sheet [--agent-log RUN/agent.jsonl]` turns the second into one labelled row of images per turn. Use it to check that a trail spans the window instead of clustering — that is the failure mode of the selector, and it is invisible in the token counts.
+**Seeing what the model actually looked at:** `ask` lines in `agent.jsonl` carry `sent` (console story: `frame 1024x576 high (0.8s old)`, `trail 2 low (back to 6.3s)`) and `frames` (identities: `{"current": 3870, "detail": "high", "trail": [3809, 3837, ...], "trail_detail": "low"}`). `gpagent inspect DIR --sent-sheet [--agent-log RUN/agent.jsonl]` turns the second into one labelled row of images per turn — use it to check that a trail spans the window instead of clustering.
 
 **Portal issues:** `manifest.json::devices.screen` carries portal diagnostics (handshake time, stalls, portal errors).
+
+## Known Gotchas
+
+**Capture:**
+- Cap frame rate at the compositor with a `video/x-raw,max-framerate=N/1` capsfilter directly on `pipewiresrc`; dropping downstream is too late since the readback cost is already paid. `framerate=N/1` is rejected (the stream is variable-rate); only `max-framerate` negotiates. Keep `videorate ! video/x-raw,framerate=N/1` downstream as a floor for compositors that ignore `max-framerate`.
+- `echo-suppression-level=high` suppresses the player during double-talk (talking over game audio is double-talk by definition); default is `moderate`.
+- `DeviceMonitor` reports each device 2–3×, and a sink shares `node.name` with its monitor — dedup on `(media.class, node.name)`.
+- AEC reference must be the whole system output (default sink monitor), not just agent output, or game audio through speakers into the mic reads as speech.
+
+**Agent:**
+- `session.audio.output.format` requires `rate` even though the TypedDict marks it optional and docs omit it.
+- Base64 audio delta chunks are arbitrary byte counts; odd-length chunks pushed as-is shift all following samples by a byte.
+- The offset between player clock (`event.t`) and agent clock (`time.monotonic()`) is estimated as the smallest `now - event.t` ever seen, not the first (the first event can come out of a startup backlog).
+- Realtime sessions expire at 60 minutes; `_pump_events` reconnects with backoff and reseeds instructions only — history does not come back, and item ids from the dead session must be dropped before any `truncate`/`delete`.
+- TPM is a real ceiling on long sessions: the API re-bills the whole conversation each turn, so input tokens grow with session length. Non-completed `response.done` statuses are logged as `note` lines.
+- Barge-in should only cancel a response once its audio has actually reached the player — a response that hasn't made a sound isn't talking over anyone.
+- The playback clock must be cleared between turns for non-realtime players (`player.discard()` before the next response), or the next utterance's audio accumulates on top of the previous one.
