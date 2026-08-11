@@ -156,7 +156,7 @@ class TestTheTurnItSends:
         -- images in one item carry no timestamps and no stated direction.
         """
         agent.cfg.image_trail = 2
-        for i, t in enumerate([100.0, 101.0, 108.0, 109.0]):
+        for i, t in enumerate([100.0, 103.0, 106.0, 109.0]):
             await agent.handle(frame(seq=i, data=JPEG + bytes([i])), now=t)
         await agent.handle(speech(), now=110.0)
 
@@ -186,7 +186,7 @@ class TestTheTurnItSends:
         lines = []
         agent._on_line = lines.append
         agent.cfg.image_trail = 2
-        for i, t in enumerate([100.0, 101.0, 108.0, 109.0]):
+        for i, t in enumerate([100.0, 103.0, 106.0, 109.0]):
             await agent.handle(frame(seq=i), now=t)
         await agent.handle(speech(), now=110.0)
 

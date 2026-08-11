@@ -75,6 +75,15 @@ class AgentConfig:
     image_trail: int = 4
     #: detail for the trail frames -- "low" is the point of the feature
     image_trail_detail: ImageDetail = "low"
+    #: Minimum spacing between images sent in one turn, trail and current alike.
+    #: Bucketing spreads the picks across the candidate window but never asks
+    #: whether that window is worth spreading: back-to-back replies can leave a
+    #: two-second gap, and four frames of the same two seconds is four copies of
+    #: one moment at 85 tokens each. Below capture's own `triggers.min_interval_s`
+    #: (2.0), so it changes nothing at default settings -- it exists so the agent
+    #: does not depend on a capture-side knob for its own correctness. The trail
+    #: shrinks rather than clusters: a 3 s window sends one frame, not four.
+    image_trail_min_gap_s: float = 1.5
     #: trail frames older than this are dropped. Looser than `max_image_age_s`
     #: on purpose: a stale frame is a bad answer to "what is on screen now" but
     #: a fine answer to "how did we get here".

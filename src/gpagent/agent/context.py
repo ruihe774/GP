@@ -191,23 +191,40 @@ class ContextBuffer:
         it would also drop an image into history older than one already there,
         against the order the accompanying note promises. The unseen trajectory
         is exactly `(last frame sent, current frame)`, and that is the window.
+
+        **Spread is not assumed, it is enforced.** Buckets spread the picks
+        across whatever window they are given without ever asking whether that
+        window is long enough to be worth spreading: two replies six seconds
+        apart leave a short one, and four frames of the same three seconds is
+        one moment sent four times. `image_trail_min_gap_s` holds the floor at
+        both ends -- candidates within it of the current frame never compete for
+        a slot, and adjacent picks closer than it are thinned. A short window
+        yields a short trail rather than a redundant one.
         """
         n = self.cfg.image_trail
         if n <= 0:
             return []
 
+        gap = self.cfg.image_trail_min_gap_s
         cutoff = max(now - self.cfg.image_trail_max_age_s, self._sent_through_t)
         cands = sorted(
-            (f for f in self._history if f.data and cutoff < f.t < current.t),
+            (
+                f
+                for f in self._history
+                # The upper bound is two rules, not one: strictly older than the
+                # current frame (so it cannot pick the current frame itself when
+                # the floor is disabled), and far enough back to not duplicate it.
+                if f.data and cutoff < f.t < current.t and f.t <= current.t - gap
+            ),
             key=lambda f: f.t,
         )
         if len(cands) <= n:
-            return cands
+            return self._thin(cands, gap)
 
         span = current.t - cands[0].t
         if span <= 0:  # every candidate shares a timestamp; value is all there is
             best = sorted(cands, key=lambda f: (f.scene_score, f.t))[-n:]
-            return sorted(best, key=lambda f: f.t)
+            return self._thin(sorted(best, key=lambda f: f.t), gap)
 
         buckets: dict[int, Frame] = {}
         for f in cands:
@@ -216,17 +233,35 @@ class ContextBuffer:
             if held is None or (f.scene_score, f.t) > (held.scene_score, held.t):
                 buckets[i] = f
 
-        chosen = list(buckets.values())
+        chosen = self._thin(sorted(buckets.values(), key=lambda f: f.t), gap)
+
+        # Backfill is where the floor bites: an empty bucket hands its slot to
+        # the best leftover *anywhere* in the window, which is often the frame
+        # next door to one already picked. Spares are tested against everything
+        # kept rather than thinned afterwards, so a backfilled neighbour can
+        # never displace the bucket winner it sits beside.
         if len(chosen) < n:
             taken = {f.seq for f in chosen}
-            spare = sorted(
-                (f for f in cands if f.seq not in taken),
-                key=lambda f: (f.scene_score, f.t),
-                reverse=True,
-            )
-            chosen += spare[: n - len(chosen)]
-        chosen.sort(key=lambda f: f.t)
+            for f in sorted(cands, key=lambda f: (f.scene_score, f.t), reverse=True):
+                if len(chosen) >= n:
+                    break
+                if f.seq in taken or not all(abs(f.t - k.t) >= gap for k in chosen):
+                    continue
+                chosen.append(f)
+                taken.add(f.seq)
+                chosen.sort(key=lambda f: f.t)
         return chosen
+
+    @staticmethod
+    def _thin(frames: list[Frame], gap: float) -> list[Frame]:
+        """Drop picks that land within `gap` of the one before them."""
+        if gap <= 0:
+            return frames
+        kept: list[Frame] = []
+        for f in frames:
+            if not kept or f.t - kept[-1].t >= gap:
+                kept.append(f)
+        return kept
 
     def _render(self) -> tuple[str | None, int]:
         if not self._summaries:

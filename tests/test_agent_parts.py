@@ -78,10 +78,10 @@ class TestContextBuffer:
     def test_earlier_frames_ride_along_as_a_trail(self):
         buf = ContextBuffer(AgentConfig(image_trail=4))
         for i in range(3):
-            buf.add_frame(frame(seq=i, t=float(i)))
-        ctx = buf.take(3.0)
-        assert ctx.frame.t == 2.0, "the current screen is still the newest frame"
-        assert trail_times(ctx) == [0.0, 1.0], "and the trail is older, oldest first"
+            buf.add_frame(frame(seq=i, t=2.0 * i))
+        ctx = buf.take(4.0)
+        assert ctx.frame.t == 4.0, "the current screen is still the newest frame"
+        assert trail_times(ctx) == [0.0, 2.0], "and the trail is older, oldest first"
         assert buf.trail_sent == 2
 
     def test_the_trail_spans_the_window_instead_of_the_last_moment(self):
@@ -93,29 +93,29 @@ class TestContextBuffer:
         from, which is the whole point of sending more than one.
         """
         buf = ContextBuffer(AgentConfig(image_trail=2))
-        for i, t in enumerate([0.0, 1.0, 8.0, 9.0]):
+        for i, t in enumerate([0.0, 2.0, 6.0, 8.0]):
             buf.add_frame(frame(seq=i, t=t))
         buf.add_frame(frame(seq=9, t=10.0))
-        assert trail_times(buf.take(10.0)) == [1.0, 9.0]
+        assert trail_times(buf.take(10.0)) == [2.0, 8.0], "not [6.0, 8.0], the newest two"
 
     def test_the_frame_that_changed_the_screen_wins_its_slot(self):
         buf = ContextBuffer(AgentConfig(image_trail=2))
         buf.add_frame(frame(seq=0, t=0.0, score=0.9))
-        buf.add_frame(frame(seq=1, t=1.0, score=0.1))
-        buf.add_frame(frame(seq=2, t=8.0, score=0.1))
-        buf.add_frame(frame(seq=3, t=9.0, score=0.7))
+        buf.add_frame(frame(seq=1, t=2.0, score=0.1))
+        buf.add_frame(frame(seq=2, t=6.0, score=0.1))
+        buf.add_frame(frame(seq=3, t=8.0, score=0.7))
         buf.add_frame(frame(seq=9, t=10.0))
-        assert trail_times(buf.take(10.0)) == [0.0, 9.0]
+        assert trail_times(buf.take(10.0)) == [0.0, 8.0]
 
     def test_a_frame_is_never_paid_for_twice(self):
         buf = ContextBuffer(AgentConfig(image_trail=4))
         buf.add_frame(frame(seq=0, t=0.0))
-        buf.add_frame(frame(seq=1, t=1.0))
-        first = buf.take(2.0)
+        buf.add_frame(frame(seq=1, t=2.0))
+        first = buf.take(3.0)
         assert trail_times(first) == [0.0]
 
-        buf.add_frame(frame(seq=2, t=3.0))
-        second = buf.take(4.0)
+        buf.add_frame(frame(seq=2, t=4.0))
+        second = buf.take(5.0)
         assert second.frame.seq == 2
         assert second.trail == [], "everything older is already in the conversation"
 
@@ -129,29 +129,66 @@ class TestContextBuffer:
         """
         buf = ContextBuffer(AgentConfig(image_trail=1))
         buf.add_frame(frame(seq=0, t=0.0, score=0.9))
-        buf.add_frame(frame(seq=1, t=1.0, score=0.1))
-        buf.add_frame(frame(seq=2, t=2.0))
-        assert trail_times(buf.take(2.0)) == [0.0]
+        buf.add_frame(frame(seq=1, t=2.0, score=0.1))
+        buf.add_frame(frame(seq=2, t=4.0))
+        assert trail_times(buf.take(4.0)) == [0.0]
 
-        buf.add_frame(frame(seq=3, t=3.0, score=0.9))
-        buf.add_frame(frame(seq=4, t=4.0))
-        assert trail_times(buf.take(4.0)) == [3.0], "not t=1.0, which is behind the last send"
+        buf.add_frame(frame(seq=3, t=6.0, score=0.9))
+        buf.add_frame(frame(seq=4, t=8.0))
+        assert trail_times(buf.take(8.0)) == [6.0], "not t=2.0, which is behind the last send"
 
     def test_frames_survive_a_turn_that_sent_no_image(self):
         buf = ContextBuffer(AgentConfig(image_trail=4))
         buf.add_frame(frame(seq=0, t=0.0))
-        buf.add_frame(frame(seq=1, t=1.0))
-        buf.take(2.0, with_image=False)
+        buf.add_frame(frame(seq=1, t=2.0))
+        buf.take(3.0, with_image=False)
 
-        buf.add_frame(frame(seq=2, t=3.0))
-        assert trail_times(buf.take(3.0)) == [0.0, 1.0], "nothing was covered, so nothing expired"
+        buf.add_frame(frame(seq=2, t=4.0))
+        assert trail_times(buf.take(4.0)) == [0.0, 2.0], "nothing was covered, so nothing expired"
+
+    def test_a_short_window_yields_a_short_trail_not_a_redundant_one(self):
+        """Bucketing spreads picks across the window it is handed; it does not
+        ask whether the window is worth spreading. Four frames of the same three
+        seconds is one moment sent four times, at 85 tokens each."""
+        buf = ContextBuffer(AgentConfig(image_trail=4, image_trail_min_gap_s=1.5))
+        for i, t in enumerate([0.0, 0.4, 0.8, 1.2, 1.6, 2.0]):
+            buf.add_frame(frame(seq=i, t=t))
+        buf.add_frame(frame(seq=9, t=2.4))
+        assert trail_times(buf.take(2.4)) == [0.0], "one frame, not four of the same moment"
+
+    def test_a_frame_that_all_but_duplicates_the_current_one_is_not_a_candidate(self):
+        buf = ContextBuffer(AgentConfig(image_trail=4, image_trail_min_gap_s=1.5))
+        buf.add_frame(frame(seq=0, t=0.0))
+        buf.add_frame(frame(seq=1, t=9.9))
+        buf.add_frame(frame(seq=2, t=10.0))
+        assert trail_times(buf.take(10.0)) == [0.0], "t=9.9 is 0.1s before the current frame"
+
+    def test_backfilled_slots_obey_the_spacing_too(self):
+        """The gap the backfill fills is the one it is most likely to violate:
+        an empty bucket hands its slot to the best leftover anywhere, which is
+        often the frame next door to one already picked."""
+        buf = ContextBuffer(AgentConfig(image_trail=4, image_trail_min_gap_s=1.5))
+        buf.cfg.image_trail = 3
+        for i, (t, score) in enumerate([(0.0, 0.5), (7.0, 0.8), (7.2, 0.9), (7.4, 0.1)]):
+            buf.add_frame(frame(seq=i, t=t, score=score))
+        buf.add_frame(frame(seq=9, t=10.0))
+        # The middle bucket is empty, so a slot goes begging; every leftover
+        # that could fill it sits beside the pick that won its own bucket.
+        assert trail_times(buf.take(10.0)) == [0.0, 7.2]
+
+    def test_the_spacing_floor_can_be_turned_off(self):
+        buf = ContextBuffer(AgentConfig(image_trail=2, image_trail_min_gap_s=0.0))
+        buf.add_frame(frame(seq=0, t=0.0))
+        buf.add_frame(frame(seq=1, t=0.1))
+        buf.add_frame(frame(seq=2, t=0.2))
+        assert trail_times(buf.take(0.2)) == [0.0, 0.1]
 
     def test_the_trail_has_its_own_age_horizon(self):
         buf = ContextBuffer(AgentConfig(image_trail=4, image_trail_max_age_s=5.0))
         buf.add_frame(frame(seq=0, t=0.0))
-        buf.add_frame(frame(seq=1, t=9.0))
+        buf.add_frame(frame(seq=1, t=8.0))
         buf.add_frame(frame(seq=2, t=10.0))
-        assert trail_times(buf.take(10.0)) == [9.0]
+        assert trail_times(buf.take(10.0)) == [8.0], "t=0.0 is past the horizon"
 
     def test_the_trail_can_be_turned_off(self):
         buf = ContextBuffer(AgentConfig(image_trail=0))

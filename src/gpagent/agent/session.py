@@ -420,18 +420,23 @@ class CommentaryAgent:
         content: list[dict] = []
         if ctx.text:
             content.append({"type": "input_text", "text": ctx.text})
-        if ctx.trail:
+        # A turn with no trail sends the current frame alone and says nothing
+        # extra about it: the note exists to order *several* images, and one
+        # image needs no ordering. That is most first turns and any turn whose
+        # gap held nothing new -- 7 of 68 on sess7.
+        if ctx.trail and ctx.frame:
             # Images in one item carry no timestamps and nothing says which way
             # round they go, so a bare pile of screenshots reads as ambiguous at
             # best and as "the screen is flickering" at worst. One line of text
             # ahead of them costs ~25 tokens and makes them a sequence.
             span = ctx.frame.t - ctx.trail[0].t
+            n = len(ctx.trail)
             content.append(
                 {
                     "type": "input_text",
                     "text": (
-                        f"[screen] {len(ctx.trail)} earlier frames from the last "
-                        f"{span:.0f}s, oldest first, then the current screen last."
+                        f"[screen] {n} earlier frame{'' if n == 1 else 's'} from the "
+                        f"last {span:.0f}s, oldest first, then the current screen last."
                     ),
                 }
             )

@@ -102,6 +102,13 @@ image_detail = "high"
 # minute 60 (sess7 lost two responses to rate_limit). 0 disables.
 image_trail = 4
 image_trail_detail = "low"
+# Minimum spacing between images sent in one turn. Bucketing spreads picks
+# across the candidate window but never asks whether that window is worth
+# spreading: back-to-back replies can leave two seconds, and four frames of the
+# same two seconds is one moment sent four times. Below capture's own
+# triggers.min_interval_s (2.0), so it is inert at default settings -- it is
+# here so the agent does not lean on a capture-side knob to stay correct.
+image_trail_min_gap_s = 1.5
 image_trail_max_age_s = 45.0  # looser than max_image_age_s: stale is fine as history
 
 max_image_age_s = 20.0        # never attach a screenshot older than this
