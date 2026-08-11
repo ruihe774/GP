@@ -7,6 +7,11 @@ The split is deliberate: `AgentConfig` is *what we send and how we talk to the
 API*, `SpeakConfig` is *when we open our mouth*. Only the second one decides
 whether this feels like a friend or a tech demo, and it is the one with a
 virtual-clock test suite.
+
+`HudConfig` is a third thing again: *where the words land* when they are read
+rather than heard. It is deliberately independent of the other two -- the HUD is
+a display surface with its own command (`gpagent hud`) and no knowledge of the
+session.
 """
 
 from __future__ import annotations
@@ -14,10 +19,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-__all__ = ["AgentConfig", "SpeakConfig"]
+__all__ = ["AgentConfig", "SpeakConfig", "HudConfig"]
 
 ImageDetail = Literal["auto", "low", "high"]
 ReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh"]
+#: Which corner (or edge) the toast stack sits in. The vertical half also picks
+#: the growth direction, so the anchored edge never moves as entries arrive.
+HudAnchor = Literal[
+    "top-right", "top-left", "top", "bottom-right", "bottom-left", "bottom"
+]
 
 
 @dataclass
@@ -146,6 +156,92 @@ class AgentConfig:
     #: reconnect backoff bounds if the socket drops mid-session
     reconnect_min_s: float = 1.0
     reconnect_max_s: float = 30.0
+
+
+@dataclass
+class HudConfig:
+    """The on-screen commentary overlay: a stack of toasts in a screen corner.
+
+    Sized for glancing at, not reading: whatever is on screen is the game, and
+    the HUD has to be legible in the corner of an eye during play. That is what
+    `max_entries`, the reading-speed hold, and the dimming of older entries are
+    all for -- old remarks fade out of the way rather than accumulating into
+    something that demands attention.
+    """
+
+    enabled: bool = False
+
+    # -- placement --------------------------------------------------------
+    anchor: HudAnchor = "top-right"
+    #: Which monitor to sit on: "primary", a RandR output name ("HDMI-1"), or an
+    #: index. The X screen is the *union* of the outputs -- 8960x2880 across two
+    #: here -- so "top right of the screen" is off the side of a monitor unless
+    #: one is picked deliberately.
+    monitor: str = "primary"
+    #: gap between the card and the monitor edges it is anchored to
+    margin_px: int = 32
+    #: card width as a fraction of the monitor, floored at `min_width_px`. A
+    #: fraction rather than pixels because the same config has to look sane on a
+    #: 1080p laptop and a 4K TV.
+    width_frac: float = 0.28
+    min_width_px: int = 320
+    #: HiDPI. Every `*_px` here is quoted in design pixels at 96 dpi and
+    #: multiplied by this. 0 discovers it: `Xft.dpi` from the X resource manager
+    #: (what the compositor tells clients -- 192, i.e. 2x, on this machine),
+    #: else the chosen monitor's own physical dpi. XWayland reports device
+    #: pixels, so getting this wrong is not subtle: a 22 px card on a 5K panel
+    #: is unreadable.
+    scale: float = 0.0
+
+    # -- type -------------------------------------------------------------
+    #: Resolved through fontconfig (`fc-match`), so the family can be a generic
+    #: alias like "sans-serif" and still land on something installed.
+    font_family: str = "sans-serif"
+    #: Language hint passed to fontconfig as `:lang=`, e.g. "ja". Pillow does no
+    #: font fallback -- one TTF renders the whole card, and DejaVu Sans has no
+    #: CJK glyphs at all -- so a Japanese session that leaves this empty gets a
+    #: card full of tofu. This is the knob that fixes it.
+    font_lang: str = ""
+    #: an explicit .ttf path, which skips fontconfig entirely
+    font_path: str | None = None
+    font_size_px: int = 22
+    #: line height as a multiple of the font size
+    line_spacing: float = 1.25
+    padding_px: int = 14
+    corner_radius_px: int = 14
+
+    # -- timing -----------------------------------------------------------
+    #: how many remarks stay on screen at once; the oldest drops off the top
+    max_entries: int = 3
+    #: Hold time is read speed, not a constant: a nine-word aside and a
+    #: three-line explanation are not on screen for the same length of time.
+    #: Characters per second, then clamped by the two bounds below.
+    read_cps: float = 16.0
+    hold_min_s: float = 4.0
+    hold_max_s: float = 16.0
+    #: fade-out at the end of an entry's hold; 0 disables the animation
+    fade_ms: int = 250
+
+    # -- colour -----------------------------------------------------------
+    bg_color: str = "#12141a"
+    #: card opacity. Real translucency, from a 32-bit ARGB visual composited by
+    #: the compositor -- not a screenshot of what is behind.
+    bg_opacity: float = 0.82
+    fg_color: str = "#f2f4f8"
+    #: the bar marking the newest entry, the one worth reading first
+    accent_color: str = "#6fd3ff"
+    #: alpha multiplier for everything that is not the newest entry
+    dim_older: float = 0.55
+
+    # -- window -----------------------------------------------------------
+    #: Pass clicks through to whatever is underneath. Off means the HUD eats
+    #: every click that lands on it, which during a game is a bug, not a
+    #: feature; it exists only for debugging where the window actually is.
+    click_through: bool = True
+    #: X display to open, e.g. ":0". None follows $DISPLAY. This is XWayland on
+    #: a Wayland session, which is the point: an override-redirect X window is
+    #: mutter's topmost layer, and Wayland offers a plain client nothing like it.
+    display: str | None = None
 
 
 @dataclass

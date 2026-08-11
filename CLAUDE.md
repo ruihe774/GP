@@ -57,6 +57,7 @@ Consumes the event stream, decides when to speak, and calls gpt-realtime-2.1.
 - `policy.py` — `SpeakPolicy` pure logic (mirrors `TriggerPolicy`), via three independent reasons to speak (see below).
 - `transport.py` — handles Realtime API message formatting, payload transform validation.
 - `playback.py` — audio output via GStreamer. Appsrc pipeline with priming silence for preroll; buffers need explicit timestamps. Uses `autoaudiosink` (selects `pulsesink`, not `pipewiresink`). Output goes to the default sink because Component A's AEC uses it as reference.
+- `hud.py` — on-screen output instead of voice: an override-redirect X11 window (XWayland on this Wayland session, because that is mutter's topmost layer), showing a stack of toasts in one monitor's corner. Pure layout/render (`ToastStack`, `render_card`, `place`), `HudWindow` for everything X, `TextHud` owning a thread so `show()` never blocks a caller. Not wired to the session — `output_modalities` is still `["audio"]`; see Known Gotchas.
 - `context.py` — conversation context held by the session.
 - `persona.py` — agent personality and instructions.
 - `env.py` — environment utilities (API key loading as `Secret` to prevent accidental logging).
@@ -93,12 +94,13 @@ Commands:
 - `inspect` — timeline, stats, estimated cost, WAV export, contact sheets. `--contact-sheet` montages everything captured; `--sent-sheet` montages only what the agent sent, one row per turn, each image labelled with its `seq` and detail (green border = high-detail current frame, grey = trail). Reads the `frames` field of the agent log's `ask` lines, so `--agent-log` points it at a run whose blobs live elsewhere.
 - `replay` — re-emit with original timing
 - `commentate` — run agent over captured or live events
+- `hud` — drive the on-screen overlay by hand: `TEXT...`, `--demo` (a scripted reel), `--stdin` (a line per toast), or `--render PATH` to draw the card to a PNG with no display involved. `--render-size WxH` picks the screen it lays out against.
 
 Config via `--set key=value` (runtime) or TOML files (persistent).
 
 ### Configuration
 
-- `src/gpagent/config.py` (capture) and `src/gpagent/agent/config.py` (agent) hold defaults in code. TOML sections `[gamepad] [audio] [screen] [triggers]` are Component A; `[agent] [speak]` are Component B. Per-device gamepad overrides go under `[gamepad.device_button_map."<vid:pid>"]`.
+- `src/gpagent/config.py` (capture) and `src/gpagent/agent/config.py` (agent) hold defaults in code. TOML sections `[gamepad] [audio] [screen] [triggers]` are Component A; `[agent] [speak] [hud]` are Component B. Per-device gamepad overrides go under `[gamepad.device_button_map."<vid:pid>"]`.
 - Loaded from `gpagent.toml` or `~/.config/gpagent/`, overridable ad hoc with `--set section.key=value`. `gpagent.example.toml` is the canonical annotated reference — every value in it is the current default, so defaults aren't duplicated here.
 
 ### Sinks & Output
@@ -195,3 +197,10 @@ Both must be clean before committing. Notes on the current config:
 - TPM is a real ceiling on long sessions: the API re-bills the whole conversation each turn, so input tokens grow with session length. Non-completed `response.done` statuses are logged as `note` lines.
 - Barge-in should only cancel a response once its audio has actually reached the player — a response that hasn't made a sound isn't talking over anyone.
 - The playback clock must be cleared between turns for non-realtime players (`player.discard()` before the next response), or the next utterance's audio accumulates on top of the previous one.
+
+**HUD:**
+- Text output is a session-wide choice, not a rendering one: it changes `output_modalities` on `session.update` and moves the words onto `response.output_text.*` instead of audio deltas plus a transcript. Every recording on disk was captured with `["audio"]`, so the text path cannot be replayed and cannot be verified without spending a real session. That is why `hud.py` ships unwired — do not render the audio transcript to it and call that the feature.
+- Depth-32 X windows are composited under the Render convention, i.e. **premultiplied** alpha. Straight alpha rings every glyph and rounded corner with a bright fringe.
+- The X screen is the union of the outputs (8960x2880 across two here, primary at x=3840), and XWayland reports **device** pixels while the compositor scales by `Xft.dpi` (192 = 2x). Placement is against one `Monitor` rect in root coordinates, and every `*_px` is a design pixel at 96 dpi multiplied by `Monitor.scale`.
+- `python-xlib` 0.33 has no XFixes region API, so click-through is the SHAPE extension's `Input` kind with an empty rectangle list. `put_image` does not split oversized requests either — a card is sent in row bands under `max_request_length * 4`.
+- Pillow does no font fallback: one file renders the whole card, and DejaVu Sans has no CJK. `hud.font_lang = "ja"` routes the lookup through fontconfig, which is the only reason a Japanese remark renders as words.

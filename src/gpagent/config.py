@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from .agent.config import AgentConfig, SpeakConfig
+from .agent.config import AgentConfig, HudConfig, SpeakConfig
 
 __all__ = [
     "GamepadConfig",
@@ -21,6 +21,7 @@ __all__ = [
     "TriggerConfig",
     "AgentConfig",
     "SpeakConfig",
+    "HudConfig",
     "CaptureConfig",
 ]
 
@@ -155,6 +156,9 @@ class CaptureConfig:
     #: and the same --set machinery, and land in the session manifest.
     agent: AgentConfig = field(default_factory=AgentConfig)
     speak: SpeakConfig = field(default_factory=SpeakConfig)
+    #: The on-screen commentary overlay. Its own section because it is a
+    #: display surface, driven by `gpagent hud` and independent of a session.
+    hud: HudConfig = field(default_factory=HudConfig)
 
     # -- (de)serialization -------------------------------------------------
 

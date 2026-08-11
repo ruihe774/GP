@@ -945,6 +945,91 @@ def _write_sent_sheet(directory: Path, events: list, agent_log: Path | None = No
     print(f"\nwrote {len(rows)} turns to {path}")
 
 
+# -- hud -------------------------------------------------------------------
+
+#: A reel that exercises what actually breaks: a one-liner, something long
+#: enough to wrap, a burst that pushes an entry off the top, and a run with no
+#: spaces in it. The last line only renders as words with a font that has the
+#: glyphs -- `--set hud.font_lang=ja` is how you get one.
+DEMO_LINES = [
+    "Oh no.",
+    "That jump was optimistic — you had the speed, just not the angle.",
+    "Okay, going left this time.",
+    "Wait.",
+    "That is the third time that exact barrel has ended a run, and I want you "
+    "to know I have been counting.",
+    "ナイス、そのショートカットで一周分ぐらい稼いだよ。",
+]
+
+
+def cmd_hud(args) -> int:
+    cfg = _build_config(args)
+    cfg.hud.enabled = True
+    if args.anchor:
+        cfg.hud.anchor = args.anchor
+    if args.monitor:
+        cfg.hud.monitor = args.monitor
+    if args.hold:
+        cfg.hud.hold_min_s = cfg.hud.hold_max_s = args.hold
+
+    lines = DEMO_LINES if args.demo else list(args.text)
+    if args.render:
+        return _render_hud(cfg, lines or DEMO_LINES[:3], args)
+    if not lines and not args.stdin:
+        raise SystemExit("give some text, or --demo, or --stdin")
+
+    from .agent.hud import hold_for, make_hud
+
+    hud = make_hud(cfg.hud)
+    print(f"hud: {hud.name}  ({cfg.hud.anchor} of {cfg.hud.monitor})")
+    if hud.name == "null":
+        print("  nothing will appear: no X display, or the window would not open")
+    last = ""
+    try:
+        for index, text in enumerate(lines):
+            print(f"  {text}")
+            hud.show(text)
+            last = text
+            if args.stdin or index < len(lines) - 1:
+                time.sleep(args.interval)
+        if args.stdin:
+            for line in sys.stdin:
+                text = line.strip()
+                if text:
+                    print(f"  {text}")
+                    hud.show(text)
+                    last = text
+        # Stay alive until the last remark has had its time on screen.
+        if last:
+            time.sleep(hold_for(last, cfg.hud) + cfg.hud.fade_ms / 1000.0)
+    except KeyboardInterrupt:
+        print()
+    finally:
+        hud.close()
+    return 0
+
+
+def _render_hud(cfg: CaptureConfig, lines: list[str], args) -> int:
+    """Draw the card to a file. No X server, no compositor, no human."""
+    from .agent.hud import Entry, Metrics, Monitor, load_font, place, render_card
+
+    try:
+        width, _, height = args.render_size.partition("x")
+        screen = Monitor(0, 0, int(width), int(height), scale=cfg.hud.scale or 1.0, name="render")
+    except ValueError:
+        raise SystemExit(f"--render-size expects WxH, got {args.render_size!r}") from None
+    metrics = Metrics.for_monitor(cfg.hud, screen)
+    shown = lines[-max(1, cfg.hud.max_entries) :]
+    entries = [Entry(text=text, shown_at=0.0, expires_at=60.0) for text in shown]
+    font = load_font(cfg.hud, metrics.font_px)
+    card = render_card(entries, [1.0] * len(entries), cfg.hud, metrics, font)
+    card.save(args.render)
+    x, y = place(card.size, screen, metrics, cfg.hud)
+    print(f"wrote {card.width}x{card.height} to {args.render}")
+    print(f"  {screen.width}x{screen.height} at {metrics.scale:g}x, {cfg.hud.anchor} at ({x}, {y})")
+    return 0
+
+
 # -- commentate ------------------------------------------------------------
 
 
@@ -1366,6 +1451,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="show the screen-capture picker instead of reusing the last choice",
     )
     commentate.set_defaults(func=cmd_commentate)
+
+    hud = sub.add_parser(
+        "hud", help="put commentary on screen instead of through the speakers"
+    )
+    hud.add_argument("text", nargs="*", help="remarks to show, in order")
+    hud.add_argument("--demo", action="store_true", help="a scripted reel instead of TEXT")
+    hud.add_argument("--stdin", action="store_true", help="one line in, one toast out, until EOF")
+    hud.add_argument("--render", metavar="PATH", help="draw to a PNG and exit; needs no display")
+    hud.add_argument(
+        "--render-size",
+        metavar="WxH",
+        default="1920x1080",
+        help="screen --render lays the card out against (default: 1920x1080)",
+    )
+    hud.add_argument("--interval", type=float, default=2.0, help="seconds between remarks")
+    hud.add_argument(
+        "--hold", type=float, default=0.0, help="fixed seconds on screen, instead of reading speed"
+    )
+    hud.add_argument(
+        "--anchor",
+        choices=["top-right", "top-left", "top", "bottom-right", "bottom-left", "bottom"],
+        help="which corner the stack sits in",
+    )
+    hud.add_argument("--monitor", help='"primary", an output name like HDMI-1, or an index')
+    _add_mapping_args(hud)
+    hud.set_defaults(func=cmd_hud)
 
     replay = sub.add_parser("replay", help="re-emit a session with original timing")
     replay.add_argument("directory")

@@ -173,3 +173,56 @@ engagement_window_s = 60.0
 # a permanently mute agent -- the quietest possible bug to notice.
 speech_gate_timeout_s = 31.0     # a speech.start whose segment never arrives
 response_gate_timeout_s = 45.0   # a response that never completes
+
+[hud]
+# On-screen commentary: a stack of toasts in a corner, for when the agent
+# should be read rather than heard. An override-redirect X11 window --
+# XWayland on a Wayland session, deliberately, because that is mutter's
+# topmost layer and Wayland offers a plain client nothing like it. Drive it on
+# its own with `gpagent hud --demo`.
+enabled = false
+
+anchor = "top-right"     # top|bottom + -left|-right, or bare top|bottom to centre
+# Which monitor: "primary", an output name ("HDMI-1"), or an index. The X
+# screen is the UNION of the outputs, so "the top right of the screen" is off
+# the side of a display unless one is named.
+monitor = "primary"
+margin_px = 32
+width_frac = 0.28        # card width as a fraction of that monitor
+min_width_px = 320
+
+# HiDPI. Every *_px here is a design pixel at 96 dpi, multiplied by this.
+# 0 discovers it: Xft.dpi from the X resource manager (what the compositor
+# tells clients), else the monitor's physical dpi. XWayland reports device
+# pixels, so at 2x an unscaled card is half the size it should be.
+scale = 0.0
+
+# Resolved through fontconfig, so a generic family works. Pillow does NO font
+# fallback -- one file renders the whole card and DejaVu Sans has no CJK -- so
+# a Japanese session needs font_lang, or every glyph comes out as tofu.
+font_family = "sans-serif"
+font_lang = ""           # e.g. "ja"; passed to fc-match as :lang=
+# font_path = "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"
+font_size_px = 22
+line_spacing = 1.25
+padding_px = 14
+corner_radius_px = 14
+
+max_entries = 3          # older remarks drop off the top rather than piling up
+# Hold time is reading time, not a constant: an aside and an explanation should
+# not be on screen for the same length of time.
+read_cps = 16.0
+hold_min_s = 4.0
+hold_max_s = 16.0
+fade_ms = 250            # fade-out at the end of a hold; 0 for a hard cut
+
+bg_color = "#12141a"
+bg_opacity = 0.82        # real translucency, from a 32-bit ARGB visual
+fg_color = "#f2f4f8"
+accent_color = "#6fd3ff" # the bar marking the newest remark
+dim_older = 0.55         # alpha multiplier for everything that is not newest
+
+# Off means the HUD eats every click that lands on it, which during a game is a
+# bug. It exists for finding out where the window actually is.
+click_through = true
+# display = ":0"         # unset follows $DISPLAY
