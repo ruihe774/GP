@@ -165,8 +165,17 @@ class CaptureConfig:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
-    def merge_dict(self, data: dict[str, Any]) -> None:
-        """Overlay a config dict onto self. Sections/keys absent from `data` are untouched."""
+    def merge_dict(self, data: dict[str, Any], *, strict: bool = True) -> list[str]:
+        """Overlay a config dict onto self. Sections/keys absent from `data` are untouched.
+
+        Returns the keys that were not recognised. `strict` (a config file or a
+        `--set`, where an unknown key is a typo the user wants to hear about
+        now) raises on the first one; lenient is for a manifest recorded by an
+        older version, where an unknown key is a *record* of a setting that has
+        since been removed and refusing to replay the session over it helps
+        nobody.
+        """
+        unknown: list[str] = []
         for f in fields(type(self)):
             section = data.get(f.name)
             if not isinstance(section, dict):
@@ -176,8 +185,11 @@ class CaptureConfig:
             for key, value in section.items():
                 if key in known:
                     setattr(target, key, value)
-                else:
+                elif strict:
                     raise ValueError(f"unknown config key: {f.name}.{key}")
+                else:
+                    unknown.append(f"{f.name}.{key}")
+        return unknown
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CaptureConfig:

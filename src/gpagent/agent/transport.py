@@ -167,6 +167,19 @@ class RecordingTransport(_QueueTransport):
     path and the cost meter are all exercised offline -- a dry run that just
     dropped requests on the floor would leave the agent permanently waiting for
     a response that never lands, which is the exact failure it is meant to catch.
+
+    The usage block bills the *whole conversation*, not the turn, because that
+    is what the API does and it is the only part of the bill anyone is trying to
+    control. A ledger of live items is kept, `conversation.item.delete` removes
+    from it, and everything still in it is charged again on the next response --
+    so a dry run shows what `agent.prune_after_s` does to the growth curve, and
+    to the TPM ceiling that curve runs into. Cached tokens are modelled the same
+    way, one rule: a delete truncates the cached prefix at the deleted item.
+
+    It is a model of the server, not the server. Sizes come from `tokens.py`,
+    the per-item overhead the API adds is not counted, and a real session's
+    cache can miss for reasons nothing here knows about. Read the shape of the
+    curve off it, not the fourth digit.
     """
 
     name = "dry-run"
@@ -187,7 +200,15 @@ class RecordingTransport(_QueueTransport):
         #: that got audio events back would exercise a path it will never take
         self.text = text
         self._fh: IO[str] | None = None
+        #: everything currently in the conversation, in order, by item id --
+        #: this is what gets re-billed every response
+        self._ledger: dict[str, _InputTally] = {}
+        #: audio appended but not yet committed into an item
         self._pending_input = _InputTally()
+        #: tokens the next response may charge at the cached rate: what was in
+        #: the conversation last time, capped by the earliest delete since
+        self._cached = 0
+        self._cache_ceiling = _NO_CEILING
         self._responses = 0
 
     async def connect(self) -> None:
@@ -217,23 +238,65 @@ class RecordingTransport(_QueueTransport):
 
     def _tally(self, event: dict) -> None:
         kind = event.get("type")
-        if kind == "input_audio_buffer.append":
+        if kind == "session.update":
+            # The persona is the one thing charged on every single request and
+            # never deleted, so it belongs at the head of the ledger.
+            text = ((event.get("session") or {}).get("instructions")) or ""
+            self._ledger["dry-instructions"] = _InputTally(text=text_tokens(text))
+        elif kind == "input_audio_buffer.append":
             # base64 -> bytes -> samples -> ms, at 24 kHz mono s16
             b64 = event.get("audio") or ""
             self._pending_input.audio_ms += len(b64) * 3 / 4 / 2 / 24.0
+        elif kind == "input_audio_buffer.commit":
+            # Committing turns the buffer into an item of its own. The server
+            # names it, so nothing can delete it -- which is exactly true of the
+            # real thing too, and part of what the growth curve is made of.
+            self._ledger[f"dry-audio-{len(self._ledger)}"] = self._pending_input
+            self._pending_input = _InputTally()
         elif kind == "conversation.item.create":
-            for part in (event.get("item") or {}).get("content") or []:
+            item = event.get("item") or {}
+            tally = _InputTally()
+            for part in item.get("content") or []:
                 if part.get("type") == "input_text":
-                    self._pending_input.text += text_tokens(part.get("text") or "")
+                    tally.text += text_tokens(part.get("text") or "")
                 elif part.get("type") == "input_image":
                     detail = part.get("detail", "high")
-                    self._pending_input.image += image_tokens(1024, 576, detail=detail)
+                    tally.image += image_tokens(1024, 576, detail=detail)
+            self._ledger[item.get("id") or f"dry-item-{len(self._ledger)}"] = tally
+        elif kind == "conversation.item.delete":
+            self._delete(event.get("item_id") or "")
+
+    def _delete(self, item_id: str) -> None:
+        """Drop an item, and cap what the next request can still claim as cached.
+
+        A prompt cache is a prefix match, so removing an item leaves only what
+        was ahead of it cacheable. Deletions come from the oldest end, which is
+        why a pruning round is close to a full invalidation and why doing them
+        in bulk is the whole trick.
+        """
+        if item_id not in self._ledger:
+            return
+        prefix = 0
+        for key, tally in self._ledger.items():
+            if key == item_id:
+                break
+            prefix += tally.total()
+        self._cache_ceiling = min(self._cache_ceiling, prefix)
+        del self._ledger[item_id]
 
     def _answer(self, event: dict) -> None:
         self._responses += 1
         item_id = f"dry-item-{self._responses:04d}"
-        tally = self._pending_input
-        self._pending_input = _InputTally()
+        # Everything still in the conversation is charged again, which is the
+        # point of the whole ledger; only the part that survived unchanged since
+        # the last response is charged at the cached rate.
+        billed = sum(tally.total() for tally in self._ledger.values())
+        cached = min(self._cached, self._cache_ceiling, billed)
+        tally = _InputTally(
+            text=sum(t.text for t in self._ledger.values()),
+            image=sum(t.image for t in self._ledger.values()),
+            audio_ms=sum(t.audio_ms for t in self._ledger.values()),
+        )
         self.feed({"type": "response.created", "response": {"id": f"dry-{self._responses}"}})
         self.feed(
             {
@@ -259,6 +322,11 @@ class RecordingTransport(_QueueTransport):
             )
         out_audio = 0 if self.text else self.ASSUMED_REPLY_TOKENS
         out_text = self.ASSUMED_TEXT_TOKENS if self.text else 0
+        # The answer joins the conversation and is re-billed with the rest of
+        # it from here on, exactly like the items that prompted it.
+        self._ledger[item_id] = _InputTally(text=out_audio + out_text)
+        self._cached = billed + out_audio + out_text
+        self._cache_ceiling = _NO_CEILING
         self.feed(
             {
                 "type": "response.done",
@@ -271,7 +339,7 @@ class RecordingTransport(_QueueTransport):
                             "text_tokens": tally.text,
                             "audio_tokens": audio_tokens(tally.audio_ms),
                             "image_tokens": tally.image,
-                            "cached_tokens": 0,
+                            "cached_tokens": cached,
                         },
                         "output_tokens": out_audio + out_text,
                         "output_token_details": {
@@ -284,11 +352,15 @@ class RecordingTransport(_QueueTransport):
         )
 
 
+#: stand-in for "no delete has capped the cache yet"
+_NO_CEILING = 1 << 62
+
+
 class _InputTally:
-    def __init__(self) -> None:
-        self.text = 0
-        self.image = 0
-        self.audio_ms = 0.0
+    def __init__(self, text: int = 0, image: int = 0, audio_ms: float = 0.0) -> None:
+        self.text = text
+        self.image = image
+        self.audio_ms = audio_ms
 
     def total(self) -> int:
         return self.text + self.image + audio_tokens(self.audio_ms)

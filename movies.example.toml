@@ -82,9 +82,24 @@ max_output_tokens = 160       # a read line is shorter than a spoken one
 # A two-hour film is longer than anything this was tuned on, and the API re-bills
 # the whole conversation every turn: input tokens per request grow all session,
 # and images are the bulk of them. TPM, not price, is the ceiling that bites
-# first. A lower retention ratio drops history in amortized batches server-side,
-# which is the only trimming that does not invalidate the prompt-cache prefix.
+# first, and on sess_movie2 it was not close -- the run spent its last seven
+# minutes returning `rate_limit_exceeded` for every response, thirteen in a row,
+# with ~2.3k image tokens added per turn and nothing ever leaving.
+#
+# Three answers, in the order they apply. A lower retention ratio drops history
+# server-side in amortized batches, the only trimming that does not invalidate
+# the prompt-cache prefix.
 truncation_retention_ratio = 0.6
+# ...and client-side pruning for the part the server has no reason to prioritise:
+# the screenshots, which are ~85% of the input here and are worthless within a
+# couple of scenes, plus the per-turn nudge, which is the same three sentences
+# repeated once per turn. 180 s is about six remarks at this cadence -- enough
+# trail for the agent to know what film it is watching, short enough that the
+# request stops growing. The prompt cache is thrown away once per round, which
+# is why the round is expensive and the interval, not the cutoff, is the knob
+# that decides what it costs: at 90 s that is roughly one turn in three.
+prune_after_s = 180.0
+prune_interval_s = 90.0
 
 playback = false              # nothing to play; keeps the sink out of the way
 

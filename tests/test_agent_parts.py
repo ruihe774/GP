@@ -581,7 +581,9 @@ class TestSdkPayloadDrift:
         )
         return [
             agent.session_update(),
-            agent._context_item(ctx),
+            agent._text_item(0.0, "hello"),
+            agent._images_item(0.0, ctx),
+            agent._reason_item(0.0, "reply"),
             {"type": "input_audio_buffer.append", "audio": "AAAA"},
             {"type": "input_audio_buffer.commit"},
             {"type": "response.create", "response": {"instructions": "be brief"}},
@@ -684,6 +686,78 @@ class TestRecordingTransport:
                 break
         details = done["response"]["usage"]["input_token_details"]
         assert details["image_tokens"] == 85, "detail=low must be priced as low"
+        await transport.close()
+
+    async def image_item(self, transport, item_id, detail="high"):
+        await transport.send(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "id": item_id,
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/jpeg;base64,AA",
+                            "detail": detail,
+                        }
+                    ],
+                },
+            }
+        )
+
+    async def usage(self, transport):
+        """Ask for a response and return the usage block it comes back with."""
+        await transport.send({"type": "response.create", "response": {}})
+        async for event in transport:
+            if event["type"] == "response.done":
+                return event["response"]["usage"]
+        raise AssertionError("the dry run must answer every request")
+
+    async def test_the_whole_conversation_is_billed_on_every_response(self):
+        """The API re-bills history, and history is the thing being tuned.
+
+        A dry run that charged only for the turn's own items would show a flat
+        cost per response and hide the growth curve that hits TPM -- the exact
+        thing `agent.prune_after_s` exists to bend.
+        """
+        transport = RecordingTransport()
+        await transport.connect()
+        await self.image_item(transport, "img-1", detail="low")
+        first = await self.usage(transport)
+        await self.image_item(transport, "img-2", detail="low")
+        second = await self.usage(transport)
+        assert second["input_token_details"]["image_tokens"] == 170, "both frames, again"
+        assert second["input_tokens"] > first["input_tokens"]
+        await transport.close()
+
+    async def test_a_deleted_item_stops_being_billed(self):
+        transport = RecordingTransport()
+        await transport.connect()
+        await self.image_item(transport, "img-1", detail="low")
+        await self.image_item(transport, "img-2", detail="low")
+        await self.usage(transport)
+        await transport.send({"type": "conversation.item.delete", "item_id": "img-1"})
+        after = await self.usage(transport)
+        assert after["input_token_details"]["image_tokens"] == 85, "one frame left"
+        await transport.close()
+
+    async def test_a_delete_truncates_the_cached_prefix(self):
+        """Deleting from the oldest end costs most of the cache, once."""
+        transport = RecordingTransport()
+        await transport.connect()
+        await self.image_item(transport, "img-1")
+        await self.image_item(transport, "img-2")
+        steady = await self.usage(transport)
+        assert (await self.usage(transport))["input_token_details"]["cached_tokens"] > 0
+        await transport.send({"type": "conversation.item.delete", "item_id": "img-1"})
+        after = await self.usage(transport)
+        assert after["input_token_details"]["cached_tokens"] == 0
+        # ...and the cache refills on the very next request, which is why the
+        # cost of pruning is per round rather than per item.
+        assert (await self.usage(transport))["input_token_details"]["cached_tokens"] > 0
+        assert steady["input_tokens"] > 0
         await transport.close()
 
     async def test_a_text_dry_run_is_answered_in_text(self):

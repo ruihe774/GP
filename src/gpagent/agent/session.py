@@ -9,14 +9,20 @@ below this layer knows which of the three it is running under.
 
 Conversation shape, per response:
 
-    conversation.item.create   one user item: accumulated controller summaries,
-                               plus at most one screenshot (see context.py)
+    conversation.item.create   one user item: accumulated controller summaries
+    conversation.item.create   one user item: the screenshots -- ordering note,
+                               trail, current frame (see context.py)
     input_audio_buffer.append  the player's utterance, PCM16 24 kHz mono --
     input_audio_buffer.commit  exactly what capture produced, no conversion
     conversation.item.create   one system item: which reason we are speaking
                                for (see persona.reason_note)
     response.create            bare -- persona, language and output cap are all
                                constant, so they live in session.update
+
+The images have their own item rather than riding along with the text because
+they are the half that gets deleted again: an item is the unit `conversation
+.item.delete` operates on, so anything that has to outlive a screenshot cannot
+share an item with one. See `_maybe_prune`.
 
 Only `reply` sends audio. `react` and `ambient` are the same shape without it.
 
@@ -36,6 +42,7 @@ import contextlib
 import json
 import logging
 import time
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -141,10 +148,15 @@ class CommentaryAgent:
         #: shown. Text needs this as much as audio does: the API emits
         #: `response.output_text.done` for an interrupted response too.
         self._accept_output = True
-        self._items: list[tuple[float, str]] = []
-        self._image_items: list[str] = []
+        #: Items this client created that it is willing to delete again, oldest
+        #: first: (t, item_id, kind). Screenshots and per-turn nudges only --
+        #: see `_maybe_prune` for why the conversation proper is not in here.
+        self._disposable: list[tuple[float, str, str]] = []
         self._item_seq = 0
         self._last_prune = 0.0
+        #: how many of each kind have been deleted, for `report()`
+        self.pruned: Counter[str] = Counter()
+        self._prune_rounds = 0
         #: age of each frame at the moment it was attached, for tuning capture
         self._frame_ages: list[float] = []
 
@@ -362,13 +374,11 @@ class CommentaryAgent:
 
         detail: list[str] = []
         if ctx:
-            item = self._context_item(ctx)
-            await self.transport.send(item)
-            if ctx.frame:
-                await self._retire_old_images(item["item"]["id"])
             if ctx.text:
+                await self.transport.send(self._text_item(now, ctx.text))
                 detail.append(f'"{ctx.text}"')
             if ctx.frame:
+                await self.transport.send(self._images_item(now, ctx))
                 # Frame age is the whole point of the capture-side trigger
                 # interval now that at most one frame is sent per response:
                 # it buys freshness, not tokens.
@@ -404,7 +414,7 @@ class CommentaryAgent:
         # `response.create.instructions`, which would replace the session
         # persona and, because it varies per turn, break the cached prefix.
         # See `persona.reason_note`.
-        await self.transport.send(self._reason_item(reason))
+        await self.transport.send(self._reason_item(now, reason))
         await self.transport.send({"type": "response.create"})
         self.policy.mark_spoken(reason, now)
         self._response_active = True
@@ -454,10 +464,19 @@ class CommentaryAgent:
         kept.reverse()
         return kept
 
-    def _context_item(self, ctx) -> dict:
+    def _text_item(self, now: float, text: str) -> dict:
+        """The controller summaries. Not disposable: it is the cheap half."""
+        return self._item(now, "gpctx", "user", [{"type": "input_text", "text": text}], None)
+
+    def _images_item(self, now: float, ctx) -> dict:
+        """Every screenshot this turn sends, in one item so one delete drops them.
+
+        Trail and current frame share the item deliberately. They are created in
+        the same turn and pruned on the same cutoff, so splitting them would buy
+        two `conversation.item.delete` calls and two chances to invalidate the
+        prompt cache in exchange for a distinction nothing ever draws.
+        """
         content: list[dict] = []
-        if ctx.text:
-            content.append({"type": "input_text", "text": ctx.text})
         # A turn with no trail sends the current frame alone and says nothing
         # extra about it: the note exists to order *several* images, and one
         # image needs no ordering. That is most first turns and any turn whose
@@ -485,17 +504,26 @@ class CommentaryAgent:
                 content.append(self._image_part(f, self.cfg.image_trail_detail))
         if ctx.frame:
             content.append(self._image_part(ctx.frame, self.cfg.image_detail))
-        # Client-assigned so the item can be pruned without waiting for the
-        # server to tell us what it called it.
+        return self._item(now, "gpimg", "user", content, "image")
+
+    def _item(
+        self, now: float, prefix: str, role: str, content: list[dict], kind: str | None
+    ) -> dict:
+        """One `conversation.item.create`, with an id we chose ourselves.
+
+        Client-assigned so an item can be deleted later without waiting for the
+        server to say what it called it -- and, since `conversation.item.created`
+        arrives asynchronously, without a race between deciding to prune and
+        learning the name of the thing to prune. `kind` names the disposable
+        ones; None means the item stays for the life of the session.
+        """
         self._item_seq += 1
+        item_id = f"{prefix}{self._item_seq:012d}"
+        if kind is not None:
+            self._disposable.append((now, item_id, kind))
         return {
             "type": "conversation.item.create",
-            "item": {
-                "id": f"gpctx{self._item_seq:012d}",
-                "type": "message",
-                "role": "user",
-                "content": content,
-            },
+            "item": {"id": item_id, "type": "message", "role": role, "content": content},
         }
 
     def _image_part(self, frame, detail: str) -> dict:
@@ -506,37 +534,17 @@ class CommentaryAgent:
             "detail": detail,
         }
 
-    def _reason_item(self, reason: str) -> dict:
-        """The per-turn nudge, as a system message appended before the response."""
-        self._item_seq += 1
-        return {
-            "type": "conversation.item.create",
-            "item": {
-                "id": f"gprsn{self._item_seq:012d}",
-                "type": "message",
-                "role": "system",
-                "content": [{"type": "input_text", "text": reason_note(reason, self.cfg)}],
-            },
-        }
+    def _reason_item(self, now: float, reason: str) -> dict:
+        """The per-turn nudge, as a system message appended before the response.
 
-    async def _retire_old_images(self, newest_id: str) -> None:
-        """Keep only the last few screenshots in the conversation.
-
-        The whole conversation is re-billed as input on every turn, so a
-        screenshot left in context is not paid for once but once per response
-        for as long as it stays. Two minutes of stale frames is the most
-        expensive thing the agent can carry, and the oldest of them is also the
-        least useful.
+        Disposable for the same reason the screenshots are, and less obviously:
+        each one is only ~30 tokens, but there is one per turn and they are all
+        but identical to each other, so by the hundredth turn the conversation
+        is carrying a hundred copies of three sentences that only ever applied
+        to the turn they were written for.
         """
-        if self.cfg.keep_images <= 0:
-            return
-        self._image_items.append(newest_id)
-        while len(self._image_items) > self.cfg.keep_images:
-            stale = self._image_items.pop(0)
-            await self.transport.send(
-                {"type": "conversation.item.delete", "item_id": stale}
-            )
-            self._items = [(t, i) for t, i in self._items if i != stale]
+        content = [{"type": "input_text", "text": reason_note(reason, self.cfg)}]
+        return self._item(now, "gprsn", "system", content, "note")
 
     async def _send_audio(self, pcm: bytes) -> None:
         for start in range(0, len(pcm), AUDIO_CHUNK_BYTES):
@@ -612,8 +620,7 @@ class CommentaryAgent:
         now = self.clock()
         # Item ids belonged to the old conversation; deleting or truncating
         # them on the new one would earn an error for each.
-        self._items.clear()
-        self._image_items.clear()
+        self._disposable.clear()
         self._audio_item_id = None
         self.player.flush(now)
         self._accept_output = True
@@ -649,10 +656,6 @@ class CommentaryAgent:
                 self.player.push(pcm)
         elif kind == "response.output_item.added":
             self._audio_item_id = (event.get("item") or {}).get("id") or self._audio_item_id
-        elif kind == "conversation.item.created":
-            item_id = (event.get("item") or {}).get("id")
-            if item_id:
-                self._items.append((now, item_id))
         elif kind == "response.output_audio_transcript.done":
             self._response_transcript = event.get("transcript") or ""
             self._emit(Line(now, "say", self._response_transcript))
@@ -831,23 +834,63 @@ class CommentaryAgent:
     # -- context pruning ---------------------------------------------------
 
     async def _maybe_prune(self, now: float) -> None:
-        """Delete conversation items older than the retention window.
+        """Delete the disposable half of the conversation, in one round.
 
-        The server's `truncation` setting is the backstop; this is the cheap
-        deterministic half, and it matters most for player audio items, which
-        are by far the heaviest things in the conversation.
+        Two decisions, and both are about the prompt cache rather than about
+        what the model needs to remember.
+
+        **One cutoff.** Screenshots -- the current frame and the trail behind it
+        -- and the per-turn system nudge all go on the same `prune_after_s`, so
+        every deletion the session ever wants to make is available at the same
+        moment. Three independent windows would mean three rounds and three
+        invalidations to remove things that were created together.
+
+        **In bulk.** A delete truncates the cached prefix at the position of the
+        deleted item, and we always delete from the oldest end, so *any* round
+        costs essentially the whole prefix: the next request is billed at the
+        fresh rate. That price is per round, not per item, which turns the whole
+        problem into "how often", not "how much". `prune_interval_s` is the
+        floor; nine items in one round cost a ninth of nine rounds of one.
+
+        The conversation proper is left alone. What the player said and what the
+        agent answered is the thread of the session, it is not something the
+        client can regenerate, and it is a fraction of the tokens; the server's
+        `truncation.retention_ratio` is the mechanism aimed at that, and it
+        drops history in amortized batches that leave the prefix intact.
+
+        Why do it at all when the cost measurement says trimming loses (see
+        `AgentConfig.prune_after_s`): cached tokens count against TPM in full.
+        The rate limit does not care that history is cheap, only that it is
+        re-sent, and on sess_movie2 that ended the session thirteen requests
+        before the film did.
         """
-        if self.cfg.prune_after_s <= 0 or now - self._last_prune < 30.0:
+        if self.cfg.prune_after_s <= 0:
+            return
+        if now - self._last_prune < self.cfg.prune_interval_s:
+            return
+        cutoff = now - self.cfg.prune_after_s
+        stale = [entry for entry in self._disposable if entry[0] < cutoff]
+        if not stale:
+            # Deliberately without touching `_last_prune`: the interval limits
+            # how often the cache may be thrown away, so a round that threw
+            # nothing away must not push the next real one further out.
             return
         self._last_prune = now
-        cutoff = now - self.cfg.prune_after_s
-        stale = [(t, i) for t, i in self._items if t < cutoff]
-        if not stale:
-            return
-        self._items = [(t, i) for t, i in self._items if t >= cutoff]
-        for _, item_id in stale:
+        self._disposable = [entry for entry in self._disposable if entry[0] >= cutoff]
+        for _, item_id, _kind in stale:
             await self.transport.send({"type": "conversation.item.delete", "item_id": item_id})
-        log.debug("pruned %d conversation items", len(stale))
+        counts = Counter(kind for _, _, kind in stale)
+        self.pruned.update(counts)
+        self._prune_rounds += 1
+        self._emit(
+            Line(
+                now,
+                "prune",
+                f"dropped {len(stale)} items older than {self.cfg.prune_after_s:.0f}s: "
+                + ", ".join(f"{n} {kind}" for kind, n in sorted(counts.items())),
+                {"pruned": dict(counts)},
+            )
+        )
 
     # -- logging -----------------------------------------------------------
 
@@ -881,6 +924,9 @@ class CommentaryAgent:
             "frames_seen": self.context.frames_seen,
             "frames_sent": self.context.frames_sent,
             "trail_sent": self.context.trail_sent,
+            # Rounds, not just items: the round is what the prompt cache is
+            # billed for, so "48 items in 6 rounds" is the number to read.
+            "pruned": {**self.pruned, "rounds": self._prune_rounds},
             "frame_age_s": {
                 "mean": round(sum(self._frame_ages) / len(self._frame_ages), 2),
                 "max": round(max(self._frame_ages), 2),

@@ -71,13 +71,24 @@ def _build_config(args) -> CaptureConfig:
     if replay_dir:
         saved = _read_manifest(Path(replay_dir)).get("config")
         if isinstance(saved, dict):
-            try:
-                cfg.merge_dict(saved)
-            except ValueError as exc:
-                raise SystemExit(f"bad config in {replay_dir}/manifest.json: {exc}") from exc
+            # Lenient: this is what the recording was made under, not what the
+            # user is asking for. A key this version has dropped must not make
+            # an old session unreplayable.
+            stale = cfg.merge_dict(saved, strict=False)
+            if stale:
+                print(
+                    f"note: {replay_dir}/manifest.json has settings this version "
+                    f"no longer has, ignored: {', '.join(stale)}"
+                )
     if getattr(args, "config", None):
         with open(args.config, "rb") as fh:
-            cfg.merge_dict(tomllib.load(fh))
+            try:
+                # Strict, unlike the manifest above: here an unknown key is a
+                # typo, and a setting silently ignored for a whole session is
+                # worse than a message before it starts.
+                cfg.merge_dict(tomllib.load(fh))
+            except ValueError as exc:
+                raise SystemExit(f"bad config in {args.config}: {exc}") from exc
     try:
         cfg.apply_overrides(_parse_set(getattr(args, "set", []) or []))
     except ValueError as exc:
@@ -1225,6 +1236,7 @@ def _print_line(line) -> None:
         "player": "mic ",
         "cut": "CUT ",
         "note": "??  ",
+        "prune": "--  ",
         "error": "ERR ",
         "session": "--  ",
     }
@@ -1251,6 +1263,12 @@ def _print_agent_report(agent, args, out_dir: Path | None) -> None:
     if report["frame_age_s"]:
         age = report["frame_age_s"]
         print(f"  frame age       {age['mean']}s mean, {age['max']}s worst at send time")
+    pruned = report.get("pruned") or {}
+    if pruned.get("rounds"):
+        # Rounds is the number that matters: one round is one invalidated
+        # prompt-cache prefix, whether it dropped two items or twenty.
+        kinds = ", ".join(f"{n} {kind}" for kind, n in sorted(pruned.items()) if kind != "rounds")
+        print(f"  pruned          {kinds} in {pruned['rounds']} rounds")
     if report.get("output") == "text":
         print(f"  wrote           {len(agent.hud.shown)} remarks to the {agent.hud.name} hud")
     else:
@@ -1316,7 +1334,7 @@ def _compare_with_estimate(directory: str, agent, tok: dict, cost: dict) -> None
     print(
         "  note: 'sent' can exceed 'captured'. `inspect` counts each item once;\n"
         "        the API re-bills the whole conversation as input on every turn,\n"
-        "        which is what agent.keep_images and agent.prune_after_s control."
+        "        which is what agent.prune_after_s controls."
     )
 
 

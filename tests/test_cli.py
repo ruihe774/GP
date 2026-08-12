@@ -65,10 +65,26 @@ class TestBuildConfigReplayLayer:
         cfg = _build_config(_args(replay=str(tmp_path)))
         assert cfg.gamepad.sticks_mode == "off"
 
-    def test_unknown_key_in_recorded_config_raises(self, tmp_path):
-        _write_session_with_config(tmp_path, {"gamepad": {"nonexistent": 1}})
+    def test_a_setting_this_version_dropped_still_replays(self, tmp_path, capsys):
+        """A manifest records what a past run used, it does not request anything.
+
+        `agent.keep_images` was removed when pruning moved to one shared cutoff.
+        Every session recorded before that has it, and refusing to replay them
+        would make the recordings useless for measuring the change that removed
+        it -- which is the one thing they are most needed for.
+        """
+        _write_session_with_config(tmp_path, {"gamepad": {"nonexistent": 1, "enabled": False}})
+        cfg = _build_config(_args(replay=str(tmp_path)))
+        assert cfg.gamepad.enabled is False, "the keys it does know must still apply"
+        assert "gamepad.nonexistent" in capsys.readouterr().out, "and say what it ignored"
+
+    def test_an_unknown_key_in_a_config_file_is_still_an_error(self, tmp_path):
+        """There it is a typo, and silently ignoring it is how a setting
+        goes missing for an entire session."""
+        path = tmp_path / "gpagent.toml"
+        path.write_text("[gamepad]\nnonexistent = 1\n")
         with pytest.raises(SystemExit):
-            _build_config(_args(replay=str(tmp_path)))
+            _build_config(_args(replay=None, config=str(path)))
 
     def test_no_replay_ignores_directory_state(self, tmp_path):
         _write_session_with_config(tmp_path, {"gamepad": {"sticks_mode": "full"}})

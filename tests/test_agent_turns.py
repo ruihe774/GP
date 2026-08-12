@@ -103,7 +103,8 @@ class TestTheTurnItSends:
 
         order = [e["type"] for e in agent.transport.sent]
         assert order == [
-            "conversation.item.create",  # context: summary + frame
+            "conversation.item.create",  # the controller summary
+            "conversation.item.create",  # the screenshots, in an item of their own
             "input_audio_buffer.append",
             "input_audio_buffer.commit",
             "conversation.item.create",  # the per-turn system nudge
@@ -709,7 +710,7 @@ class TestTheSessionComesBack:
             transport.drop()
             await asyncio.sleep(0.05)
             assert not agent._response_active
-            assert not agent._items and not agent._image_items, "stale item ids kept"
+            assert not agent._disposable, "stale item ids kept"
         finally:
             await agent.close()
 
@@ -756,73 +757,162 @@ class TestResponsesThatSayNothing:
         assert not [line for line in agent.lines if line.kind == "note"]
 
 
-class TestContextPruning:
-    async def test_old_items_are_deleted(self, agent):
-        agent.cfg.prune_after_s = 60.0
-        for i, t in enumerate((100.0, 110.0)):
-            agent._clock_obj.set(t)
-            await agent.on_server_event(
-                {"type": "conversation.item.created", "item": {"id": f"old-{i}"}}
-            )
-        agent._clock_obj.set(400.0)
-        await agent.tick(400.0)
-        deleted = {e["item_id"] for e in agent.transport.sent_of_type("conversation.item.delete")}
-        assert deleted == {"old-0", "old-1"}
+def turns(agent, count, *, every=40.0, start=100.0):
+    """Play `count` complete turns, one screenshot and one utterance each."""
 
-    async def test_pruning_is_off_by_default(self, agent):
-        """Deleting items invalidates the prompt cache; measured, it loses."""
-        assert agent.cfg.prune_after_s == 0.0
-        agent._clock_obj.set(100.0)
-        await agent.on_server_event(
-            {"type": "conversation.item.created", "item": {"id": "old"}}
-        )
-        agent._clock_obj.set(100_000.0)
-        await agent.tick(100_000.0)
-        assert agent.transport.sent_of_type("conversation.item.delete") == []
-
-    async def test_recent_items_are_kept(self, agent):
-        agent.cfg.prune_after_s = 300.0
-        agent._clock_obj.set(100.0)
-        await agent.on_server_event(
-            {"type": "conversation.item.created", "item": {"id": "fresh"}}
-        )
-        agent._clock_obj.set(200.0)
-        await agent.tick(200.0)
-        assert agent.transport.sent_of_type("conversation.item.delete") == []
-
-
-class TestImagesAreRetired:
-    """Images left in context are re-billed on every later turn, not once."""
-
-    async def send_frames(self, agent, count, keep):
-        agent.cfg.keep_images = keep
+    async def run():
         for i in range(count):
-            t = 100.0 + i * 40.0
+            t = start + i * every
             agent._clock_obj.set(t)
             await agent.handle(frame(seq=i, data=bytes([i]) + b"\xd8jpeg"), now=t)
             await agent.handle(speech(), now=t + 1)
             await complete_response(agent, item_id=f"item-{i}")
 
-    async def test_only_the_newest_images_are_kept(self, agent):
-        await self.send_frames(agent, count=4, keep=2)
-        sent = [
-            e["item"]["id"]
+    return run()
+
+
+def created(agent, prefix):
+    return [
+        e["item"]["id"]
+        for e in agent.transport.sent_of_type("conversation.item.create")
+        if e["item"]["id"].startswith(prefix)
+    ]
+
+
+def deleted(agent):
+    return [e["item_id"] for e in agent.transport.sent_of_type("conversation.item.delete")]
+
+
+class TestContextPruning:
+    """What the client deletes again, and how rarely it does it.
+
+    The conversation is re-billed as input on every turn, so a screenshot left
+    in it is paid for once per response for as long as it stays -- and cached
+    or not, it counts against TPM in full, which is what ended sess_movie2.
+    """
+
+    async def test_stale_images_are_deleted(self, agent):
+        agent.cfg.prune_after_s = 60.0
+        await turns(agent, 4)
+        assert deleted(agent), "screenshots must not accumulate forever"
+        assert set(deleted(agent)) <= set(created(agent, "gpimg")) | set(
+            created(agent, "gprsn")
+        )
+
+    async def test_the_screen_note_goes_with_the_frames_it_introduces(self, agent):
+        """"[screen] 2 earlier frames..." is meaningless once they are gone.
+
+        It shares the images' item rather than the text one precisely so it
+        cannot outlive them: a note left behind would be telling the model to
+        look at a sequence of screenshots that is no longer in the conversation.
+        """
+        agent.cfg.prune_after_s = 60.0
+        agent.cfg.image_trail = 2
+        for i, t in enumerate([100.0, 103.0, 106.0, 109.0]):
+            await agent.handle(frame(seq=i, data=JPEG + bytes([i])), now=t)
+        await agent.handle(speech(), now=110.0)
+        await complete_response(agent)
+        agent._clock_obj.set(400.0)
+        await agent.tick(400.0)
+
+        surviving = [
+            c["text"]
             for e in agent.transport.sent_of_type("conversation.item.create")
-            if any(c["type"] == "input_image" for c in e["item"]["content"])
+            if e["item"]["id"] not in set(deleted(agent))
+            for c in e["item"]["content"]
+            if c["type"] == "input_text"
         ]
-        deleted = [e["item_id"] for e in agent.transport.sent_of_type("conversation.item.delete")]
-        assert len(sent) == 4
-        assert deleted == sent[:2], "the two oldest screenshots must be dropped"
+        assert not [t for t in surviving if "[screen]" in t]
 
-    async def test_keeping_more_deletes_fewer(self, agent):
-        await self.send_frames(agent, count=4, keep=4)
-        assert agent.transport.sent_of_type("conversation.item.delete") == []
+    async def test_both_the_current_frame_and_its_trail_go(self, agent):
+        """One item holds both, so one delete takes both with it."""
+        agent.cfg.prune_after_s = 60.0
+        agent.cfg.image_trail = 2
+        for i, t in enumerate([100.0, 103.0, 106.0, 109.0]):
+            await agent.handle(frame(seq=i, data=JPEG + bytes([i])), now=t)
+        await agent.handle(speech(), now=110.0)
+        await complete_response(agent)
+        agent._clock_obj.set(400.0)
+        await agent.tick(400.0)
 
-    async def test_items_carry_a_client_id_so_they_can_be_pruned_at_once(self, agent):
+        item = [
+            e["item"]
+            for e in agent.transport.sent_of_type("conversation.item.create")
+            if e["item"]["id"] in set(deleted(agent))
+        ]
+        images = [c for c in item[0]["content"] if c["type"] == "input_image"]
+        assert [c["detail"] for c in images] == ["low", "low", "high"]
+
+    async def test_old_system_notes_go_in_the_same_round(self, agent):
+        """The per-turn nudge is small, identical every turn, and there is one
+        per turn -- so it is the second thing worth deleting, and it costs
+        nothing extra to delete it alongside the images."""
+        agent.cfg.prune_after_s = 60.0
+        await turns(agent, 4)
+        gone = set(deleted(agent))
+        assert gone & set(created(agent, "gpimg"))
+        assert gone & set(created(agent, "gprsn"))
+
+    async def test_the_controller_summary_survives_its_screenshots(self, agent):
+        """Text is the cheap half; it is in its own item so it can stay."""
+        agent.cfg.prune_after_s = 60.0
+        for i in range(4):
+            t = 100.0 + i * 40.0
+            agent._clock_obj.set(t)
+            await agent.handle(pad(f"tapped {i}"), now=t)
+            await agent.handle(frame(seq=i), now=t + 0.5)
+            await agent.handle(speech(), now=t + 1)
+            await complete_response(agent, item_id=f"item-{i}")
+        assert created(agent, "gpctx"), "summaries must have gone out"
+        assert not set(deleted(agent)) & set(created(agent, "gpctx"))
+
+    async def test_deletes_arrive_in_one_bulk_round(self, agent):
+        """The prompt cache is invalidated per round, not per item.
+
+        Six turns inside one interval leave six items' worth of deletions, and
+        they must go out together: dribbling one out per turn would pay the
+        invalidation six times for the same saving.
+        """
+        agent.cfg.prune_after_s = 30.0
+        agent.cfg.prune_interval_s = 500.0
+        await turns(agent, 6, every=20.0)  # 100..200, all inside one interval
+        agent._clock_obj.set(1000.0)
+        await agent.tick(1000.0)
+        assert len(deleted(agent)) >= 6
+        rounds = [line for line in agent.lines if line.kind == "prune"]
+        assert len(rounds) == 1, "one round, however many items it drops"
+        assert agent.report()["pruned"]["rounds"] == 1
+
+    async def test_the_interval_is_what_limits_how_often_the_cache_dies(self, agent):
+        agent.cfg.prune_after_s = 10.0
+        agent.cfg.prune_interval_s = 200.0
+        await turns(agent, 6, every=30.0)  # 150 s of turns, every one of them stale
+        assert len([line for line in agent.lines if line.kind == "prune"]) == 1
+
+    async def test_a_shorter_interval_prunes_more_often(self, agent):
+        agent.cfg.prune_after_s = 10.0
+        agent.cfg.prune_interval_s = 30.0
+        await turns(agent, 6, every=30.0)
+        assert len([line for line in agent.lines if line.kind == "prune"]) > 1
+
+    async def test_recent_items_are_kept(self, agent):
+        agent.cfg.prune_after_s = 300.0
+        await turns(agent, 3)
+        assert deleted(agent) == []
+
+    async def test_pruning_is_off_by_default(self, agent):
+        """As a cost measure, deleting items loses to the prompt cache."""
+        assert agent.cfg.prune_after_s == 0.0
+        await turns(agent, 4)
+        agent._clock_obj.set(100_000.0)
+        await agent.tick(100_000.0)
+        assert deleted(agent) == []
+
+    async def test_images_carry_a_client_id_so_they_can_be_pruned_at_once(self, agent):
         await agent.handle(frame(), now=100.0)
         await agent.handle(speech(), now=101.0)
         item = agent.transport.sent_of_type("conversation.item.create")[0]["item"]
-        assert item["id"].startswith("gpctx")
+        assert item["id"].startswith("gpimg")
 
 
 class TestUsageIsRecorded:
@@ -926,6 +1016,7 @@ class TestTextOutput:
         await agent.handle(frame(), now=100.5)
         await agent.handle(speech(dur_ms=1000), now=102.0)
         assert [e["type"] for e in agent.transport.sent] == [
+            "conversation.item.create",
             "conversation.item.create",
             "input_audio_buffer.append",
             "input_audio_buffer.commit",

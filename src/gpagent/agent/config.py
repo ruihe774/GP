@@ -133,22 +133,39 @@ class AgentConfig:
     #: gamepad summaries older than this are dropped rather than sent
     context_window_s: float = 45.0
     max_summary_chars: int = 400
-    # Client-side context trimming. Both default to *off*, against expectation,
-    # because it was measured and it lost. The Realtime API re-bills the whole
-    # conversation as input on every turn, so trimming looks like an obvious win
-    # -- but deleting an item invalidates the prompt-cache prefix behind it, and
-    # cached input is ~10x cheaper than fresh. On sess5, keeping every image
-    # billed 31008 image tokens for $0.0204 of input; deleting all but the last
-    # two billed 8721 for $0.0268. Fewer tokens, more money.
+    # Client-side context pruning. Off by default, against expectation, because
+    # as a *cost* measure it was measured and it lost. The Realtime API re-bills
+    # the whole conversation as input on every turn, so trimming looks like an
+    # obvious win -- but deleting an item invalidates the prompt-cache prefix
+    # behind it, and cached input is ~10x cheaper than fresh. On sess5, keeping
+    # every image billed 31008 image tokens for $0.0204 of input; deleting all
+    # but the last two billed 8721 for $0.0268. Fewer tokens, more money.
     #
-    # The server's `truncation.retention_ratio` is the mechanism that actually
-    # belongs here: it drops history in amortized batches specifically to keep
-    # the cache prefix intact. These two exist for hard bounds on very long
-    # sessions; 0 disables each.
-    #: delete conversation items older than this, 0 to leave it to the server
+    # What changes the answer is TPM. Cached tokens are cheap but they are not
+    # free of the rate limit -- they count against it in full -- so on a long
+    # session with frequent frames the conversation grows until every request
+    # is rejected. sess_movie2 died that way: thirteen consecutive
+    # `rate_limit_exceeded` failures from 10605 s on, at ~2.3k image tokens
+    # added per turn. Against that, pruning is a straight win and the
+    # invalidated prefix is what it costs.
+    #
+    # What gets pruned is what this client generated and would happily generate
+    # again: screenshots (current frame and trail alike) and the per-turn system
+    # nudge. The conversation proper -- what the player said, what the agent
+    # answered -- is never deleted from under the model; the server's
+    # `truncation.retention_ratio` is the mechanism for that, and it drops
+    # history in amortized batches designed to keep the cache prefix intact.
+    #: age at which images and per-turn system notes are deleted, 0 to leave
+    #: the whole question to the server. One cutoff for both, deliberately: they
+    #: are created together and deleting them in the same round costs one cache
+    #: invalidation rather than two.
     prune_after_s: float = 0.0
-    #: how many screenshots stay in the conversation, 0 for unlimited
-    keep_images: int = 0
+    #: Floor between pruning rounds. This is the knob that makes pruning cheap:
+    #: each round invalidates the cached prefix once, so nine items deleted in
+    #: one round cost a ninth of what they cost deleted one per turn. Nothing is
+    #: sent between rounds however stale it gets, so the effective retention is
+    #: `prune_after_s` to `prune_after_s + prune_interval_s`.
+    prune_interval_s: float = 120.0
     #: Hard ceiling per response; audio counts toward it at ~1 token / 50 ms.
     #: A backstop against a rambling response, not a length control -- brevity
     #: is the persona's job. Hitting this truncates mid-word, so it is set well

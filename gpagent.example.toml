@@ -151,14 +151,22 @@ max_image_age_s = 20.0        # never attach a screenshot older than this
 image_on_unprompted = true    # attach frames to remarks, not just replies
 max_output_tokens = 320       # backstop against rambling; hitting it truncates
 
-# Client-side context trimming, both OFF because it was measured and it lost:
-# the API re-bills the whole conversation each turn, so trimming looks like an
-# obvious win, but deleting an item invalidates the prompt-cache prefix behind
-# it and cached input is ~10x cheaper. Keeping every image billed 31008 image
-# tokens for $0.0204; keeping the last two billed 8721 for $0.0268. The
-# server's truncation_retention_ratio is the mechanism that belongs here.
-prune_after_s = 0.0           # 0 leaves it to the server
-keep_images = 0               # 0 for unlimited
+# Client-side pruning, OFF because as a COST measure it was measured and it
+# lost: the API re-bills the whole conversation each turn, so trimming looks
+# like an obvious win, but deleting an item invalidates the prompt-cache prefix
+# behind it and cached input is ~10x cheaper. Keeping every image billed 31008
+# image tokens for $0.0204; keeping the last two billed 8721 for $0.0268.
+#
+# TPM is the reason to turn it on anyway. Cached tokens are cheap but they still
+# count against the rate limit in full, so a long session with frequent frames
+# eventually cannot make a request at all -- see movies.example.toml, which sets
+# both of these. What gets deleted is screenshots (current frame and trail) and
+# the per-turn system nudge, on one shared cutoff so they go in one round. The
+# conversation itself is never touched; truncation_retention_ratio is for that.
+prune_after_s = 0.0           # 0 leaves the whole question to the server
+prune_interval_s = 120.0      # floor between rounds. Each round costs one cache
+                              # invalidation whatever its size, so deleting in
+                              # bulk rarely is the whole point of pruning at all.
 truncation_retention_ratio = 0.8
 
 transcribe_player = true      # readable logs, at a small per-minute cost
