@@ -63,6 +63,16 @@ dedup_threshold = 0.01     # drop frames too similar to the last one SENT
 
 [agent]
 model = "gpt-realtime-2.1-mini"   # -mini for testing; gpt-realtime-2.1 for real
+
+# voice | text. Session-wide, because it IS output_modalities on session.update:
+# in "text" the model writes the remark instead of speaking it, it arrives on
+# response.output_text.* rather than as audio plus a transcript, and it lands on
+# the [hud] overlay (which `commentate --text` turns on for you) instead of the
+# speakers. Nothing about the input side changes -- the player still talks, is
+# still transcribed, and still gets answered. Barge-in stops applying: text on
+# screen is not talking over anyone. Text output is also roughly 10x cheaper per
+# response than the same remark spoken.
+output = "voice"
 # alloy | ash | ballad | cedar | coral | echo | marin | sage | shimmer | verse
 voice = "marin"
 voice_speed = 1.0          # playback rate; server clamps to [0.25, 1.5]
@@ -180,6 +190,10 @@ response_gate_timeout_s = 45.0   # a response that never completes
 # XWayland on a Wayland session, deliberately, because that is mutter's
 # topmost layer and Wayland offers a plain client nothing like it. Drive it on
 # its own with `gpagent hud --demo`.
+#
+# agent.output = "text" turns this on regardless: it is that session's output
+# device. read_cps below is then load-bearing beyond the display -- how long a
+# remark is on screen is how long the speak policy treats it as still standing.
 enabled = false
 
 anchor = "top-right"     # top|bottom + -left|-right, or bare top|bottom to centre

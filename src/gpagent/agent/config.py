@@ -23,6 +23,10 @@ __all__ = ["AgentConfig", "SpeakConfig", "HudConfig"]
 
 ImageDetail = Literal["auto", "low", "high"]
 ReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh"]
+#: Whether the agent is heard or read. Session-wide, not per remark: it is
+#: `output_modalities` on `session.update`, so it decides what the model
+#: generates rather than how one response is presented.
+OutputMode = Literal["voice", "text"]
 #: Which corner (or edge) the toast stack sits in. The vertical half also picks
 #: the growth direction, so the anchored edge never moves as entries arrive.
 HudAnchor = Literal[
@@ -138,6 +142,14 @@ class AgentConfig:
     transcribe_model: str = "gpt-4o-mini-transcribe"
 
     # -- output -----------------------------------------------------------
+    #: Voice or text, for the whole session. This is `output_modalities` on
+    #: `session.update`: in "text" the model writes its remark instead of
+    #: speaking it, and there is no audio to play, no transcript to wait for and
+    #: nothing to talk over. The words land on the HUD (see `HudConfig`), which
+    #: is why they are worth reading at all -- a remark with nowhere to go is
+    #: just a line in the log. Everything on the *input* side is unchanged: the
+    #: player still talks, and is still transcribed.
+    output: OutputMode = "voice"
     #: play to the *default* sink. Component A's echo canceller uses that sink's
     #: monitor as its AEC reference; any other sink and the agent hears itself
     #: and replies to itself.
@@ -156,6 +168,11 @@ class AgentConfig:
     #: reconnect backoff bounds if the socket drops mid-session
     reconnect_min_s: float = 1.0
     reconnect_max_s: float = 30.0
+
+    @property
+    def text_output(self) -> bool:
+        """Read, not heard. The question a dozen places downstream ask."""
+        return self.output == "text"
 
 
 @dataclass

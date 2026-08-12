@@ -19,6 +19,13 @@ Conversation shape, per response:
                                constant, so they live in session.update
 
 Only `reply` sends audio. `react` and `ambient` are the same shape without it.
+
+None of that changes with `agent.output`. What changes is the *answer*: with
+`output = "text"` the session asks for `["text"]` on `session.update`, so the
+model writes the remark instead of speaking it, it arrives on
+`response.output_text.*` rather than as audio deltas plus a transcript, and it
+goes to the HUD instead of the speakers. That is a session-wide choice, not a
+per-turn one -- see `AgentConfig.output`.
 """
 
 from __future__ import annotations
@@ -46,6 +53,7 @@ from ..events import (
 )
 from ..tokens import UsageMeter
 from .context import ContextBuffer, Frame
+from .hud import NullHud, hold_for
 from .persona import instructions, reason_note
 from .playback import NullPlayer
 from .policy import SpeakPolicy
@@ -98,6 +106,7 @@ class CommentaryAgent:
         cfg: CaptureConfig,
         transport,
         player=None,
+        hud=None,
         *,
         clock: Callable[[], float] = time.monotonic,
         log_path: str | Path | None = None,
@@ -106,9 +115,14 @@ class CommentaryAgent:
     ):
         self.cfg = cfg.agent
         self.speak_cfg = cfg.speak
+        self.hud_cfg = cfg.hud
         self.clock = clock
         self.transport = transport
         self.player = player if player is not None else NullPlayer(clock)
+        # Where a text remark lands. Null unless the caller opened a real one:
+        # a session with `output = "text"` and no display still runs, still
+        # logs and still costs money, it just has nowhere to put the words.
+        self.hud = hud if hud is not None else NullHud()
         self.policy = SpeakPolicy(cfg.speak, clock)
         self.context = ContextBuffer(cfg.agent)
         self.meter = UsageMeter(model=cfg.agent.model)
@@ -123,8 +137,10 @@ class CommentaryAgent:
         self._response_started: float | None = None
         self._audio_item_id: str | None = None
         #: False between cancelling a response and starting the next one, so
-        #: in-flight deltas for the cancelled one are not played
-        self._accept_audio = True
+        #: whatever is still in flight for the cancelled one is not played or
+        #: shown. Text needs this as much as audio does: the API emits
+        #: `response.output_text.done` for an interrupted response too.
+        self._accept_output = True
         self._items: list[tuple[float, str]] = []
         self._image_items: list[str] = []
         self._item_seq = 0
@@ -145,7 +161,7 @@ class CommentaryAgent:
         self._response_reason = ""
         self._response_transcript = ""
         self._response_asked_at: float | None = None
-        self._response_first_audio: float | None = None
+        self._response_first_out: float | None = None
         self._response_usage: dict[str, Any] = {}
         self._pump: asyncio.Task | None = None
         self._watchdog: asyncio.Task | None = None
@@ -182,6 +198,7 @@ class CommentaryAgent:
             self._pump = None
         await self.transport.close()
         await self.player.stop()
+        self.hud.close()
         if self._log_fh is not None:
             self._log_fh.close()
             self._log_fh = None
@@ -202,26 +219,32 @@ class CommentaryAgent:
                 # such parameter and is handled in the instructions.
                 transcription["language"] = self.cfg.language
             audio_input["transcription"] = transcription
+        # The one line that decides whether this session is heard or read. It
+        # is not a rendering choice: it changes what the model generates, so it
+        # can only be made once, here, for the whole session.
+        text_out = self.cfg.text_output
+        audio: dict[str, Any] = {"input": audio_input}
+        if not text_out:
+            audio["output"] = {
+                # `rate` is required here even though the SDK's TypedDict
+                # marks it optional and the docs example omits it: the
+                # server rejects the session without it.
+                "format": {"type": "audio/pcm", "rate": SAMPLE_RATE},
+                "voice": self.cfg.voice,
+                "speed": self.cfg.voice_speed,
+            }
         session: dict[str, Any] = {
             "type": "realtime",
-            "output_modalities": ["audio"],
+            "output_modalities": ["text"] if text_out else ["audio"],
             "instructions": instructions(self.cfg),
             "max_output_tokens": self.cfg.max_output_tokens,
             "truncation": {
                 "type": "retention_ratio",
                 "retention_ratio": self.cfg.truncation_retention_ratio,
             },
-            "audio": {
-                "input": audio_input,
-                "output": {
-                    # `rate` is required here even though the SDK's TypedDict
-                    # marks it optional and the docs example omits it: the
-                    # server rejects the session without it.
-                    "format": {"type": "audio/pcm", "rate": SAMPLE_RATE},
-                    "voice": self.cfg.voice,
-                    "speed": self.cfg.voice_speed,
-                },
-            },
+            # Input audio stays either way: a text session still listens, and
+            # still transcribes what it hears for the log.
+            "audio": audio,
         }
         if self.cfg.reasoning_effort is not None:
             # Non-reasoning models (gpt-realtime, gpt-realtime-1.5) reject this
@@ -279,7 +302,15 @@ class CommentaryAgent:
         Not the same as "a response is in flight": offline the response
         completes instantly but the sentence it produced still occupies time,
         and that is precisely the window barge-in has to cover.
+
+        A text session has no such window. The remark is on screen for as long
+        as it takes to read, but it is not *occupying* anything -- a second one
+        stacks under it, and cutting the first one off would be deleting words
+        the player may be halfway through. So here the question is only whether
+        the model is still writing.
         """
+        if self.cfg.text_output:
+            return self._response_active
         return self._response_active or self.player.timer.remaining_ms(now) > 0
 
     def _audible(self, now: float) -> bool:
@@ -292,7 +323,14 @@ class CommentaryAgent:
         answers to none of their questions; ten of sixty-six responses were
         generated, billed and discarded without a sound. Let it through -- the
         new utterance is already queued and folds into the next turn.
+
+        Text is never audible in that sense, and that is the whole answer for a
+        text session: nobody is being talked over, so nothing needs cutting off.
+        The player's utterance still lands and still gets answered on the next
+        turn -- it just does not cost a response to make room for itself.
         """
+        if self.cfg.text_output:
+            return False
         return self.player.timer.played_ms(now) > 0
 
     async def tick(self, now: float | None = None) -> None:
@@ -317,7 +355,7 @@ class CommentaryAgent:
         # A new utterance starts here, so nothing the last one left on the
         # playback clock belongs to it. See `PlaybackTimer.discard`.
         self.player.discard()
-        self._accept_audio = True
+        self._accept_output = True
         self._audio_item_id = None
         with_image = self.cfg.image_on_unprompted or reason == "reply"
         ctx = self.context.take(now, with_image=with_image)
@@ -575,7 +613,7 @@ class CommentaryAgent:
         self._image_items.clear()
         self._audio_item_id = None
         self.player.flush(now)
-        self._accept_audio = True
+        self._accept_output = True
         self._reset_response_record()
         if self._response_active:
             # The gate is absolute while set, and nothing is ever going to
@@ -592,7 +630,7 @@ class CommentaryAgent:
         now = self.clock()
 
         if kind == "response.output_audio.delta":
-            if not self._accept_audio:
+            if not self._accept_output:
                 # Deltas already in flight when we cancelled. Playing them would
                 # emit a fragment of the sentence we just cut off, a second
                 # after cutting it off.
@@ -601,8 +639,8 @@ class CommentaryAgent:
             delta = event.get("delta")
             if delta:
                 pcm = base64.b64decode(delta)
-                if self._response_first_audio is None:
-                    self._response_first_audio = now
+                if self._response_first_out is None:
+                    self._response_first_out = now
                 if self._recorder is not None:
                     self._response_audio += pcm
                 self.player.push(pcm)
@@ -615,6 +653,25 @@ class CommentaryAgent:
         elif kind == "response.output_audio_transcript.done":
             self._response_transcript = event.get("transcript") or ""
             self._emit(Line(now, "say", self._response_transcript))
+        elif kind == "response.output_text.delta":
+            # Nothing is shown per delta -- half a remark appearing and then
+            # growing is a worse thing to catch out of the corner of an eye
+            # than one that arrives whole. This is here for the latency
+            # measurement, which is "when did the answer start", not "when was
+            # it finished".
+            first = self._accept_output and event.get("delta")
+            if first and self._response_first_out is None:
+                self._response_first_out = now
+        elif kind == "response.output_text.done":
+            # Also emitted for an interrupted or cancelled response, which is
+            # exactly what `_accept_output` is for: showing it would put a
+            # remark on screen that the session already decided against.
+            if not self._accept_output:
+                return
+            self._response_transcript = event.get("text") or ""
+            if self._response_transcript:
+                self._emit(Line(now, "say", self._response_transcript))
+                self.hud.show(self._response_transcript)
         elif kind == "conversation.item.input_audio_transcription.completed":
             self._emit(Line(now, "heard", event.get("transcript") or ""))
         elif kind == "response.done":
@@ -635,7 +692,13 @@ class CommentaryAgent:
         self._response_usage = response.get("usage") or {}
         self.meter.add(response.get("usage"))
         spoken_ms = await self.player.drain()
-        if spoken_ms <= 0:
+        if self.cfg.text_output:
+            # What a written remark "takes" is how long it is on screen, which
+            # is reading time -- the same number the HUD holds it for. The
+            # quiet floor is then measured from when the player is done with
+            # it, exactly as it is measured from the end of a sentence.
+            spoken_ms = hold_for(self._response_transcript, self.hud_cfg) * 1000.0
+        elif spoken_ms <= 0:
             # Dry runs and --no-playback never push audio; take the duration the
             # API reported instead, so the cooldown still reflects a real pause.
             details = (response.get("usage") or {}).get("output_token_details") or {}
@@ -654,7 +717,13 @@ class CommentaryAgent:
         if status and status != "completed" and why != "client_cancelled":
             self._emit(Line(now, "note", f"response {status}" + (f": {why}" if why else "")))
         end = now
-        if not self.player.realtime:
+        if self.cfg.text_output:
+            # The remark is up now and done being read later, so the floor
+            # starts later. Nothing goes on the playback clock: there is no
+            # audio to model, and `_speaking` deliberately does not consult it
+            # in a text session.
+            end = now + spoken_ms / 1000.0
+        elif not self.player.realtime:
             # Nothing waited for the audio, so the sentence ends in the future.
             # Hand the duration to the player's timer as well, so the agent can
             # still tell it is mid-sentence when the player interrupts.
@@ -687,7 +756,7 @@ class CommentaryAgent:
                     "audio_end_ms": int(heard_ms),
                 }
             )
-        self._accept_audio = False
+        self._accept_output = False
         self._response_active = False
         self._response_started = None
         self._audio_item_id = None
@@ -709,15 +778,19 @@ class CommentaryAgent:
         pcm = bytes(self._response_audio)
         dur_ms = int(len(pcm) / 2 / (SAMPLE_RATE / 1000.0))
         latency = (
-            int((self._response_first_audio - self._response_asked_at) * 1000)
-            if self._response_first_audio is not None
+            int((self._response_first_out - self._response_asked_at) * 1000)
+            if self._response_first_out is not None
             else 0
         )
         event = AgentResponse(
             data=pcm or None,
             reason=self._response_reason,
             transcript=self._response_transcript,
-            dur_ms=int(heard_ms) if cut and heard_ms else dur_ms,
+            # A text remark has no blob and no duration: `transcript` is the
+            # whole of it, and `modality` is how a reader knows that is not a
+            # recording with its audio missing.
+            modality="text" if self.cfg.text_output else "audio",
+            dur_ms=0 if self.cfg.text_output else (int(heard_ms) if cut and heard_ms else dur_ms),
             sample_rate=SAMPLE_RATE,
             latency_ms=max(0, latency),
             cut=cut,
@@ -733,7 +806,7 @@ class CommentaryAgent:
         self._response_audio = bytearray()
         self._response_transcript = ""
         self._response_asked_at = None
-        self._response_first_audio = None
+        self._response_first_out = None
         self._response_usage = {}
 
     def _arm_watchdog(self) -> None:
@@ -798,6 +871,7 @@ class CommentaryAgent:
 
     def report(self) -> dict[str, Any]:
         return {
+            "output": self.cfg.output,
             "responses": self.spoke,
             "by_reason": dict(self.policy.counts),
             "declined": dict(self.policy.declined),

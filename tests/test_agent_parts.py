@@ -603,6 +603,24 @@ class TestSdkPayloadDrift:
             transformed = asyncio.run(async_maybe_transform(payload, RealtimeClientEventParam))
             assert transformed == payload, f"SDK dropped fields from {payload['type']}"
 
+    def test_a_text_session_survives_the_transform(self):
+        """`output_modalities` is the whole feature; a dropped one is a mute HUD."""
+        from openai._utils import async_maybe_transform
+        from openai.types.realtime.realtime_client_event_param import RealtimeClientEventParam
+
+        from gpagent.agent.playback import NullPlayer
+        from gpagent.agent.session import CommentaryAgent
+        from gpagent.agent.transport import FakeTransport
+        from gpagent.config import CaptureConfig
+
+        cfg = CaptureConfig()
+        cfg.agent.output = "text"
+        agent = CommentaryAgent(cfg, FakeTransport(), NullPlayer())
+        payload = agent.session_update()
+        assert payload["session"]["output_modalities"] == ["text"]
+        transformed = asyncio.run(async_maybe_transform(payload, RealtimeClientEventParam))
+        assert transformed == payload, "SDK dropped fields from a text session.update"
+
     def test_reasoning_effort_survives_the_transform(self):
         from openai._utils import async_maybe_transform
         from openai.types.realtime.realtime_client_event_param import RealtimeClientEventParam
@@ -666,4 +684,21 @@ class TestRecordingTransport:
                 break
         details = done["response"]["usage"]["input_token_details"]
         assert details["image_tokens"] == 85, "detail=low must be priced as low"
+        await transport.close()
+
+    async def test_a_text_dry_run_is_answered_in_text(self):
+        """A dry run must exercise the path the real session will take."""
+        transport = RecordingTransport(text=True)
+        await transport.connect()
+        await transport.send({"type": "response.create", "response": {}})
+        received = []
+        async for event in transport:
+            received.append(event)
+            if event["type"] == "response.done":
+                break
+        kinds = [e["type"] for e in received]
+        assert "response.output_text.done" in kinds
+        assert "response.output_audio_transcript.done" not in kinds
+        out = received[-1]["response"]["usage"]["output_token_details"]
+        assert out["text_tokens"] > 0 and out["audio_tokens"] == 0
         await transport.close()

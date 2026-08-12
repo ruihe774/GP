@@ -173,10 +173,19 @@ class RecordingTransport(_QueueTransport):
 
     #: what a short spoken reply costs in output audio tokens (~2.5 s at 50 ms/tok)
     ASSUMED_REPLY_TOKENS = 50
+    #: ...and what the same remark costs written down, which is where the two
+    #: modes stop being comparable: text output is roughly an order of
+    #: magnitude cheaper per response than speaking the same words.
+    ASSUMED_TEXT_TOKENS = 20
 
-    def __init__(self, path: str | Path | None = None):
+    DRY_REMARK = "(dry run: no model was asked)"
+
+    def __init__(self, path: str | Path | None = None, *, text: bool = False):
         super().__init__()
         self.path = Path(path) if path else None
+        #: answer the way the session asked to be answered -- a text session
+        #: that got audio events back would exercise a path it will never take
+        self.text = text
         self._fh: IO[str] | None = None
         self._pending_input = _InputTally()
         self._responses = 0
@@ -232,13 +241,24 @@ class RecordingTransport(_QueueTransport):
                 "item": {"id": item_id, "type": "message", "role": "assistant"},
             }
         )
-        self.feed(
-            {
-                "type": "response.output_audio_transcript.done",
-                "item_id": item_id,
-                "transcript": "(dry run: no model was asked)",
-            }
-        )
+        if self.text:
+            self.feed(
+                {
+                    "type": "response.output_text.done",
+                    "item_id": item_id,
+                    "text": self.DRY_REMARK,
+                }
+            )
+        else:
+            self.feed(
+                {
+                    "type": "response.output_audio_transcript.done",
+                    "item_id": item_id,
+                    "transcript": self.DRY_REMARK,
+                }
+            )
+        out_audio = 0 if self.text else self.ASSUMED_REPLY_TOKENS
+        out_text = self.ASSUMED_TEXT_TOKENS if self.text else 0
         self.feed(
             {
                 "type": "response.done",
@@ -253,10 +273,10 @@ class RecordingTransport(_QueueTransport):
                             "image_tokens": tally.image,
                             "cached_tokens": 0,
                         },
-                        "output_tokens": self.ASSUMED_REPLY_TOKENS,
+                        "output_tokens": out_audio + out_text,
                         "output_token_details": {
-                            "text_tokens": 0,
-                            "audio_tokens": self.ASSUMED_REPLY_TOKENS,
+                            "text_tokens": out_text,
+                            "audio_tokens": out_audio,
                         },
                     },
                 },

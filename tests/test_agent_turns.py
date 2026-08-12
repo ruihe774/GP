@@ -12,6 +12,7 @@ import base64
 
 import pytest
 
+from gpagent.agent.hud import NullHud
 from gpagent.agent.playback import NullPlayer
 from gpagent.agent.session import CommentaryAgent, ReplayClock
 from gpagent.agent.transport import FakeTransport
@@ -831,3 +832,188 @@ class TestUsageIsRecorded:
         assert agent.meter.responses == 1
         assert agent.meter.out_audio == 120
         assert agent.report()["usage"]["spoken_s"] == 6.0
+
+
+class TestTextOutput:
+    """`agent.output = "text"`: the model writes the remark instead of saying it.
+
+    Session-wide, not a rendering choice -- what changes is `output_modalities`
+    on `session.update`, and everything downstream follows from the API putting
+    the words on `response.output_text.*` instead of audio plus a transcript.
+    """
+
+    def text_agent(self, recorder=None, **agent_kwargs):
+        clock = ReplayClock(100.0)
+        cfg = make_config(output="text", **agent_kwargs)
+        agent = CommentaryAgent(
+            cfg, FakeTransport(), NullPlayer(clock), NullHud(),
+            clock=clock, recorder=recorder,
+        )
+        agent._clock_obj = clock
+        return agent
+
+    async def write(self, agent, text, *, item_id="a1", delay=0.0):
+        """The server's side of one written response, through to `response.done`."""
+        await agent.on_server_event(
+            {"type": "response.output_item.added", "item": {"id": item_id}}
+        )
+        agent._clock_obj.set(agent._clock_obj.now + delay)
+        await agent.on_server_event(
+            {"type": "response.output_text.delta", "item_id": item_id, "delta": text[:4]}
+        )
+        await agent.on_server_event(
+            {"type": "response.output_text.done", "item_id": item_id, "text": text}
+        )
+        await agent.on_server_event(
+            {
+                "type": "response.done",
+                "response": {
+                    "status": "completed",
+                    "usage": {
+                        "input_tokens": 100,
+                        "input_token_details": {"text_tokens": 100},
+                        "output_tokens": 12,
+                        "output_token_details": {"text_tokens": 12, "audio_tokens": 0},
+                    },
+                },
+            }
+        )
+
+    # -- the session -------------------------------------------------------
+
+    def test_the_session_asks_for_text(self):
+        session = self.text_agent().session_update()["session"]
+        assert session["output_modalities"] == ["text"]
+
+    def test_a_voice_session_still_asks_for_audio(self, agent):
+        assert agent.session_update()["session"]["output_modalities"] == ["audio"]
+
+    def test_no_voice_is_configured_for_a_session_that_never_speaks(self):
+        session = self.text_agent().session_update()["session"]
+        assert "output" not in session["audio"]
+
+    def test_the_player_is_still_listened_to_and_transcribed(self):
+        audio_in = self.text_agent().session_update()["session"]["audio"]["input"]
+        assert audio_in["format"] == {"type": "audio/pcm", "rate": 24000}
+        assert audio_in["transcription"]["model"]
+
+    def test_the_persona_says_it_is_being_read(self):
+        instructions = self.text_agent().session_update()["session"]["instructions"]
+        assert "not speaking out loud" in instructions
+        assert "sitting on the couch" in instructions, "the persona itself is unchanged"
+
+    def test_a_voice_session_is_told_none_of_that(self, agent):
+        assert "not speaking out loud" not in agent.session_update()["session"]["instructions"]
+
+    # -- the words ---------------------------------------------------------
+
+    async def test_the_remark_reaches_the_hud(self):
+        agent = self.text_agent()
+        await agent.handle(frame(score=1.0), now=100.0)
+        await self.write(agent, "that barrel again")
+        assert agent.hud.shown == ["that barrel again"]
+
+    async def test_it_is_logged_as_something_said(self):
+        agent = self.text_agent()
+        await agent.handle(frame(score=1.0), now=100.0)
+        await self.write(agent, "that barrel again")
+        said = [line for line in agent.lines if line.kind == "say"]
+        assert [line.text for line in said] == ["that barrel again"]
+
+    async def test_a_turn_is_sent_the_same_way_it_always_was(self):
+        agent = self.text_agent()
+        await agent.handle(pad("tapped A x3"), now=100.0)
+        await agent.handle(frame(), now=100.5)
+        await agent.handle(speech(dur_ms=1000), now=102.0)
+        assert [e["type"] for e in agent.transport.sent] == [
+            "conversation.item.create",
+            "input_audio_buffer.append",
+            "input_audio_buffer.commit",
+            "conversation.item.create",
+            "response.create",
+        ]
+
+    async def test_a_cancelled_remark_is_never_shown(self):
+        """`response.output_text.done` is emitted for interrupted responses too."""
+        agent = self.text_agent()
+        await agent.handle(speech(), now=100.0)
+        await agent._cancel_response(100.5, why="test")
+        await self.write(agent, "half a thought")
+        assert agent.hud.shown == []
+
+    # -- what a written remark costs the session ---------------------------
+
+    async def test_nobody_is_talked_over_so_nothing_is_cancelled(self):
+        """Barge-in exists to stop the agent speaking over someone; text cannot."""
+        agent = self.text_agent()
+        await agent.handle(frame(score=1.0), now=100.0)
+        await agent.on_server_event(
+            {"type": "response.output_item.added", "item": {"id": "a1"}}
+        )
+        agent._clock_obj.set(100.5)
+        await agent.on_speech_start(now=100.5)
+        assert agent.transport.sent_of_type("response.cancel") == []
+
+        await self.write(agent, "still finishes the thought")
+        assert agent.hud.shown == ["still finishes the thought"]
+
+    async def test_the_reply_still_lands_after_it(self):
+        agent = self.text_agent()
+        await agent.handle(frame(score=1.0), now=100.0)
+        await self.write(agent, "hm")
+        agent._clock_obj.set(140.0)
+        await agent.handle(speech(dur_ms=800), now=140.0)
+        assert len(agent.transport.sent_of_type("response.create")) == 2
+
+    async def test_a_remark_is_still_standing_while_it_is_being_read(self):
+        """Reading time is what a written remark occupies, as speech occupies air.
+
+        The visible consequence is the reply beat: it is measured from the end
+        of the last response, and for text that end is when the player is done
+        reading, not when the model finished writing.
+        """
+        from gpagent.agent.hud import hold_for
+
+        agent = self.text_agent()
+        remark = "that is the third time that exact barrel has ended a run " * 3
+        await agent.handle(frame(score=1.0), now=100.0)
+        await self.write(agent, remark)
+
+        hold = hold_for(remark, agent.hud_cfg)
+        assert hold > agent.hud_cfg.hold_min_s, "the fixture must be worth reading"
+
+        # Still on screen: the answer waits rather than landing on top of it.
+        asked_at = 100.0 + hold - 2.0
+        agent._clock_obj.set(asked_at)
+        await agent.handle(speech(dur_ms=800), now=asked_at)
+        assert len(agent.transport.sent_of_type("response.create")) == 1
+        assert agent.policy.declined.get("reply_spacing") == 1
+
+        # Read, plus the beat: the question that stayed pending gets answered.
+        answered_at = 100.0 + hold + agent.speak_cfg.reply_min_gap_s + 0.5
+        agent._clock_obj.set(answered_at)
+        await agent.tick(answered_at)
+        assert len(agent.transport.sent_of_type("response.create")) == 2
+
+    # -- the recording -----------------------------------------------------
+
+    async def test_the_remark_is_recorded_as_text(self):
+        recorded = []
+        agent = self.text_agent(recorder=recorded.append)
+        await agent.handle(frame(score=1.0), now=100.0)
+        await self.write(agent, "that barrel again", delay=0.4)
+
+        said = [e for e in recorded if isinstance(e, AgentResponse)]
+        assert len(said) == 1
+        assert said[0].modality == "text"
+        assert said[0].transcript == "that barrel again"
+        assert said[0].data is None and said[0].dur_ms == 0
+        assert said[0].latency_ms > 0, "measured from the first delta, not the last"
+
+    async def test_text_output_tokens_are_metered(self):
+        agent = self.text_agent()
+        await agent.handle(frame(score=1.0), now=100.0)
+        await self.write(agent, "that barrel again")
+        assert agent.meter.out_text == 12
+        assert agent.meter.out_audio == 0
+        assert agent.report()["output"] == "text"

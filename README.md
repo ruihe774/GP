@@ -48,6 +48,7 @@ uv run gpagent devices          # lists gamepad, mic, screen — shows if they'r
 ```bash
 # ensure you have put OpenAI API key in .env
 uv run gpagent commentate                    # capture and comment in real time
+uv run gpagent commentate --text             # ...on screen instead of out loud
 ```
 
 On first run, a dialog asks for screen permission.
@@ -63,6 +64,8 @@ You can pass `--pick-screen` to show the dialog in subsequent runs.
 | `inspect NAME` | View the captured session timeline, stats, and estimated cost |
 | `commentate --replay NAME` | Run the agent over a recorded session |
 | `commentate` | Capture and comment live in one shot |
+| `commentate --text` | The same, but remarks are shown on screen instead of spoken |
+| `hud --demo` | Try the on-screen overlay on its own |
 
 ## Customization
 
@@ -76,6 +79,7 @@ E.g.:
 [agent]
 model = "gpt-realtime-2.1"  # use a stronger model
 voice = "cedar"             # change the voice
+output = "text"             # or read it in the corner of the screen instead
 ```
 
 ## Recording Conversations
@@ -116,6 +120,6 @@ BTN_WEST = "Y"
 ## Cost
 
 GP uses OpenAI's realtime API endpoint. The models `gpt-realtime-2.1` and `gpt-realtime-2.1-mini` can be used.
-Each minute of commentary costs roughly $0.015–$0.02 (at current OpenAI prices). Most of that is the agent's voice output, not the video or audio input.
+Each minute of commentary costs roughly $0.015–$0.02 (at current OpenAI prices). Most of that is the agent's voice output, not the video or audio input — which is why `--text` is several times cheaper: nothing is spoken, so that line disappears.
 Inputs are throttled at the client side so frequent requests are avoided.
 Check OpenAI's doc and API dashboard for detailed usage.

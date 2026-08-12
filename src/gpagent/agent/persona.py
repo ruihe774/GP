@@ -20,6 +20,7 @@ from .config import AgentConfig
 
 __all__ = [
     "DEFAULT_PERSONA",
+    "TEXT_OUTPUT_NOTE",
     "RESPONSE_INSTRUCTIONS",
     "LANGUAGE_NAMES",
     "resolve_persona",
@@ -66,6 +67,18 @@ How you talk:
 """
 
 
+#: Appended when the session outputs text instead of speech. A remark that is
+#: read has different constraints from one that is heard: it lands in a corner
+#: of a screen the player is busy looking elsewhere on, it does not fade as it
+#: is said, and nothing renders markdown -- asterisks arrive as asterisks.
+TEXT_OUTPUT_NOTE = """
+You are not speaking out loud. What you say is shown as a line of text in the
+corner of their screen, read at a glance while they are playing. Keep it to one
+short line -- shorter than you would say it. Plain words only: no markdown, no
+asterisks, no emoji, no stage directions, and never refer to the text or the
+screen it is on."""
+
+
 RESPONSE_INSTRUCTIONS = {
     "reply": "They just said something to you. Answer it, briefly.",
     "react": (
@@ -94,8 +107,15 @@ def language_name(code: str) -> str:
 
 
 def instructions(cfg: AgentConfig) -> str:
-    """The persona, plus the language directive if one was asked for."""
+    """The persona, plus whatever the session's shape adds to it.
+
+    Both additions are session-wide constants, which is why they belong here
+    rather than on any one turn: this string is sent once, in `session.update`,
+    and keys the cached prefix of every request after it.
+    """
     text = resolve_persona(cfg)
+    if cfg.text_output:
+        text += TEXT_OUTPUT_NOTE
     if cfg.language:
         name = language_name(cfg.language)
         text += (

@@ -173,6 +173,10 @@ class AgentResponse(Event):
     #: which speaking rule fired: reply | react | ambient
     reason: str = ""
     transcript: str = ""
+    #: how the remark reached the player: audio | text. A text session has no
+    #: blob and no duration -- `transcript` is not a transcript of anything, it
+    #: is the remark itself.
+    modality: str = "audio"
     dur_ms: int = 0
     sample_rate: int = 24000
     encoding: str = "pcm_s16le"

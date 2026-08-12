@@ -671,7 +671,10 @@ def cmd_inspect(args) -> int:
             said_ms += event.dur_ms
             mark = " CUT" if event.cut else ""
             text = event.transcript or "(no transcript)"
-            line = f"say  [{event.reason}{mark}] {text}  ({event.dur_ms} ms)"
+            # A text remark has no duration to report -- it was written, not
+            # spoken, and "(0 ms)" would read as a response that said nothing.
+            tail = "" if event.modality == "text" else f"  ({event.dur_ms} ms)"
+            line = f"say  [{event.reason}{mark}] {text}{tail}"
         elif isinstance(event, SessionEnd):
             duration = max(duration, event.duration_s)
             line = f"session end ({event.duration_s:.1f}s)"
@@ -1051,6 +1054,13 @@ def cmd_commentate(args) -> int:
         cfg.agent.volume = args.volume
     if args.language:
         cfg.agent.language = args.language
+    if args.text_output is not None:
+        cfg.agent.output = args.text_output
+    if cfg.agent.text_output:
+        # Nothing will be spoken, so there is nothing to open a sink for, and
+        # the HUD is the only place the words can go.
+        cfg.agent.playback = False
+        cfg.hud.enabled = True
     if args.no_playback or args.dry_run:
         cfg.agent.playback = False
     if args.replay is None and args.replay_speed == 0.0:
@@ -1059,6 +1069,7 @@ def cmd_commentate(args) -> int:
 
 
 async def _commentate(cfg: CaptureConfig, args) -> int:
+    from .agent.hud import make_hud
     from .agent.playback import make_player
     from .agent.session import CommentaryAgent, ReplayClock, drive_from_bus, drive_from_session
     from .agent.transport import OpenAITransport, RecordingTransport, Transport
@@ -1069,7 +1080,7 @@ async def _commentate(cfg: CaptureConfig, args) -> int:
 
     transport: Transport
     if args.dry_run:
-        transport = RecordingTransport()
+        transport = RecordingTransport(text=cfg.agent.text_output)
     else:
         from .agent.env import MissingAPIKey, load_api_key
 
@@ -1085,6 +1096,10 @@ async def _commentate(cfg: CaptureConfig, args) -> int:
         sink=cfg.agent.audio_sink,
         volume=cfg.agent.volume,
     )
+    # A text session opens the overlay here for the same reason it opens the
+    # sink for a spoken one: it is the output device. `make_hud` degrades to a
+    # null one when there is no display, which keeps a headless replay running.
+    hud = make_hud(cfg.hud) if cfg.agent.text_output else None
 
     # One directory holding both halves of the conversation: what was captured
     # and what the agent said back, in one ordered stream with the audio beside
@@ -1111,6 +1126,7 @@ async def _commentate(cfg: CaptureConfig, args) -> int:
         cfg,
         transport,
         player,
+        hud,
         clock=clock or time.monotonic,
         log_path=(out_dir / "agent.jsonl") if out_dir else None,
         on_line=None if args.quiet else _print_line,
@@ -1122,7 +1138,11 @@ async def _commentate(cfg: CaptureConfig, args) -> int:
     print(f"commentating: {source} -> {mode}")
     if args.replay and isinstance(_read_manifest(Path(args.replay)).get("config"), dict):
         print(f"  using recorded config from {args.replay} (pass -c/--set/flags to override)")
-    if not args.dry_run and not cfg.agent.playback:
+    if hud is not None:
+        print(f"  text output -> hud: {hud.name} ({cfg.hud.anchor} of {cfg.hud.monitor})")
+        if hud.name == "null":
+            print("  nothing will appear on screen: no X display, or the window would not open")
+    elif not args.dry_run and not cfg.agent.playback:
         print("(playback disabled: nothing will come out of the speakers)")
 
     await agent.start()
@@ -1231,7 +1251,10 @@ def _print_agent_report(agent, args, out_dir: Path | None) -> None:
     if report["frame_age_s"]:
         age = report["frame_age_s"]
         print(f"  frame age       {age['mean']}s mean, {age['max']}s worst at send time")
-    print(f"  spoke           {usage['spoken_s']}s")
+    if report.get("output") == "text":
+        print(f"  wrote           {len(agent.hud.shown)} remarks to the {agent.hud.name} hud")
+    else:
+        print(f"  spoke           {usage['spoken_s']}s")
 
     tok = usage["tokens"]
     cost = usage["cost"]
@@ -1429,6 +1452,21 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         metavar="N",
         help="earlier low-detail frames to send with each response (0 disables)",
+    )
+    commentate.add_argument(
+        "--text",
+        dest="text_output",
+        action="store_const",
+        const="text",
+        default=None,
+        help="read, not heard: the model writes each remark and it goes on the HUD",
+    )
+    commentate.add_argument(
+        "--no-text",
+        dest="text_output",
+        action="store_const",
+        const="voice",
+        help="speak, overriding agent.output from the config",
     )
     commentate.add_argument(
         "--no-playback", action="store_true", help="do not open the audio sink"

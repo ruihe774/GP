@@ -101,3 +101,39 @@ def test_it_answers_a_spoken_question_with_a_frame_attached(api_key):
     assert said[0].text.strip(), "the model said nothing at all"
     assert meter.out_audio > 0, "no audio tokens billed -- it did not speak"
     assert meter.in_image > 0, "the frame was not counted as image input"
+
+
+def test_a_text_session_writes_its_remark_instead_of_speaking_it(api_key):
+    """The one thing no recording can stand in for.
+
+    Every session on disk was captured with `output_modalities: ["audio"]`, so
+    replaying one exercises the inputs of a text session and none of its
+    output. Only the server can say whether it accepts `["text"]` and answers
+    on `response.output_text.*`.
+    """
+    from gpagent.events import ScreenFrame, SpeechSegment
+    from gpagent.sinks.jsonl import read_session
+
+    if not SESS5.exists():
+        pytest.skip("sess5 recording is not checked in")
+    events = list(read_session(SESS5, load_blobs=True))
+    speech = next(e for e in events if isinstance(e, SpeechSegment) and e.data)
+    frame = next(e for e in events if isinstance(e, ScreenFrame) and e.data)
+
+    async def run():
+        agent, clock = await _open(api_key, output="text")
+        try:
+            clock.set(1.0)
+            await agent.handle(frame, now=1.0)
+            await agent.handle(speech, now=2.0)
+            said = await _wait_for(agent, {"say", "error"})
+            return said, agent.meter, list(agent.hud.shown)
+        finally:
+            await agent.close()
+
+    said, meter, shown = asyncio.run(run())
+    assert said[0].kind == "say", f"expected a written remark, got {said[0].text}"
+    assert said[0].text.strip(), "the model wrote nothing at all"
+    assert shown == [said[0].text], "the remark must reach the hud, not just the log"
+    assert meter.out_text > 0, "no text tokens billed -- it did not write"
+    assert meter.out_audio == 0, "a text session must not be billed for speech"
