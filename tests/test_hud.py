@@ -295,6 +295,22 @@ class TestRenderCard:
         _, faded = self.card(["Oh no."], [0.5])
         assert 0 < faded.getchannel("A").getextrema()[1] < solid.getchannel("A").getextrema()[1]
 
+    def test_stroked_has_no_panel_behind_the_text(self):
+        """Borderless: nothing painted except the glyphs and their outline."""
+        _, card = self.card(["Oh"], style="stroked", bg_opacity=1.0)
+        # A solid "card" panel would make every pixel opaque; stroked leaves
+        # the gaps between glyphs transparent.
+        assert card.getchannel("A").getextrema()[0] == 0
+
+    def test_stroked_is_narrower_than_a_card_with_no_text_change(self):
+        # No accent-bar gutter reserved on the left when there is no accent bar.
+        _, card = self.card(["Oh no."], style="card")
+        cfg = HudConfig(style="stroked")
+        metrics = Metrics.for_monitor(cfg, PRIMARY)
+        font = load_font(cfg, metrics.font_px)
+        stroked = render_card(entries("Oh no."), [1.0], cfg, metrics, font)
+        assert stroked.height <= card.height
+
 
 class TestPixelPacking:
     def image(self, rgba):

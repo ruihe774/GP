@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-__all__ = ["AgentConfig", "SpeakConfig", "HudConfig"]
+__all__ = ["AgentConfig", "SpeakConfig", "HudConfig", "HudAnchor", "HudStyle"]
 
 ImageDetail = Literal["auto", "low", "high"]
 ReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh"]
@@ -32,6 +32,10 @@ OutputMode = Literal["voice", "text"]
 HudAnchor = Literal[
     "top-right", "top-left", "top", "bottom-right", "bottom-left", "bottom"
 ]
+#: How a remark is rendered. "card" is the panel with an accent bar and rules
+#: between entries; "stroked" drops the panel entirely and outlines each glyph
+#: instead, for a game whose own HUD a translucent box would compete with.
+HudStyle = Literal["card", "stroked"]
 
 
 @dataclass
@@ -239,13 +243,23 @@ class HudConfig:
     #: fade-out at the end of an entry's hold; 0 disables the animation
     fade_ms: int = 250
 
+    # -- style ------------------------------------------------------------
+    #: "card" draws the panel below; "stroked" is borderless -- no panel, no
+    #: accent bar, no rules between entries -- and relies on an outline
+    #: around each glyph for legibility over whatever the game is showing.
+    style: HudStyle = "card"
+    #: outline width for "stroked", in design px. Ignored by "card", which
+    #: uses a hairline drop shadow instead.
+    stroke_width_px: int = 2
+
     # -- colour -----------------------------------------------------------
     bg_color: str = "#12141a"
     #: card opacity. Real translucency, from a 32-bit ARGB visual composited by
-    #: the compositor -- not a screenshot of what is behind.
+    #: the compositor -- not a screenshot of what is behind. Also the stroke
+    #: colour in "stroked", where there is no panel for it to paint.
     bg_opacity: float = 0.82
     fg_color: str = "#f2f4f8"
-    #: the bar marking the newest entry, the one worth reading first
+    #: the bar marking the newest entry, the one worth reading first ("card" only)
     accent_color: str = "#6fd3ff"
     #: alpha multiplier for everything that is not the newest entry
     dim_older: float = 0.55

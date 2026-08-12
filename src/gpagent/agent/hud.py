@@ -217,6 +217,7 @@ class Metrics:
     accent_px: int
     rule_px: int
     shadow_px: int
+    stroke_px: int
 
     @classmethod
     def for_monitor(cls, cfg: HudConfig, monitor: Monitor) -> Metrics:
@@ -243,6 +244,7 @@ class Metrics:
             accent_px=px(3, 1),
             rule_px=max(1, px(1)),
             shadow_px=max(1, px(1)),
+            stroke_px=px(cfg.stroke_width_px, 1),
         )
 
 
@@ -383,28 +385,37 @@ def render_card(
     the card: `ImageDraw` *replaces* alpha instead of blending it, so a
     half-transparent glyph drawn directly would punch a hole through the panel
     behind it.
+
+    `cfg.style == "stroked"` skips the panel, accent bar and rules entirely --
+    there is no card, just text -- and outlines each glyph in `bg_color`
+    instead of a drop shadow, since a shadow reads as a shadow only against a
+    panel and disappears into an arbitrary game frame.
     """
+    bordered = cfg.style == "card"
     pad, line_px = metrics.pad, metrics.line_px
-    text_left = pad + metrics.accent_px + pad
+    text_left = pad + (metrics.accent_px + pad if bordered else 0)
     text_width = max(1, metrics.width - text_left - pad)
     blocks = [wrap_text(e.text, font, text_width) for e in entries]
     heights = [len(lines) * line_px + 2 * pad for lines in blocks]
-    height = sum(heights) + metrics.rule_px * max(0, len(entries) - 1)
+    rule_gap = metrics.rule_px if bordered else 0
+    height = sum(heights) + rule_gap * max(0, len(entries) - 1)
     card = Image.new("RGBA", (metrics.width, max(1, height)), (0, 0, 0, 0))
     if not entries:
         return card
 
-    # The panel is as opaque as the least faded thing on it, so the background
-    # goes with the last remark rather than blinking out from under it.
-    panel_fade = max(fades) if fades else 1.0
     bg = _rgb(cfg.bg_color)
-    panel = Image.new("RGBA", card.size, (0, 0, 0, 0))
-    ImageDraw.Draw(panel).rounded_rectangle(
-        (0, 0, card.width - 1, card.height - 1),
-        radius=metrics.radius,
-        fill=(*bg, int(255 * min(1.0, max(0.0, cfg.bg_opacity)))),
-    )
-    card = Image.alpha_composite(card, _scaled_alpha(panel, panel_fade))
+    if bordered:
+        # The panel is as opaque as the least faded thing on it, so the
+        # background goes with the last remark rather than blinking out from
+        # under it.
+        panel_fade = max(fades) if fades else 1.0
+        panel = Image.new("RGBA", card.size, (0, 0, 0, 0))
+        ImageDraw.Draw(panel).rounded_rectangle(
+            (0, 0, card.width - 1, card.height - 1),
+            radius=metrics.radius,
+            fill=(*bg, int(255 * min(1.0, max(0.0, cfg.bg_opacity)))),
+        )
+        card = Image.alpha_composite(card, _scaled_alpha(panel, panel_fade))
 
     fg = _rgb(cfg.fg_color)
     accent = _rgb(cfg.accent_color)
@@ -413,7 +424,7 @@ def render_card(
     for index, (lines, block_h) in enumerate(zip(blocks, heights, strict=True)):
         layer = Image.new("RGBA", card.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(layer)
-        if index == newest:
+        if bordered and index == newest:
             draw.rounded_rectangle(
                 (pad, top + pad, pad + metrics.accent_px, top + block_h - pad),
                 radius=metrics.accent_px // 2,
@@ -421,17 +432,24 @@ def render_card(
             )
         for row, line in enumerate(lines):
             y = top + pad + row * line_px
-            # A hairline shadow, not a blur: the card sits over a game frame
-            # that may be any colour, and one dark pixel of offset is the
-            # cheapest thing that keeps light text on light scenery readable.
-            draw.text((text_left + metrics.shadow_px, y + metrics.shadow_px), line,
-                      font=font, fill=(0, 0, 0, 160))
-            draw.text((text_left, y), line, font=font, fill=(*fg, 255))
+            if bordered:
+                # A hairline shadow, not a blur: the card sits over a game
+                # frame that may be any colour, and one dark pixel of offset
+                # is the cheapest thing that keeps light text on light
+                # scenery readable.
+                draw.text((text_left + metrics.shadow_px, y + metrics.shadow_px), line,
+                          font=font, fill=(0, 0, 0, 160))
+                draw.text((text_left, y), line, font=font, fill=(*fg, 255))
+            else:
+                draw.text(
+                    (text_left, y), line, font=font, fill=(*fg, 255),
+                    stroke_width=metrics.stroke_px, stroke_fill=(*bg, 255),
+                )
         dim = 1.0 if index == newest else max(0.0, min(1.0, cfg.dim_older))
         card = Image.alpha_composite(card, _scaled_alpha(layer, fades[index] * dim))
 
         top += block_h
-        if index != newest:
+        if bordered and index != newest:
             rule = Image.new("RGBA", card.size, (0, 0, 0, 0))
             ImageDraw.Draw(rule).rectangle(
                 (pad, top, card.width - pad, top + metrics.rule_px - 1),

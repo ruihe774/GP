@@ -230,10 +230,17 @@ hold_min_s = 4.0
 hold_max_s = 16.0
 fade_ms = 250            # fade-out at the end of a hold; 0 for a hard cut
 
+# "card" is the panel below, with an accent bar and rules between entries.
+# "stroked" is borderless -- no panel, no accent bar, no rules -- just text
+# outlined in bg_color, for a game whose own HUD a translucent box competes with.
+style = "card"
+stroke_width_px = 2      # outline width for "stroked"; ignored by "card"
+
 bg_color = "#12141a"
-bg_opacity = 0.82        # real translucency, from a 32-bit ARGB visual
+bg_opacity = 0.82        # real translucency, from a 32-bit ARGB visual;
+                         # also the outline colour in "stroked"
 fg_color = "#f2f4f8"
-accent_color = "#6fd3ff" # the bar marking the newest remark
+accent_color = "#6fd3ff" # the bar marking the newest remark ("card" only)
 dim_older = 0.55         # alpha multiplier for everything that is not newest
 
 # Off means the HUD eats every click that lands on it, which during a game is a
