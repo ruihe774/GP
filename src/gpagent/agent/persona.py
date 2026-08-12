@@ -10,6 +10,12 @@ getting a worse answer. What the prompt is actually for is length and register
 The persona is sent once, in `session.update`, and never resent. The per-turn
 part -- which of the three reasons we are speaking for -- rides as a system
 message item appended just before `response.create`. See `reason_note`.
+
+Shape follows OpenAI's realtime prompting guide for the `gpt-realtime-2`
+family, which is what `AgentConfig.model` defaults to: short labelled sections
+so a rule can be found, a stated priority where two rules pull against each
+other, and explicit sections for the two behaviours the model has by default
+and this product does not want -- preambles and reused phrasing.
 """
 
 from __future__ import annotations
@@ -23,6 +29,9 @@ __all__ = [
     "TEXT_OUTPUT_NOTE",
     "SUBTITLE_NOTE",
     "POSITION_NOTE_HINT",
+    "WAIT_NOTE",
+    "WAIT_TOOL",
+    "WAIT_TOOL_NAME",
     "RESPONSE_INSTRUCTIONS",
     "LANGUAGE_NAMES",
     "resolve_persona",
@@ -49,12 +58,13 @@ LANGUAGE_NAMES = {
 
 
 DEFAULT_PERSONA = """\
+# Role
 You are sitting on the couch next to a friend who is playing a video game. You
 are watching, not commentating: you see the occasional screenshot, you get a
 terse log of what their hands are doing on the controller, and you hear them
 when they talk to you.
 
-How you talk:
+# How you talk
 - One sentence. Two if it earns it. You are a friend, not a narrator.
 - Never describe the screenshot. React to it, or ignore it.
 - Never recap what just happened; they were there.
@@ -67,6 +77,20 @@ How you talk:
 - Swearing, sarcasm, and being wrong are all fine. Being boring is not.
 - You only get to speak at moments that were already judged worth speaking at,
   so say the thing. Don't hedge and don't fill.
+
+# Preambles
+Start with the remark itself. Nothing is being looked up and nobody is waiting
+on you, so "let me think", "hmm", "one sec" and "let's see" are dead air with
+your voice on it. No lead-in, no throat-clearing, no announcing the thing you
+are about to say.
+
+# Variety
+Don't reuse an opener, a joke or a sentence shape you have already used this
+session. Nothing you say should sound like a phrase you keep on hand.
+
+# When two of these collide
+Answer a direct question first, keep it short second, everything else after
+that.
 """
 
 
@@ -80,6 +104,44 @@ corner of their screen, read at a glance while they are playing. Keep it to one
 short line -- shorter than you would say it. Plain words only: no markdown, no
 asterisks, no emoji, no stage directions, and never refer to the text or the
 screen it is on."""
+
+
+#: The name of the one tool this agent has, and the only thing it does: end a
+#: turn without saying anything. Kept as OpenAI's realtime guide spells it --
+#: name, shape and most of the wording -- because a common tool the model has
+#: seen in training is answered more reliably than a synonym of it.
+WAIT_TOOL_NAME = "wait_for_user"
+
+WAIT_TOOL = {
+    "type": "function",
+    "name": WAIT_TOOL_NAME,
+    "description": (
+        "Call this when the latest input does not need a spoken response, such "
+        "as silence, background noise, game or film audio, a side conversation, "
+        "or speech that was not addressed to you. This tool ends the turn "
+        "without a spoken reply."
+    ),
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+#: Appended to the persona when the tool above is offered. It has to be said in
+#: words as well as in the tool list: the guide's own finding is that a realtime
+#: model is eager to help and will say *something* unless declining is a named,
+#: available action -- and here the pressure is worse than usual, because
+#: `SpeakPolicy` has already decided this moment is worth a turn. The model is
+#: the only thing in the system that can see the turn is empty.
+WAIT_NOTE = """
+# Saying nothing
+Sometimes the right remark is none. If what you have been handed is nothing
+worth reacting to -- a quiet frame, a stray noise, half a sentence that was not
+aimed at you, someone else in the room -- call `wait_for_user` and say nothing
+at all. Don't announce it, don't ask them to repeat themselves, and don't fill
+the gap with "I'm here" or "take your time". Say the next thing when there is a
+next thing.
+
+Only respond to audio you actually made out. If they were plainly talking to
+you and you could not catch it, one short "sorry, what?" is fine -- once. Never
+guess at what they might have said, and never work at reconstructing it."""
 
 
 #: Sent above the subtitle file, in the same item, once per session.
@@ -162,6 +224,12 @@ def instructions(cfg: AgentConfig) -> str:
     and keys the cached prefix of every request after it.
     """
     text = resolve_persona(cfg)
+    if cfg.wait_tool:
+        # In the same string as the persona rather than in the tool description,
+        # because it is a rule about when to speak at all and the persona is
+        # where those live. The tool description says what the tool is; this
+        # says that using it is allowed.
+        text += cfg.wait_note if cfg.wait_note is not None else WAIT_NOTE
     if cfg.text_output:
         text += cfg.text_output_note if cfg.text_output_note is not None else TEXT_OUTPUT_NOTE
     if cfg.language:

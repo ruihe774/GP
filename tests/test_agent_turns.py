@@ -444,10 +444,18 @@ class TestSessionSetup:
         assert fmt == {"type": "audio/pcm", "rate": 24000}
 
     def test_the_persona_is_configurable(self):
-        cfg = make_config(persona="be a lighthouse")
+        cfg = make_config(persona="be a lighthouse", wait_tool=False)
         transport = FakeTransport()
         agent = CommentaryAgent(cfg, transport, NullPlayer())
         assert agent.session_update()["session"]["instructions"] == "be a lighthouse"
+
+    def test_the_persona_keeps_the_notes_the_session_shape_adds(self):
+        """A replaced persona still gets told about the tool it has been given."""
+        cfg = make_config(persona="be a lighthouse")
+        agent = CommentaryAgent(cfg, FakeTransport(), NullPlayer())
+        instructions = agent.session_update()["session"]["instructions"]
+        assert instructions.startswith("be a lighthouse")
+        assert "wait_for_user" in instructions
 
     def test_transcription_is_omitted_when_off(self):
         cfg = make_config(transcribe_player=False)
@@ -755,6 +763,182 @@ class TestResponsesThatSayNothing:
             {"type": "response.done", "response": {"status": "completed", "usage": {}}}
         )
         assert not [line for line in agent.lines if line.kind == "note"]
+
+
+class TestTheModelCanDeclineATurn:
+    """`wait_for_user`: the one way the agent gets to stay quiet.
+
+    The policy opens a turn from what capture can see, which cannot tell the
+    player's voice from the television's. This is the model saying so.
+    """
+
+    async def hold(self, agent, *, call_id="call_1", item_id="fc-1"):
+        """The server's side of a turn answered with a tool call."""
+        await agent.on_server_event(
+            {
+                "type": "response.output_item.added",
+                "item": {"id": item_id, "type": "function_call", "name": "wait_for_user"},
+            }
+        )
+        await agent.on_server_event(
+            {
+                "type": "response.done",
+                "response": {
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "id": item_id,
+                            "name": "wait_for_user",
+                            "call_id": call_id,
+                            "arguments": "{}",
+                        }
+                    ],
+                    "usage": {"input_tokens": 100, "output_tokens": 4},
+                },
+            }
+        )
+
+    def outputs(self, agent):
+        return [
+            e["item"]
+            for e in agent.transport.sent_of_type("conversation.item.create")
+            if e["item"].get("type") == "function_call_output"
+        ]
+
+    def test_the_session_offers_the_tool(self, agent):
+        session = agent.session_update()["session"]
+        assert [t["name"] for t in session["tools"]] == ["wait_for_user"]
+        assert "wait_for_user" in session["instructions"], "and says it may be used"
+
+    def test_it_can_be_turned_off(self):
+        agent = CommentaryAgent(
+            make_config(wait_tool=False), FakeTransport(), NullPlayer()
+        )
+        session = agent.session_update()["session"]
+        assert "tools" not in session
+        assert "wait_for_user" not in session["instructions"]
+
+    async def test_the_call_is_answered_and_the_turn_just_ends(self, agent):
+        await agent.handle(frame(score=1.0), now=100.0)
+        await self.hold(agent)
+
+        outputs = self.outputs(agent)
+        assert len(outputs) == 1 and outputs[0]["call_id"] == "call_1"
+        assert len(agent.transport.sent_of_type("response.create")) == 1, (
+            "answering the tool call must not ask the same question again"
+        )
+        assert agent.held == 1
+        assert [line.kind for line in agent.lines].count("hold") == 1
+
+    async def test_nothing_is_recorded_as_having_been_said(self):
+        clock = ReplayClock(100.0)
+        recorded = []
+        agent = CommentaryAgent(
+            make_config(), FakeTransport(), NullPlayer(clock),
+            clock=clock, recorder=recorded.append,
+        )
+        agent._clock_obj = clock
+        await agent.handle(frame(score=1.0), now=100.0)
+        await self.hold(agent)
+        assert not [e for e in recorded if isinstance(e, AgentResponse)]
+
+    async def test_the_agent_can_speak_again_afterwards(self, agent):
+        await agent.handle(frame(score=1.0), now=100.0)
+        await self.hold(agent)
+        t = advance(agent, 160.0)
+        await agent.handle(frame(seq=2, score=1.0), now=t)
+        await agent.tick(now=t)
+        assert len(agent.transport.sent_of_type("response.create")) == 2
+
+    async def test_a_hold_leaves_nothing_behind_in_the_conversation(self, agent):
+        """Both halves go on the next round: a hold is over the moment it ends."""
+        await agent.handle(frame(score=1.0), now=100.0)
+        await self.hold(agent)
+        agent.cfg.prune_after_s = 30.0
+        t = advance(agent, 200.0)
+        await agent.tick(now=t)
+
+        gone = set(deleted(agent))
+        assert "fc-1" in gone, "the call itself"
+        assert self.outputs(agent)[0]["id"] in gone, "and the answer to it"
+
+
+class TestPreamblesNeverReachThePlayer:
+    """`gpt-realtime-2` opens with "let me check that" unless told not to.
+
+    The persona tells it not to. This is the second line of defence: a response
+    part the server marks `phase: "commentary"` is a preamble, and none of it is
+    played, shown, or folded into what the agent is recorded as having said.
+    """
+
+    async def test_a_spoken_preamble_is_not_played(self, agent):
+        await agent.handle(frame(score=1.0), now=100.0)
+        await agent.on_server_event(
+            {
+                "type": "response.output_item.added",
+                "item": {"id": "pre-1", "phase": "commentary"},
+            }
+        )
+        await agent.on_server_event(
+            {
+                "type": "response.output_audio.delta",
+                "item_id": "pre-1",
+                "delta": base64.b64encode(b"\x01\x02" * 24000).decode(),
+            }
+        )
+        await agent.on_server_event(
+            {
+                "type": "response.output_audio_transcript.done",
+                "item_id": "pre-1",
+                "transcript": "let me have a look",
+            }
+        )
+        assert not [line for line in agent.lines if line.kind == "say"]
+        assert agent._response_transcript == ""
+
+    async def test_the_remark_after_it_still_arrives(self, agent):
+        await agent.handle(frame(score=1.0), now=100.0)
+        await agent.on_server_event(
+            {
+                "type": "response.output_item.added",
+                "item": {"id": "pre-1", "phase": "commentary"},
+            }
+        )
+        await agent.on_server_event(
+            {
+                "type": "response.output_item.added",
+                "item": {"id": "a1", "phase": "final_answer"},
+            }
+        )
+        await agent.on_server_event(
+            {
+                "type": "response.output_audio_transcript.done",
+                "item_id": "a1",
+                "transcript": "that barrel again",
+            }
+        )
+        said = [line.text for line in agent.lines if line.kind == "say"]
+        assert said == ["that barrel again"]
+
+    async def test_a_written_preamble_never_reaches_the_hud(self):
+        clock = ReplayClock(100.0)
+        agent = CommentaryAgent(
+            make_config(output="text"), FakeTransport(), NullPlayer(clock), NullHud(),
+            clock=clock,
+        )
+        agent._clock_obj = clock
+        await agent.handle(frame(score=1.0), now=100.0)
+        await agent.on_server_event(
+            {
+                "type": "response.output_item.added",
+                "item": {"id": "pre-1", "phase": "commentary"},
+            }
+        )
+        await agent.on_server_event(
+            {"type": "response.output_text.done", "item_id": "pre-1", "text": "one sec"}
+        )
+        assert agent.hud.shown == []
 
 
 def turns(agent, count, *, every=40.0, start=100.0):

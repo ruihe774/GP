@@ -65,11 +65,30 @@ class AgentConfig:
     persona: str | None = None
     persona_file: str | None = None
 
-    #: reasoning effort for reasoning-capable Realtime models (the gpt-realtime-2
+    #: Reasoning effort for reasoning-capable Realtime models (the gpt-realtime-2
     #: family, which includes gpt-realtime-2.1 and -2.1-mini). None omits the
     #: `reasoning` block entirely and leaves it at the server's default -- older,
-    #: non-reasoning models (gpt-realtime, gpt-realtime-1.5) reject the field.
-    reasoning_effort: ReasoningEffort | None = None
+    #: non-reasoning models (gpt-realtime, gpt-realtime-1.5) reject the field,
+    #: so those need `--set agent.reasoning_effort=null`.
+    #:
+    #: "low" because OpenAI's realtime guide says to start there rather than at
+    #: the default, and because of what this agent is asked for: one sentence of
+    #: reaction, with no tools to orchestrate and no multi-step task to plan.
+    #: The cost of thinking longer is not tokens, it is that the remark lands
+    #: after the moment it was about.
+    reasoning_effort: ReasoningEffort | None = "low"
+
+    #: Offer `wait_for_user` (persona.WAIT_TOOL): a no-op function whose only
+    #: purpose is to let the model end a turn without speaking. `SpeakPolicy`
+    #: decides *when* a remark is wanted from what capture can see; it cannot
+    #: tell a VAD segment that was the player from one that was the television,
+    #: or a burst worth a reaction from a burst that turned out to be nothing.
+    #: The model can, and this is the only way it has to say so -- without it,
+    #: every turn the policy opens must be filled.
+    wait_tool: bool = True
+    #: override for persona.WAIT_NOTE, appended to the persona when `wait_tool`
+    #: is on. None uses the built-in note.
+    wait_note: str | None = None
 
     #: ISO-639-1 code the player speaks and the agent should answer in, e.g.
     #: "ja". None lets the model follow whatever it hears. Half of this is an

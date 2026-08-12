@@ -79,8 +79,21 @@ voice_speed = 1.0          # playback rate; server clamps to [0.25, 1.5]
 
 # minimal | low | medium | high | xhigh. Only sent to reasoning-capable
 # Realtime models (the gpt-realtime-2 family, including gpt-realtime-2.1 and
-# -2.1-mini); unset omits the field and leaves it at the server default.
-# reasoning_effort = "medium"
+# -2.1-mini); on an older model turn it off entirely with
+# `--set agent.reasoning_effort=null`, which omits the field. "low" is where
+# OpenAI's realtime guide says to start, and this agent wants one sentence of
+# reaction rather than a plan -- thinking longer mostly means arriving late.
+reasoning_effort = "low"
+
+# Offer the model `wait_for_user`: a no-op tool whose only purpose is to let it
+# end a turn without saying anything. The speak policy decides a moment is worth
+# a remark from what capture can see; only the model can tell that the VAD
+# segment was the television, or that the burst turned out to be nothing. With
+# this off, every turn the policy opens has to be filled.
+wait_tool = true
+# Override for the note appended to the persona when wait_tool is on (see
+# agent/persona.py::WAIT_NOTE). Unset uses the built-in note.
+# wait_note = "\nIf there is nothing worth saying, call wait_for_user."
 
 # ISO-639-1 code the player speaks and the agent answers in, e.g. "ja".
 # Unset means the model follows whatever it hears. Passed to input

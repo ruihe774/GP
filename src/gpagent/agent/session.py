@@ -9,7 +9,9 @@ below this layer knows which of the three it is running under.
 
 Conversation shape, once at the start of the session:
 
-    session.update             persona, language, output modality
+    session.update             persona, language, output modality, and the one
+                               tool there is (`wait_for_user`, which lets the
+                               model end a turn without speaking)
     conversation.item.create   one system item: the whole subtitle file, if one
                                was configured (see subtitles.py). Sent here,
                                before the first turn, so it sits in the cached
@@ -70,7 +72,7 @@ from ..events import (
 from ..tokens import UsageMeter
 from .context import ContextBuffer, Frame
 from .hud import NullHud, hold_for
-from .persona import instructions, reason_note, subtitle_note
+from .persona import WAIT_TOOL, WAIT_TOOL_NAME, instructions, reason_note, subtitle_note
 from .playback import NullPlayer
 from .policy import SpeakPolicy
 from .subtitles import Script, load_script
@@ -131,7 +133,7 @@ class Disposable:
     #: agent clock when the item entered the conversation
     t: float
     item_id: str
-    #: "image" | "note" | "heard" | "said" | "stub". The session's own
+    #: "image" | "note" | "heard" | "said" | "wait" | "stub". The session's own
     #: vocabulary rather than the API's: `heard` and `said` are already the
     #: `Line` kinds for the two sides of a spoken exchange, so `report()` reads
     #: "12 image, 9 note, 4 heard, 4 said".
@@ -220,6 +222,10 @@ class CommentaryAgent:
         #: shown. Text needs this as much as audio does: the API emits
         #: `response.output_text.done` for an interrupted response too.
         self._accept_output = True
+        #: Output items the server marked `phase: "commentary"` -- preambles.
+        #: Nothing in this set reaches the speakers, the HUD or the transcript.
+        #: Per response, cleared by `_speak`.
+        self._commentary: set[str] = set()
         #: Everything removable, in conversation order. Screenshots, per-turn
         #: nudges, and both sides of a spoken exchange -- see `_prune_round`.
         self._disposable: list[Disposable] = []
@@ -269,6 +275,8 @@ class CommentaryAgent:
         #: set by close(), so the pump stops reopening the session
         self._closing = False
         self.spoke = 0
+        #: turns the model answered with `wait_for_user` instead of a remark
+        self.held = 0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -347,8 +355,14 @@ class CommentaryAgent:
         }
         if self.cfg.reasoning_effort is not None:
             # Non-reasoning models (gpt-realtime, gpt-realtime-1.5) reject this
-            # field, so it's only sent when explicitly configured.
+            # field, so it can be turned off entirely (`=null`).
             session["reasoning"] = {"effort": self.cfg.reasoning_effort}
+        if self.cfg.wait_tool:
+            # The only tool this agent has, and it does nothing: it exists so
+            # the model can decline a turn the policy opened. See
+            # `AgentConfig.wait_tool` and `_wait_calls`.
+            session["tools"] = [WAIT_TOOL]
+            session["tool_choice"] = "auto"
         return {"type": "session.update", "session": session}
 
     def _truncation(self) -> Any:
@@ -546,6 +560,7 @@ class CommentaryAgent:
         self.player.discard()
         self._accept_output = True
         self._audio_item_id = None
+        self._commentary.clear()
         # A fresh turn gets a fresh retry budget, and the items of the turn
         # before it stop being untouchable now that it is over.
         self._context_full_retries = 0
@@ -911,6 +926,7 @@ class CommentaryAgent:
         self._by_item.clear()
         self._live_items.clear()
         self._audio_item_id = None
+        self._commentary.clear()
         self._retry_pending = False
         self._context_full_retries = 0
         self._prune_forced = False
@@ -937,6 +953,8 @@ class CommentaryAgent:
                 # emit a fragment of the sentence we just cut off, a second
                 # after cutting it off.
                 return
+            if event.get("item_id") in self._commentary:
+                return
             self._audio_item_id = event.get("item_id") or self._audio_item_id
             delta = event.get("delta")
             if delta:
@@ -947,7 +965,24 @@ class CommentaryAgent:
                     self._response_audio += pcm
                 self.player.push(pcm)
         elif kind == "response.output_item.added":
-            item_id = (event.get("item") or {}).get("id")
+            item = event.get("item") or {}
+            item_id = item.get("id")
+            if item.get("type") == "function_call":
+                # A tool call is not a remark: nothing to play, nothing to show,
+                # and no transcript on the way. It is answered in
+                # `_finish_response`, where the whole response is known.
+                if item_id:
+                    self._register(Disposable(now, item_id, "wait"))
+                return
+            if item_id and item.get("phase") == "commentary":
+                # A preamble -- "let me check that" -- which this product has no
+                # use for: there is nothing to check and nobody waiting. The
+                # persona says not to produce them; this is what happens when
+                # one is produced anyway. The item stays in the conversation
+                # (the model believes it said it) but never reaches the player.
+                self._commentary.add(item_id)
+                self._emit(Line(now, "note", "dropped a preamble"))
+                return
             self._audio_item_id = item_id or self._audio_item_id
             if item_id and not self.cfg.text_output:
                 # The agent's own spoken turn. Registered as removable and as
@@ -959,6 +994,8 @@ class CommentaryAgent:
                     Disposable(now, item_id, "said", role="assistant", pending=True)
                 )
         elif kind == "response.output_audio_transcript.done":
+            if event.get("item_id") in self._commentary:
+                return
             said = event.get("transcript") or ""
             self._add_transcript(said)
             self._settle(event.get("item_id") or self._audio_item_id, said)
@@ -976,7 +1013,7 @@ class CommentaryAgent:
             # Also emitted for an interrupted or cancelled response, which is
             # exactly what `_accept_output` is for: showing it would put a
             # remark on screen that the session already decided against.
-            if not self._accept_output:
+            if not self._accept_output or event.get("item_id") in self._commentary:
                 return
             said = event.get("text") or ""
             if said:
@@ -1049,8 +1086,14 @@ class CommentaryAgent:
             # notices. `_on_context_full` collapses them.
             await self._on_context_full(self.clock(), detail_error)
             return
+        held = await self._answer_wait_calls(response)
         spoken_ms = await self.player.drain()
-        if self.cfg.text_output:
+        if held and not self._response_transcript:
+            # Nothing was said, so nothing takes time. Without this the text
+            # path below would charge the quiet floor a full reading beat for a
+            # remark that never went on screen.
+            spoken_ms = 0.0
+        elif self.cfg.text_output:
             # What a written remark "takes" is how long it is on screen, which
             # is reading time -- the same number the HUD holds it for. The
             # quiet floor is then measured from when the player is done with
@@ -1093,7 +1136,13 @@ class CommentaryAgent:
         # waiting on a transcript that is never coming.
         self._settle(self._audio_item_id, self._response_transcript)
         self._live_items.clear()
-        self._record_response(now, cut=False)
+        if held and not self._response_transcript:
+            # A turn nobody heard is not a response. Recording it would put an
+            # `agent.response` with no audio and no words into the session, and
+            # `inspect` would count it as a remark.
+            self._reset_response_record()
+        else:
+            self._record_response(now, cut=False)
         self.policy.on_response_finished(spoken_ms=spoken_ms, now=end)
         if self._watchdog is not None:
             self._watchdog.cancel()
@@ -1101,6 +1150,55 @@ class CommentaryAgent:
         # After `_record_response`, which resets the usage it reads -- so the
         # number is taken from the event rather than from the field.
         self._check_budget(now, int((response.get("usage") or {}).get("input_tokens") or 0))
+
+    async def _answer_wait_calls(self, response: dict) -> bool:
+        """Close out any `wait_for_user` call in a finished response.
+
+        The model declining to speak is the point of the tool, so the reply to
+        it is a `function_call_output` and *not* a `response.create`: asking for
+        another response is asking the same question again, and the answer that
+        came back was "nothing to say". The turn simply ends, and the quiet
+        floor starts from here the way it does after a sentence.
+
+        The output item is required all the same. A function call left dangling
+        is a call the model can see it made and never got an answer to, on every
+        request for the rest of the session -- and both items are registered
+        removable so a later round takes them, since a hold, like a nudge, stops
+        meaning anything the moment its turn is over.
+        """
+        calls = [
+            item
+            for item in (response.get("output") or [])
+            if item.get("type") == "function_call" and item.get("name") == WAIT_TOOL_NAME
+        ]
+        if not calls:
+            return False
+        now = self.clock()
+        for call in calls:
+            call_id = call.get("call_id")
+            if not call_id:
+                continue
+            await self.transport.send(self._wait_output_item(now, call_id))
+        self.held += 1
+        self._emit(
+            Line(now, "hold", f"nothing worth saying ({self._response_reason})"),
+        )
+        return True
+
+    def _wait_output_item(self, now: float, call_id: str) -> dict:
+        """The answer to a `wait_for_user` call: acknowledged, nothing to add."""
+        self._item_seq += 1
+        item_id = f"gpwof{self._item_seq:012d}"
+        self._register(Disposable(now, item_id, "wait"))
+        return {
+            "type": "conversation.item.create",
+            "item": {
+                "id": item_id,
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": '{"ok": true}',
+            },
+        }
 
     def _check_budget(self, now: float, billed: int) -> None:
         """Ask for a round when the request is getting close to the ceiling.
@@ -1355,6 +1453,12 @@ class CommentaryAgent:
             # wrong since the moment the next turn started. Age does not come
             # into it, and they are identical to each other besides.
             return entry is not self._newest_note()
+        if entry.kind == "wait":
+            # Same argument as a nudge, without the exception: a turn the model
+            # declined says nothing about any other turn, and the guard above
+            # already keeps the one in flight. Deleted outright -- there is
+            # nothing to stand in for.
+            return True
         return entry.t < cutoff
 
     def _turn_in_flight(self, now: float) -> bool:
@@ -1600,6 +1704,12 @@ class CommentaryAgent:
             "output": self.cfg.output,
             "subtitles": self.subtitle_summary(),
             "responses": self.spoke,
+            # Turns opened by the policy that the model answered with
+            # `wait_for_user` -- counted in `responses` too, since they cost a
+            # request and a slot under the rate cap; the difference is that
+            # nobody heard them. A number climbing towards `responses` means the
+            # policy is opening turns on nothing.
+            "held": self.held,
             "by_reason": dict(self.policy.counts),
             "declined": dict(self.policy.declined),
             "frames_seen": self.context.frames_seen,

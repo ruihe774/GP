@@ -179,6 +179,63 @@ def test_a_pruning_round_is_accepted_mid_conversation(api_key):
     assert not errors, f"server rejected a replacement: {[e.text for e in errors]}"
 
 
+def test_the_answer_to_a_declined_turn_is_accepted(api_key):
+    """`wait_for_user`, end to end, including the item the client sends back.
+
+    Two things only the server can settle. That a session carrying a tool list
+    still behaves (covered by the config test above), and that the answer to a
+    call -- a `conversation.item.create` of type `function_call_output`, a
+    shape this client sends nowhere else -- is taken. Get it wrong and every
+    hold leaves a dangling call in the conversation for the rest of the
+    session, with an error to go with it.
+
+    The call is forced with `response.tool_choice` rather than waited for.
+    Whether the model *chooses* to decline a given moment is a prompt question
+    and a flaky thing to assert; whether the exchange is well-formed is not.
+    """
+
+    async def run():
+        agent, clock = await _open(api_key)
+        try:
+            clock.set(1.0)
+            await agent.transport.send(
+                agent._text_item(1.0, "[controller] nothing much")
+            )
+            await agent.transport.send(
+                {
+                    "type": "response.create",
+                    "response": {
+                        "tool_choice": {"type": "function", "name": "wait_for_user"}
+                    },
+                }
+            )
+
+            async def poll():
+                while not agent.held and not any(
+                    line.kind == "error" for line in agent.lines
+                ):
+                    await asyncio.sleep(0.1)
+
+            await asyncio.wait_for(poll(), timeout=45.0)
+            # The output goes out inside `response.done` handling; give the
+            # server time to reject it if it is going to.
+            await asyncio.sleep(3.0)
+            # `OpenAITransport.sent` is a counter, not a ledger, so the record
+            # of what went out is the disposables: one `wait` entry for the
+            # call itself and one for the answer to it.
+            waits = [entry.item_id for entry in agent._disposable if entry.kind == "wait"]
+            return agent.held, waits, [line for line in agent.lines if line.kind == "error"]
+        finally:
+            await agent.close()
+
+    held, waits, errors = asyncio.run(run())
+    assert held == 1, "the model was told to call the tool and the client missed it"
+    assert sum(1 for item_id in waits if item_id.startswith("gpwof")) == 1, (
+        "the call must be answered exactly once"
+    )
+    assert not errors, f"server rejected the hold exchange: {[e.text for e in errors]}"
+
+
 def test_a_text_session_writes_its_remark_instead_of_speaking_it(api_key):
     """The one thing no recording can stand in for.
 

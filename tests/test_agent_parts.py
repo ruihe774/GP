@@ -600,6 +600,10 @@ class TestSdkPayloadDrift:
             agent._stub_item(
                 0.0, Disposable(0.0, "i", "said", role="assistant", replacement="a remark")
             ),
+            # The answer to a `wait_for_user` call. A different item *type*
+            # from everything else here, and the one payload whose loss would
+            # be silent: a dangling call the model never got an answer to.
+            agent._wait_output_item(0.0, "call_1"),
             {"type": "input_audio_buffer.append", "audio": "AAAA"},
             {"type": "input_audio_buffer.commit"},
             {"type": "response.create", "response": {"instructions": "be brief"}},
@@ -655,6 +659,51 @@ class TestSdkPayloadDrift:
         assert payload["session"]["reasoning"] == {"effort": "high"}
         transformed = asyncio.run(async_maybe_transform(payload, RealtimeClientEventParam))
         assert transformed == payload, "SDK dropped the reasoning field"
+
+    def test_an_undeclared_server_field_still_reaches_the_agent(self):
+        """`phase` is the preamble gate, and the realtime types do not declare it.
+
+        The SDK has the field for the Responses API (`ResponseOutputMessage`)
+        but nothing under `types/realtime` mentions it, so it arrives only
+        because the models allow extras. An SDK that tightened that to `ignore`
+        would drop preambles onto the player with nothing failing anywhere.
+        """
+        from openai._models import construct_type
+        from openai.types.realtime.realtime_server_event import RealtimeServerEvent
+
+        raw = {
+            "type": "response.output_item.added",
+            "event_id": "e1",
+            "response_id": "r1",
+            "output_index": 0,
+            "item": {
+                "id": "a1",
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "content": [],
+            },
+        }
+        event = construct_type(value=raw, type_=RealtimeServerEvent)
+        dumped = event.model_dump(exclude_none=True)
+        assert dumped["item"]["phase"] == "commentary"
+
+    def test_the_wait_tool_survives_the_transform(self):
+        """A dropped tool is an agent that must fill every turn it is given."""
+        from openai._utils import async_maybe_transform
+        from openai.types.realtime.realtime_client_event_param import RealtimeClientEventParam
+
+        from gpagent.agent.playback import NullPlayer
+        from gpagent.agent.session import CommentaryAgent
+        from gpagent.agent.transport import FakeTransport
+        from gpagent.config import CaptureConfig
+
+        agent = CommentaryAgent(CaptureConfig(), FakeTransport(), NullPlayer())
+        payload = agent.session_update()
+        assert [t["name"] for t in payload["session"]["tools"]] == ["wait_for_user"]
+        assert payload["session"]["tool_choice"] == "auto"
+        transformed = asyncio.run(async_maybe_transform(payload, RealtimeClientEventParam))
+        assert transformed == payload, "SDK dropped the tool list"
 
 
 class TestRecordingTransport:
