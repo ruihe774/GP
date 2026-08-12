@@ -16,8 +16,8 @@ One hazard worth naming: `AsyncRealtimeConnection.send()` routes a dict through
 `async_maybe_transform(event, RealtimeClientEventParam)`, which silently drops
 keys the installed SDK's TypedDicts do not know about. Every payload this
 package sends is asserted to survive that transform intact in
-`tests/test_transport_payloads.py`, so an SDK upgrade that starts eating a field
-fails a test instead of quietly degrading the agent.
+`tests/test_agent_parts.py::TestSdkPayloadDrift`, so an SDK upgrade that starts
+eating a field fails a test instead of quietly degrading the agent.
 """
 
 from __future__ import annotations
@@ -86,7 +86,7 @@ class OpenAITransport:
             raise RuntimeError("transport is not connected")
         # Plain dicts by design (see module docstring): the SDK's
         # `async_maybe_transform` validates and coerces at runtime, and
-        # `tests/test_transport_payloads.py` asserts every payload survives it.
+        # `TestSdkPayloadDrift` asserts every payload survives it.
         await self._conn.send(cast(Any, event))
         self.sent += 1
 
@@ -124,7 +124,17 @@ class _QueueTransport:
         self._closed = False
 
     async def connect(self) -> None:
-        return None
+        # `close()` leaves a sentinel in the queue to end the iteration. A
+        # reopen must not inherit it: the pump would read it as the new
+        # connection dropping the instant it was made, and reconnect forever.
+        self._closed = False
+        keep = []
+        while not self._incoming.empty():
+            event = self._incoming.get_nowait()
+            if event is not None:
+                keep.append(event)
+        for event in keep:
+            self._incoming.put_nowait(event)
 
     async def send(self, event: dict) -> None:
         self.sent.append(event)
@@ -171,15 +181,22 @@ class RecordingTransport(_QueueTransport):
     The usage block bills the *whole conversation*, not the turn, because that
     is what the API does and it is the only part of the bill anyone is trying to
     control. A ledger of live items is kept, `conversation.item.delete` removes
-    from it, and everything still in it is charged again on the next response --
-    so a dry run shows what `agent.prune_after_s` does to the growth curve, and
-    to the TPM ceiling that curve runs into. Cached tokens are modelled the same
-    way, one rule: a delete truncates the cached prefix at the deleted item.
+    from it, `previous_item_id` inserts into the middle of it, and everything
+    still in it is charged again on the next response -- so a dry run shows what
+    `agent.prune_after_s` does to the growth curve, and to the ceiling that curve
+    runs into. Cached tokens are modelled the same way, one rule: a change to the
+    conversation truncates the cached prefix at the position it happened.
+
+    With `context_limit` set it also models the *end* of that curve: over the
+    limit, a `response.create` is refused with an error instead of answered,
+    which is what the API does once `truncation` is disabled and is the one
+    path in the agent that no recording can stand in for.
 
     It is a model of the server, not the server. Sizes come from `tokens.py`,
-    the per-item overhead the API adds is not counted, and a real session's
-    cache can miss for reasons nothing here knows about. Read the shape of the
-    curve off it, not the fourth digit.
+    the per-item overhead the API adds is not counted, server-side truncation is
+    not modelled at all (so a `retention_ratio` dry run is not a prediction of
+    one), and a real session's cache can miss for reasons nothing here knows
+    about. Read the shape of the curve off it, not the fourth digit.
     """
 
     name = "dry-run"
@@ -192,13 +209,29 @@ class RecordingTransport(_QueueTransport):
     ASSUMED_TEXT_TOKENS = 20
 
     DRY_REMARK = "(dry run: no model was asked)"
+    #: what the player is pretended to have said, so the transcript-driven
+    #: half of pruning has something to work with offline
+    DRY_HEARD = "(dry run: whatever the player said)"
 
-    def __init__(self, path: str | Path | None = None, *, text: bool = False):
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        *,
+        text: bool = False,
+        context_limit: int = 0,
+    ):
         super().__init__()
         self.path = Path(path) if path else None
         #: answer the way the session asked to be answered -- a text session
         #: that got audio events back would exercise a path it will never take
         self.text = text
+        #: post-instruction input tokens at which a response is refused rather
+        #: than answered; 0 never refuses
+        self.context_limit = context_limit
+        #: whether the session asked for input transcription -- read off
+        #: `session.update`, because it decides whether a committed utterance
+        #: ever gets the transcript that lets the client replace it
+        self._transcribe = False
         self._fh: IO[str] | None = None
         #: everything currently in the conversation, in order, by item id --
         #: this is what gets re-billed every response
@@ -212,6 +245,16 @@ class RecordingTransport(_QueueTransport):
         self._responses = 0
 
     async def connect(self) -> None:
+        await super().connect()
+        # A reopened session starts with an empty conversation: history does
+        # not come back with it, and neither does the bill for history. Without
+        # this a dry run that reconnects keeps charging for a conversation the
+        # server has forgotten, which would make the last resort in
+        # `session._on_context_full` look like it changed nothing.
+        self._ledger = {}
+        self._pending_input = _InputTally()
+        self._cached = 0
+        self._cache_ceiling = _NO_CEILING
         if self.path is not None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._fh = open(self.path, "w", buffering=1)
@@ -241,30 +284,114 @@ class RecordingTransport(_QueueTransport):
         if kind == "session.update":
             # The persona is the one thing charged on every single request and
             # never deleted, so it belongs at the head of the ledger.
-            text = ((event.get("session") or {}).get("instructions")) or ""
+            session = event.get("session") or {}
+            text = session.get("instructions") or ""
             self._ledger["dry-instructions"] = _InputTally(text=text_tokens(text))
+            audio_input = (session.get("audio") or {}).get("input") or {}
+            self._transcribe = bool(audio_input.get("transcription"))
         elif kind == "input_audio_buffer.append":
             # base64 -> bytes -> samples -> ms, at 24 kHz mono s16
             b64 = event.get("audio") or ""
             self._pending_input.audio_ms += len(b64) * 3 / 4 / 2 / 24.0
         elif kind == "input_audio_buffer.commit":
-            # Committing turns the buffer into an item of its own. The server
-            # names it, so nothing can delete it -- which is exactly true of the
-            # real thing too, and part of what the growth curve is made of.
-            self._ledger[f"dry-audio-{len(self._ledger)}"] = self._pending_input
-            self._pending_input = _InputTally()
+            self._commit_audio()
         elif kind == "conversation.item.create":
             item = event.get("item") or {}
             tally = _InputTally()
             for part in item.get("content") or []:
-                if part.get("type") == "input_text":
+                if part.get("type") in ("input_text", "output_text"):
                     tally.text += text_tokens(part.get("text") or "")
                 elif part.get("type") == "input_image":
                     detail = part.get("detail", "high")
                     tally.image += image_tokens(1024, 576, detail=detail)
-            self._ledger[item.get("id") or f"dry-item-{len(self._ledger)}"] = tally
+            self._insert(
+                item.get("id") or f"dry-item-{len(self._ledger)}",
+                tally,
+                event.get("previous_item_id"),
+            )
         elif kind == "conversation.item.delete":
             self._delete(event.get("item_id") or "")
+
+    def _commit_audio(self) -> None:
+        """Turn the appended buffer into a user message item, and name it.
+
+        The server names this item, not the client, and it says so in
+        `input_audio_buffer.committed` -- which is the only way the client ever
+        learns the id, and therefore the only way the player's utterance is
+        ever removable. Feeding that event (and, when the session asked for
+        transcription, the transcript that lets the client write a replacement)
+        is what puts the audio half of pruning within reach of a dry run.
+        """
+        item_id = f"dry-heard-{len(self._ledger):04d}"
+        self._insert(item_id, self._pending_input, None)
+        self._pending_input = _InputTally()
+        self.feed({"type": "input_audio_buffer.committed", "item_id": item_id})
+        if self._transcribe:
+            self.feed(
+                {
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "item_id": item_id,
+                    "transcript": self.DRY_HEARD,
+                }
+            )
+
+    def _insert(self, item_id: str, tally: _InputTally, after: str | None) -> None:
+        """Add an item, at the end or after a named one.
+
+        `previous_item_id` is how a pruning round lands a replacement exactly
+        where the thing it replaces was, so position has to be modelled: the
+        ledger's order is what `_delete` walks to work out how much of the
+        prefix survives, and appending an item that the server would have put
+        in the middle would quietly model the wrong cache.
+
+        An insert caps the cache the same way a delete does, and for the same
+        reason -- the prefix only matches up to the first change. That is what
+        makes "replacing an item costs no more cache than deleting it" a thing
+        a dry run can be asked rather than a thing to take on trust: the delete
+        that follows caps it at the same position or earlier.
+        """
+        if after is not None and after not in self._ledger:
+            # What the API does: an unknown `previous_item_id` is an error and
+            # the item is not added. Anything that gets this wrong would
+            # otherwise show up as a silently mis-ordered conversation.
+            # Code and wording taken from what the server actually sends, so a
+            # log from a dry run and a log from a real session read alike.
+            self.feed(
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "item_create_invalid_previous_item_id",
+                        "message": (
+                            f"Error adding item: the previous item with id '{after}' "
+                            "does not exist."
+                        ),
+                    },
+                }
+            )
+            return
+        if after is None:
+            self._ledger[item_id] = tally
+            return
+        # Everything up to and *including* the named item is unchanged, so the
+        # cache still matches that far; the delete that follows in a pruning
+        # round is what caps it lower.
+        through = self._prefix_before(after) + self._ledger[after].total()
+        self._cache_ceiling = min(self._cache_ceiling, through)
+        rebuilt: dict[str, _InputTally] = {}
+        for key, value in self._ledger.items():
+            rebuilt[key] = value
+            if key == after:
+                rebuilt[item_id] = tally
+        self._ledger = rebuilt
+
+    def _prefix_before(self, item_id: str) -> int:
+        prefix = 0
+        for key, tally in self._ledger.items():
+            if key == item_id:
+                break
+            prefix += tally.total()
+        return prefix
 
     def _delete(self, item_id: str) -> None:
         """Drop an item, and cap what the next request can still claim as cached.
@@ -276,15 +403,43 @@ class RecordingTransport(_QueueTransport):
         """
         if item_id not in self._ledger:
             return
-        prefix = 0
-        for key, tally in self._ledger.items():
-            if key == item_id:
-                break
-            prefix += tally.total()
-        self._cache_ceiling = min(self._cache_ceiling, prefix)
+        self._cache_ceiling = min(self._cache_ceiling, self._prefix_before(item_id))
         del self._ledger[item_id]
 
+    def _refuse_if_full(self) -> bool:
+        """Model the ceiling `truncation = "disabled"` leaves in place.
+
+        The instructions are exempt because the API's own limit is on what
+        comes *after* them (`token_limits.post_instructions`), and because the
+        client cannot prune them anyway -- a limit that counted them would be
+        measuring something nobody can act on.
+
+        Nothing else is fed: no `response.created`, no `response.done`, no
+        counters moved. A refused response is a response that never happened,
+        and the agent has to survive exactly that -- an optimistically-set gate
+        with nothing coming to clear it.
+        """
+        if self.context_limit <= 0:
+            return False
+        instructions = self._ledger.get("dry-instructions")
+        billed = sum(tally.total() for tally in self._ledger.values())
+        if billed - (instructions.total() if instructions else 0) <= self.context_limit:
+            return False
+        self.feed(
+            {
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "conversation_too_long",
+                    "message": "Conversation is too long to create a Response.",
+                },
+            }
+        )
+        return True
+
     def _answer(self, event: dict) -> None:
+        if self._refuse_if_full():
+            return
         self._responses += 1
         item_id = f"dry-item-{self._responses:04d}"
         # Everything still in the conversation is charged again, which is the
@@ -323,9 +478,16 @@ class RecordingTransport(_QueueTransport):
         out_audio = 0 if self.text else self.ASSUMED_REPLY_TOKENS
         out_text = self.ASSUMED_TEXT_TOKENS if self.text else 0
         # The answer joins the conversation and is re-billed with the rest of
-        # it from here on, exactly like the items that prompted it.
-        self._ledger[item_id] = _InputTally(text=out_audio + out_text)
-        self._cached = billed + out_audio + out_text
+        # it from here on, exactly like the items that prompted it -- as
+        # *audio* when it was spoken, which is the whole reason replacing it
+        # with its transcript is worth doing. Billed as text it would look free
+        # already and the saving would not show up in a dry run at all.
+        self._ledger[item_id] = (
+            _InputTally(text=out_text)
+            if self.text
+            else _InputTally(audio_ms=out_audio * AUDIO_OUT_MS_PER_TOKEN)
+        )
+        self._cached = billed + self._ledger[item_id].total()
         self._cache_ceiling = _NO_CEILING
         self.feed(
             {
@@ -352,8 +514,12 @@ class RecordingTransport(_QueueTransport):
         )
 
 
-#: stand-in for "no delete has capped the cache yet"
+#: stand-in for "nothing has capped the cache yet"
 _NO_CEILING = 1 << 62
+#: output audio is billed at ~1 token per 50 ms (see `tokens.Rates`); this
+#: converts the assumed reply back into a duration so it can be re-billed as
+#: input audio, at the input rate, like the real thing
+AUDIO_OUT_MS_PER_TOKEN = 50.0
 
 
 class _InputTally:

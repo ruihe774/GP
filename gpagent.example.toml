@@ -151,23 +151,69 @@ max_image_age_s = 20.0        # never attach a screenshot older than this
 image_on_unprompted = true    # attach frames to remarks, not just replies
 max_output_tokens = 320       # backstop against rambling; hitting it truncates
 
-# Client-side pruning, OFF because as a COST measure it was measured and it
-# lost: the API re-bills the whole conversation each turn, so trimming looks
-# like an obvious win, but deleting an item invalidates the prompt-cache prefix
-# behind it and cached input is ~10x cheaper. Keeping every image billed 31008
-# image tokens for $0.0204; keeping the last two billed 8721 for $0.0268.
+# Scheduled client-side pruning, OFF because as a COST measure it was measured
+# and it lost: the API re-bills the whole conversation each turn, so trimming
+# looks like an obvious win, but removing an item invalidates the prompt-cache
+# prefix behind it and cached input is ~10x cheaper. Keeping every image billed
+# 31008 image tokens for $0.0204; keeping the last two billed 8721 for $0.0268.
 #
 # TPM is the reason to turn it on anyway. Cached tokens are cheap but they still
 # count against the rate limit in full, so a long session with frequent frames
 # eventually cannot make a request at all -- see movies.example.toml, which sets
-# both of these. What gets deleted is screenshots (current frame and trail) and
-# the per-turn system nudge, on one shared cutoff so they go in one round. The
-# conversation itself is never touched; truncation_retention_ratio is for that.
-prune_after_s = 0.0           # 0 leaves the whole question to the server
+# both of these.
+#
+# A round does not so much delete as re-state. Screenshots come back as a line
+# saying screenshots were here; the player's utterance and the agent's own reply
+# come back as their transcripts, which is the same conversation at a twentieth
+# of the tokens (and audio is 8x text to re-send). Only the per-turn nudge goes
+# without a replacement, and it goes whatever its age -- it was a sentence about
+# the turn it was written for and it has been wrong ever since.
+#
+# 0 turns off only the SCHEDULED round. A round forced by context_budget_tokens
+# or by the server refusing a response runs regardless: with truncation
+# disabled, nothing else is keeping the conversation inside the window.
+prune_after_s = 0.0
 prune_interval_s = 120.0      # floor between rounds. Each round costs one cache
-                              # invalidation whatever its size, so deleting in
+                              # invalidation whatever its size, so pruning in
                               # bulk rarely is the whole point of pruning at all.
+# What stands in for what a round removed. Short on purpose: a stub is
+# permanent, so every token in one is re-billed on every turn after it.
+# {n}/{frame_word} for images, {transcript} for the two spoken sides.
+# prune_image_stub_template = "[dropped] {n} {frame_word} of what was on screen here."
+# prune_speech_stub_template = "[they said] {transcript}"
+# prune_reply_stub_template = "{transcript}"
+# How long audio waits for its transcript before a generic stub stands in.
+# Nothing is removed before its replacement is known -- deleting audio first
+# would take the only record of what was said with it -- so this is what stops
+# one lost transcription pinning an item there for the rest of the session.
+audio_stub_wait_s = 30.0
+
+# Who is allowed to drop history when the conversation outgrows the context
+# window. "disabled" makes that this client's job exclusively, and the reason is
+# one item: the subtitle script, sent whole and deliberately placed FIRST so it
+# keys the cached prefix of every request. Server-side truncation drops from the
+# oldest end, in amortized batches that leave the cache alone -- a good trade
+# right up to the batch that takes the film's dialogue, and nothing tells the
+# client it happened. Disabled, the server refuses a response instead, which is
+# a failure this client can see and answer.
+#
+# "auto" or "retention_ratio" hand the job back to the server; the ratio (and
+# the token limit under it) are read only in the latter.
+truncation = "disabled"
 truncation_retention_ratio = 0.8
+truncation_post_instruction_tokens = 0   # 0 uses the model's own window
+
+# Prune before the ceiling rather than after it. When a response bills more
+# input than this, the next tick forces a round. It costs one cache prefix; the
+# alternative is finding the ceiling with a rejected response.create, which
+# costs a turn the player was waiting on. 0 waits for the server to complain.
+context_budget_tokens = 20000
+context_full_retries = 1      # per turn: prune once, ask once more, then give up
+context_full_keep_stubs = 8   # stubs spared when a forced round has nothing else left
+# Error codes to read as "the conversation is too long", on top of the built-in
+# heuristic. The API documents the refusal but not its code, so this is the
+# escape hatch that avoids needing a code change.
+context_full_codes = []
 
 transcribe_player = true      # readable logs, at a small per-minute cost
 transcribe_model = "gpt-4o-mini-transcribe"

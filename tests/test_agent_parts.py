@@ -579,11 +579,27 @@ class TestSdkPayloadDrift:
             frame=frame(seq=3, t=2.0),
             trail=[frame(seq=1, t=0.0), frame(seq=2, t=1.0)],
         )
+        from gpagent.agent.session import Disposable
+
+        retention = CommentaryAgent(CaptureConfig(), FakeTransport(), NullPlayer())
+        retention.cfg.truncation = "retention_ratio"
+        retention.cfg.truncation_post_instruction_tokens = 8000
         return [
             agent.session_update(),
+            # ...and the other half of the same field: a bare literal and the
+            # retention-ratio object are different branches of one union, so
+            # only one of them is covered by any single session.
+            retention.session_update(),
             agent._text_item(0.0, "hello"),
             agent._images_item(0.0, ctx),
             agent._reason_item(0.0, "reply"),
+            # The two shapes pruning puts back: `previous_item_id` is what
+            # lands a replacement where the thing it replaced was, and an
+            # assistant item is the only way a spoken reply comes back as text.
+            agent._stub_item(0.0, Disposable(0.0, "i", "image", replacement="[dropped] 2 frames.")),
+            agent._stub_item(
+                0.0, Disposable(0.0, "i", "said", role="assistant", replacement="a remark")
+            ),
             {"type": "input_audio_buffer.append", "audio": "AAAA"},
             {"type": "input_audio_buffer.commit"},
             {"type": "response.create", "response": {"instructions": "be brief"}},
@@ -758,6 +774,180 @@ class TestRecordingTransport:
         # cost of pruning is per round rather than per item.
         assert (await self.usage(transport))["input_token_details"]["cached_tokens"] > 0
         assert steady["input_tokens"] > 0
+        await transport.close()
+
+    async def stub_item(self, transport, item_id, after, text="[dropped] 1 frame."):
+        await transport.send(
+            {
+                "type": "conversation.item.create",
+                "previous_item_id": after,
+                "item": {
+                    "id": item_id,
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            }
+        )
+
+    async def test_an_inserted_item_lands_where_it_was_asked_to(self):
+        """Position is what `previous_item_id` is for, so position is modelled.
+
+        The ledger's order is what the cached-prefix rule is computed against,
+        so an item appended where the server would have inserted it models a
+        different cache from the one the session will actually get.
+        """
+        transport = RecordingTransport()
+        await transport.connect()
+        await self.image_item(transport, "img-1")
+        await self.image_item(transport, "img-2")
+        await self.stub_item(transport, "stub-1", "img-1")
+        assert list(transport._ledger) == ["img-1", "stub-1", "img-2"]
+        await transport.close()
+
+    async def test_inserting_after_a_missing_item_is_an_error_and_not_an_append(self):
+        """What the API does, and the reason a replacement is created *first*.
+
+        If an unknown `previous_item_id` quietly appended instead, a round that
+        deleted before it created would look like it worked and would have put
+        the replacement at the wrong end of the conversation.
+        """
+        transport = RecordingTransport()
+        await transport.connect()
+        await self.stub_item(transport, "stub-1", "img-nope")
+        assert "stub-1" not in transport._ledger
+        errors = []
+        async for event in transport:
+            errors.append(event)
+            break
+        assert errors[0]["error"]["code"] == "item_create_invalid_previous_item_id"
+        await transport.close()
+
+    async def test_replacing_an_item_costs_no_more_cache_than_deleting_it(self):
+        """The claim the whole replacement design rests on.
+
+        A prompt cache is a prefix match, so a round's ceiling is fixed by its
+        earliest *delete*. Every insert lands at or after that point, which
+        means the stubs are paid for in tokens -- a dozen each -- and not in a
+        second invalidation.
+        """
+        transport = RecordingTransport()
+        await transport.connect()
+        await self.image_item(transport, "img-1")
+        await self.image_item(transport, "img-2")
+        await self.usage(transport)
+        await self.usage(transport)
+        await transport.send({"type": "conversation.item.delete", "item_id": "img-1"})
+        deleting = await self.usage(transport)
+
+        replacing = RecordingTransport()
+        await replacing.connect()
+        await self.image_item(replacing, "img-1")
+        await self.image_item(replacing, "img-2")
+        await self.usage(replacing)
+        await self.usage(replacing)
+        await self.stub_item(replacing, "stub-1", "img-1")
+        await replacing.send({"type": "conversation.item.delete", "item_id": "img-1"})
+        replaced = await self.usage(replacing)
+
+        cached = "cached_tokens"
+        assert replaced["input_token_details"][cached] == deleting["input_token_details"][cached]
+        assert replaced["input_tokens"] > deleting["input_tokens"], "a stub is not free"
+        await transport.close()
+        await replacing.close()
+
+    async def test_a_committed_utterance_is_named_so_it_can_be_replaced(self):
+        """The id only ever arrives on `input_audio_buffer.committed`.
+
+        Without it the player's utterance is unremovable for the life of the
+        session, which is what made audio a permanent floor under the request.
+        """
+        transport = RecordingTransport()
+        await transport.connect()
+        await transport.send(
+            {
+                "type": "session.update",
+                "session": {"audio": {"input": {"transcription": {"model": "whisper-1"}}}},
+            }
+        )
+        await transport.send({"type": "input_audio_buffer.append", "audio": "AAAA" * 100})
+        await transport.send({"type": "input_audio_buffer.commit"})
+        received = [transport._incoming.get_nowait() for _ in range(2)]
+        kinds = [e["type"] for e in received]
+        assert kinds == [
+            "input_audio_buffer.committed",
+            "conversation.item.input_audio_transcription.completed",
+        ]
+        item_id = received[0]["item_id"]
+        assert received[1]["item_id"] == item_id
+        assert item_id in transport._ledger
+        await transport.close()
+
+    async def test_an_untranscribed_utterance_is_committed_without_a_transcript(self):
+        """`transcribe_player = false` leaves audio nothing to be replaced by.
+
+        The session has a fallback sentence for exactly this, and it only gets
+        exercised offline if the dry run declines to invent a transcript the
+        real API would never have sent.
+        """
+        transport = RecordingTransport()
+        await transport.connect()
+        await transport.send({"type": "session.update", "session": {"audio": {"input": {}}}})
+        await transport.send({"type": "input_audio_buffer.append", "audio": "AAAA" * 100})
+        await transport.send({"type": "input_audio_buffer.commit"})
+        assert transport._incoming.get_nowait()["type"] == "input_audio_buffer.committed"
+        assert transport._incoming.empty(), "no transcription was configured"
+        await transport.close()
+
+    async def test_a_spoken_reply_is_re_billed_as_audio(self):
+        """It is audio in the conversation, and audio is 8x text to re-send.
+
+        Billed as text it would look nearly free already, and replacing it with
+        its transcript -- the whole point of pruning the agent's own turns --
+        would measure as no saving at all.
+        """
+        transport = RecordingTransport()
+        await transport.connect()
+        await self.usage(transport)
+        second = await self.usage(transport)
+        assert second["input_token_details"]["audio_tokens"] > 0
+        await transport.close()
+
+    async def test_a_conversation_over_the_limit_is_refused_rather_than_answered(self):
+        """What `truncation = "disabled"` buys, and the bill for it.
+
+        No `response.created`, no `response.done`: a refused response is one
+        that never happened, and the agent has to survive its own optimistic
+        gate with nothing coming to clear it.
+        """
+        transport = RecordingTransport(context_limit=100)
+        await transport.connect()
+        await self.image_item(transport, "img-1")
+        await transport.send({"type": "response.create", "response": {}})
+        first = transport._incoming.get_nowait()
+        assert first["type"] == "error"
+        assert first["error"]["code"] == "conversation_too_long"
+        assert transport._incoming.empty(), "a refusal is not also an answer"
+        await transport.close()
+
+    async def test_a_small_conversation_is_answered_under_the_same_limit(self):
+        transport = RecordingTransport(context_limit=100)
+        await transport.connect()
+        usage = await self.usage(transport)
+        assert usage["input_tokens"] >= 0
+        await transport.close()
+
+    async def test_a_reopened_dry_run_starts_from_an_empty_conversation(self):
+        """History does not come back after a reconnect, and neither does its bill."""
+        transport = RecordingTransport()
+        await transport.connect()
+        await self.image_item(transport, "img-1")
+        before = await self.usage(transport)
+        await transport.close()
+        await transport.connect()
+        after = await self.usage(transport)
+        assert before["input_token_details"]["image_tokens"] > 0
+        assert after["input_token_details"]["image_tokens"] == 0
         await transport.close()
 
     async def test_a_text_dry_run_is_answered_in_text(self):

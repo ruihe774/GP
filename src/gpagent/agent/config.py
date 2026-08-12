@@ -26,6 +26,7 @@ __all__ = [
     "SubtitleConfig",
     "HudAnchor",
     "HudStyle",
+    "TruncationMode",
 ]
 
 ImageDetail = Literal["auto", "low", "high"]
@@ -34,6 +35,10 @@ ReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh"]
 #: `output_modalities` on `session.update`, so it decides what the model
 #: generates rather than how one response is presented.
 OutputMode = Literal["voice", "text"]
+#: Who trims a conversation that outgrows the model's context window.
+#: "disabled" makes it the client's job exclusively; the other two hand it back
+#: to the server. See `AgentConfig.truncation`.
+TruncationMode = Literal["disabled", "auto", "retention_ratio"]
 #: Which corner (or edge) the toast stack sits in. The vertical half also picks
 #: the growth direction, so the anchored edge never moves as entries arrive.
 HudAnchor = Literal[
@@ -156,31 +161,86 @@ class AgentConfig:
     # added per turn. Against that, pruning is a straight win and the
     # invalidated prefix is what it costs.
     #
-    # What gets pruned is what this client generated and would happily generate
-    # again: screenshots (current frame and trail alike) and the per-turn system
-    # nudge. The conversation proper -- what the player said, what the agent
-    # answered -- is never deleted from under the model; the server's
-    # `truncation.retention_ratio` is the mechanism for that, and it drops
-    # history in amortized batches designed to keep the cache prefix intact.
-    #: age at which images and per-turn system notes are deleted, 0 to leave
-    #: the whole question to the server. One cutoff for both, deliberately: they
-    #: are created together and deleting them in the same round costs one cache
-    #: invalidation rather than two.
+    # `prune_after_s = 0` turns off the *scheduled* round only. A round forced
+    # by `context_budget_tokens` or by the server refusing a response still
+    # runs: with `truncation = "disabled"` there is nothing else left to stop a
+    # session growing until it cannot make a request, and "do not pay the cache
+    # routinely" is a different statement from "do not survive".
+    #
+    # A round does not delete history so much as re-state it cheaply. Images
+    # come back as a line saying images were here; the player's utterance and
+    # the agent's own reply come back as their transcripts, which is the same
+    # thread of conversation at a twentieth of the tokens. Only the per-turn
+    # nudge is deleted outright -- it means nothing once its turn is over.
+    #: age at which images and spoken turns are replaced by text, 0 for no
+    #: scheduled pruning at all. One cutoff for every kind, deliberately: they
+    #: are created together and removing them in the same round costs one cache
+    #: invalidation rather than several.
     prune_after_s: float = 0.0
     #: Floor between pruning rounds. This is the knob that makes pruning cheap:
-    #: each round invalidates the cached prefix once, so nine items deleted in
-    #: one round cost a ninth of what they cost deleted one per turn. Nothing is
-    #: sent between rounds however stale it gets, so the effective retention is
+    #: each round invalidates the cached prefix once, so nine items replaced in
+    #: one round cost a ninth of what they cost one per turn. Nothing is sent
+    #: between rounds however stale it gets, so the effective retention is
     #: `prune_after_s` to `prune_after_s + prune_interval_s`.
     prune_interval_s: float = 120.0
+    #: Templates for what stands in for a removed item; None uses the built-in
+    #: sentence (see `session.STUBS`). Short on purpose: a stub is permanent,
+    #: so every token in one is re-billed on every turn that follows it.
+    #: `{n}` and `{frame_word}` for images, `{transcript}` for speech.
+    prune_image_stub_template: str | None = None
+    prune_speech_stub_template: str | None = None
+    prune_reply_stub_template: str | None = None
+    #: How long an audio item waits for its transcript before a generic stub
+    #: stands in for it. Audio is never removed before its replacement is
+    #: known -- deleting it first would take the only record of what was said
+    #: with it -- so without a deadline one lost transcription pins an item in
+    #: the conversation for the rest of the session.
+    audio_stub_wait_s: float = 30.0
     #: Hard ceiling per response; audio counts toward it at ~1 token / 50 ms.
     #: A backstop against a rambling response, not a length control -- brevity
     #: is the persona's job. Hitting this truncates mid-word, so it is set well
     #: above the observed mean (72 tokens over 14 responses on sess5); 220 was
     #: tight enough to cut one of them off.
     max_output_tokens: int = 320
-    #: server-side fallback for the same problem
+
+    # -- the context ceiling ----------------------------------------------
+    # Who is allowed to drop history. The server's own mechanism drops from the
+    # oldest end, and the oldest end of this conversation is the subtitle
+    # script: the one item the session cannot reconstruct, deliberately placed
+    # first so it keys the cached prefix of every request (see
+    # `session._seed_subtitles`). Amortized batches that keep the cache intact
+    # are a good trade right up until the batch takes the film's dialogue.
+    #
+    # So "disabled", and the client owns the ceiling instead: a pruning round
+    # forced by `context_budget_tokens` before the limit, another forced by the
+    # server's refusal after it, and a reconnect if neither can free anything.
+    # "auto" or "retention_ratio" hand the job back to the server.
+    truncation: TruncationMode = "disabled"
+    #: Read only when `truncation = "retention_ratio"`: the fraction of the
+    #: post-instruction window to retain when trimming, where 1.0 drops only
+    #: what it must and lower values drop extra to buy headroom.
     truncation_retention_ratio: float = 0.8
+    #: Ceiling on input tokens after instructions, for the retention-ratio
+    #: form. 0 omits `token_limits` and leaves the model's own window in charge.
+    truncation_post_instruction_tokens: int = 0
+    #: Force a pruning round once a response bills more input than this; 0
+    #: never does. The point of a budget is to meet the ceiling on our own
+    #: terms: without one the first sign of trouble is a rejected
+    #: `response.create`, which costs a turn the player was waiting on.
+    context_budget_tokens: int = 20000
+    #: How many times one turn may be asked for again after the server says the
+    #: conversation is too long. Per turn, not per session.
+    context_full_retries: int = 1
+    #: Stubs kept when a forced round has run out of anything else to remove.
+    #: The wall case: once every image and every utterance has already become a
+    #: stub, the stubs are the only thing left to spend, and spending the
+    #: oldest of them beats a session that can never speak again.
+    context_full_keep_stubs: int = 8
+    #: Error codes to read as "the conversation is too long" on top of the
+    #: built-in heuristic. The API documents that disabling truncation makes
+    #: the server error on an oversized conversation but does not document the
+    #: code, so this is the escape hatch that avoids needing a code change.
+    context_full_codes: list[str] = field(default_factory=list)
 
     #: transcribe the player so the session log is readable. Costs extra per
     #: minute of speech; turn it off for long sessions where nobody will read it.

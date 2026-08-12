@@ -783,8 +783,19 @@ def deleted(agent):
     return [e["item_id"] for e in agent.transport.sent_of_type("conversation.item.delete")]
 
 
+def created_text(agent, prefix):
+    """Every line of text sent in items whose id starts with `prefix`."""
+    return [
+        part["text"]
+        for e in agent.transport.sent_of_type("conversation.item.create")
+        if e["item"]["id"].startswith(prefix)
+        for part in e["item"]["content"]
+        if part["type"] in ("input_text", "output_text")
+    ]
+
+
 class TestContextPruning:
-    """What the client deletes again, and how rarely it does it.
+    """What the client removes again, and how rarely it does it.
 
     The conversation is re-billed as input on every turn, so a screenshot left
     in it is paid for once per response for as long as it stays -- and cached
@@ -795,9 +806,13 @@ class TestContextPruning:
         agent.cfg.prune_after_s = 60.0
         await turns(agent, 4)
         assert deleted(agent), "screenshots must not accumulate forever"
-        assert set(deleted(agent)) <= set(created(agent, "gpimg")) | set(
-            created(agent, "gprsn")
+        removable = (
+            set(created(agent, "gpimg"))
+            | set(created(agent, "gprsn"))
+            # the agent's own replies, named by the server in `turns`
+            | {f"item-{i}" for i in range(4)}
         )
+        assert set(deleted(agent)) <= removable
 
     async def test_the_screen_note_goes_with_the_frames_it_introduces(self, agent):
         """"[screen] 2 earlier frames..." is meaningless once they are gone.
@@ -913,6 +928,406 @@ class TestContextPruning:
         await agent.handle(speech(), now=101.0)
         item = agent.transport.sent_of_type("conversation.item.create")[0]["item"]
         assert item["id"].startswith("gpimg")
+
+    async def test_a_pruned_image_leaves_a_line_saying_there_were_images(self, agent):
+        """The moment is kept; only the pixels go.
+
+        A screenshot deleted outright is a beat of the session the model no
+        longer knows happened. A dozen tokens buys the fact of it back.
+        """
+        agent.cfg.prune_after_s = 60.0
+        agent.cfg.image_trail = 2
+        await turns(agent, 4)
+        stubs = [text for text in created_text(agent, "gpstb")]
+        assert [t for t in stubs if t.startswith("[dropped]")], stubs
+        assert not set(created(agent, "gpstb")) & set(deleted(agent)), "a stub is not itself pruned"
+
+    async def test_the_stub_lands_where_the_item_it_replaces_was(self, agent):
+        """`previous_item_id`, so the conversation keeps its chronology.
+
+        Appended at the tail instead, the note about a screenshot from four
+        minutes ago would read as a remark about what is on screen now.
+        """
+        agent.cfg.prune_after_s = 60.0
+        await turns(agent, 4)
+        creates = agent.transport.sent_of_type("conversation.item.create")
+        stubs = [e for e in creates if e["item"]["id"].startswith("gpstb")]
+        assert stubs, "something must have been replaced"
+        for event in stubs:
+            assert event["previous_item_id"] in set(deleted(agent))
+
+    async def test_the_stub_is_created_before_the_item_it_replaces_is_deleted(self, agent):
+        """The order is forced: `previous_item_id` must name a live item.
+
+        Delete first and the create is refused, the replacement is lost, and
+        all that is left of it is an error line.
+        """
+        agent.cfg.prune_after_s = 60.0
+        await turns(agent, 4)
+        order = [
+            (e["type"], e.get("item", {}).get("id") or e.get("item_id"), e.get("previous_item_id"))
+            for e in agent.transport.sent
+            if e["type"] in ("conversation.item.create", "conversation.item.delete")
+        ]
+        seen_deleted: set[str] = set()
+        for kind, item_id, after in order:
+            if kind == "conversation.item.delete":
+                seen_deleted.add(item_id)
+            elif after is not None:
+                assert after not in seen_deleted, f"{item_id} was inserted after a dead item"
+
+    async def test_every_stale_nudge_goes_in_one_round_however_young(self, agent):
+        """A nudge is a sentence about its own turn, and only its own turn.
+
+        The cutoff is about what is still worth looking at; a nudge from the
+        previous turn was not worth looking at the moment the turn ended.
+        """
+        agent.cfg.prune_after_s = 200.0
+        await turns(agent, 1, start=100.0)
+        await turns(agent, 3, start=250.0, every=10.0)
+        # One old turn is what triggers the round, at a cutoff of t=110. The
+        # three nudges from 251, 261 and 271 are a fraction of that age.
+        agent._clock_obj.set(310.0)
+        await agent.tick(310.0)
+
+        notes = created(agent, "gprsn")
+        gone = set(deleted(agent))
+        assert len(notes) == 4
+        assert len(gone & set(notes)) == 3, "every nudge but the newest, whatever its age"
+
+    async def test_the_current_nudge_survives_the_round_that_takes_the_rest(self, agent):
+        """It is the only one that is still true."""
+        agent.cfg.prune_after_s = 200.0
+        await turns(agent, 1, start=100.0)
+        await turns(agent, 3, start=250.0, every=10.0)
+        agent._clock_obj.set(310.0)
+        await agent.tick(310.0)
+        assert created(agent, "gprsn")[-1] not in set(deleted(agent))
+
+    async def test_a_round_is_no_more_frequent_than_it_was(self, agent):
+        """Sweeping every nudge must not become a reason to *start* a round.
+
+        If it did, a round would fire every `prune_interval_s` for the rest of
+        the session and throw away the prompt-cache prefix each time, to save
+        thirty tokens of nudge.
+        """
+        agent.cfg.prune_after_s = 300.0
+        agent.cfg.prune_interval_s = 10.0
+        await turns(agent, 6, every=20.0)
+        assert [line for line in agent.lines if line.kind == "prune"] == []
+
+
+class TestSpokenTurnsBecomeText:
+    """Audio is the one thing the client could never remove, and the dearest.
+
+    A committed utterance and a spoken reply are named by the *server*, so
+    until the client learned those names they sat in the conversation for the
+    life of the session, re-billed as audio at 8x the text rate every turn.
+    Both have a text version already: the transcript.
+    """
+
+    async def spoke(self, agent, *, t=100.0, transcript="that was close"):
+        """One reply turn, transcribed on both sides, through to response.done."""
+        await agent.handle(frame(), now=t)
+        await agent.handle(speech(), now=t + 1)
+        await agent.on_server_event(
+            {"type": "input_audio_buffer.committed", "item_id": "heard-1"}
+        )
+        await agent.on_server_event(
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "heard-1",
+                "transcript": "did you see that",
+            }
+        )
+        await agent.on_server_event(
+            {"type": "response.output_item.added", "item": {"id": "said-1"}}
+        )
+        await agent.on_server_event(
+            {
+                "type": "response.output_audio_transcript.done",
+                "item_id": "said-1",
+                "transcript": transcript,
+            }
+        )
+        await agent.on_server_event(
+            {"type": "response.done", "response": {"status": "completed", "usage": {}}}
+        )
+
+    async def test_a_committed_utterance_is_replaced_by_its_transcription(self, agent):
+        agent.cfg.prune_after_s = 60.0
+        await self.spoke(agent)
+        agent._clock_obj.set(400.0)
+        await agent.tick(400.0)
+
+        assert "heard-1" in deleted(agent)
+        assert "[they said] did you see that" in created_text(agent, "gpstb")
+
+    async def test_the_agents_own_words_go_back_in_as_an_assistant_message(self, agent):
+        """`conversation.item.create` cannot carry assistant audio, so: text.
+
+        Unmarked, too. The agent did say those words, and a bracket around
+        them would read as a stage direction for it to imitate.
+        """
+        agent.cfg.prune_after_s = 60.0
+        await self.spoke(agent, transcript="that was close")
+        agent._clock_obj.set(400.0)
+        await agent.tick(400.0)
+
+        stub = [
+            e
+            for e in agent.transport.sent_of_type("conversation.item.create")
+            if e["item"]["id"].startswith("gpstb") and e["item"]["role"] == "assistant"
+        ]
+        assert stub, "the reply must come back as the assistant's own words"
+        assert stub[0]["item"]["content"] == [{"type": "output_text", "text": "that was close"}]
+        assert "said-1" in deleted(agent)
+
+    async def test_audio_is_not_deleted_before_its_transcript_arrives(self, agent):
+        """Delete it first and the only record of what was said goes with it."""
+        agent.cfg.prune_after_s = 60.0
+        agent.cfg.audio_stub_wait_s = 1000.0  # the deadline is the next test
+        await agent.handle(frame(), now=100.0)
+        await agent.handle(speech(), now=101.0)
+        await agent.on_server_event(
+            {"type": "input_audio_buffer.committed", "item_id": "heard-1"}
+        )
+        agent._clock_obj.set(400.0)
+        await agent.tick(400.0)
+        assert "heard-1" not in deleted(agent)
+
+    async def test_a_transcript_that_never_arrives_stops_pinning_the_item(self, agent):
+        """...but not forever: an absolute gate that cannot clear is a leak.
+
+        One transcription lost to a hiccup would otherwise hold its audio in
+        the conversation for the rest of the session.
+        """
+        agent.cfg.prune_after_s = 60.0
+        agent.cfg.audio_stub_wait_s = 30.0
+        await agent.handle(frame(), now=100.0)
+        await agent.handle(speech(), now=101.0)
+        await agent.on_server_event(
+            {"type": "input_audio_buffer.committed", "item_id": "heard-1"}
+        )
+        await agent.on_server_event(
+            {"type": "response.done", "response": {"status": "completed", "usage": {}}}
+        )
+        agent._clock_obj.set(400.0)
+        await agent.tick(400.0)
+        assert "heard-1" in deleted(agent)
+        assert "[they said something here.]" in created_text(agent, "gpstb")
+
+    async def test_a_failed_transcription_settles_the_item_at_once(self, agent):
+        agent.cfg.prune_after_s = 60.0
+        await agent.handle(speech(), now=101.0)
+        await agent.on_server_event(
+            {"type": "input_audio_buffer.committed", "item_id": "heard-1"}
+        )
+        await agent.on_server_event(
+            {
+                "type": "conversation.item.input_audio_transcription.failed",
+                "item_id": "heard-1",
+            }
+        )
+        await agent.on_server_event(
+            {"type": "response.done", "response": {"status": "completed", "usage": {}}}
+        )
+        agent._clock_obj.set(200.0)
+        await agent.tick(200.0)
+        assert "heard-1" in deleted(agent)
+
+    async def test_a_cancelled_reply_keeps_the_part_that_was_said(self, agent):
+        """No transcript event follows a cut-off response; what was heard does."""
+        agent.cfg.prune_after_s = 60.0
+        await agent.handle(frame(), now=100.0)
+        await agent.handle(speech(), now=101.0)
+        await agent.on_server_event(
+            {"type": "response.output_item.added", "item": {"id": "said-1"}}
+        )
+        await agent.on_server_event(
+            {
+                "type": "response.output_audio_transcript.done",
+                "item_id": "said-1",
+                "transcript": "wait, is that",
+            }
+        )
+        await agent._cancel_response(102.0, why="barge-in")
+        agent._clock_obj.set(400.0)
+        await agent.tick(400.0)
+        assert "wait, is that" in created_text(agent, "gpstb")
+
+    async def test_a_text_session_has_nothing_to_replace(self, agent):
+        """Its assistant item is already the words, at the text rate."""
+        agent.cfg.output = "text"
+        agent.cfg.prune_after_s = 60.0
+        await agent.handle(frame(), now=100.0)
+        await agent.handle(speech(), now=101.0)
+        await agent.on_server_event(
+            {"type": "response.output_item.added", "item": {"id": "said-1"}}
+        )
+        await agent.on_server_event(
+            {"type": "response.output_text.done", "item_id": "said-1", "text": "nice"}
+        )
+        await agent.on_server_event(
+            {"type": "response.done", "response": {"status": "completed", "usage": {}}}
+        )
+        agent._clock_obj.set(400.0)
+        await agent.tick(400.0)
+        assert deleted(agent), "the screenshots still go"
+        assert "said-1" not in deleted(agent)
+
+
+class TestConversationFull:
+    """What happens once nothing is trimming the conversation but this client.
+
+    `truncation = "disabled"` keeps the server's hands off the oldest end of
+    the conversation, where the film's dialogue lives. The price is documented
+    and paid here: the server refuses a response rather than shrinking one.
+    """
+
+    TOO_LONG = {
+        "type": "invalid_request_error",
+        "code": "conversation_too_long",
+        "message": "Conversation is too long to create a Response.",
+    }
+
+    async def refuse(self, agent, err=None):
+        await agent.on_server_event({"type": "error", "error": err or self.TOO_LONG})
+
+    async def test_the_session_asks_for_no_server_truncation(self, agent):
+        assert agent.session_update()["session"]["truncation"] == "disabled"
+
+    async def test_the_ratio_is_still_available_to_anyone_who_wants_it(self, agent):
+        agent.cfg.truncation = "retention_ratio"
+        agent.cfg.truncation_retention_ratio = 0.6
+        agent.cfg.truncation_post_instruction_tokens = 8000
+        assert agent.session_update()["session"]["truncation"] == {
+            "type": "retention_ratio",
+            "retention_ratio": 0.6,
+            "token_limits": {"post_instructions": 8000},
+        }
+
+    async def test_a_full_conversation_is_pruned_and_the_turn_asked_again(self, agent):
+        agent.cfg.prune_after_s = 60.0
+        await turns(agent, 3, every=40.0)
+        await agent.handle(frame(seq=9), now=400.0)
+        await agent.handle(speech(), now=401.0)
+        before = len(agent.transport.sent_of_type("response.create"))
+        await self.refuse(agent)
+
+        assert deleted(agent), "room has to actually be made"
+        assert len(agent.transport.sent_of_type("response.create")) == before + 1
+
+    async def test_a_forced_round_runs_even_with_scheduled_pruning_off(self, agent):
+        """Off means "do not pay the cache routinely", not "do not survive"."""
+        assert agent.cfg.prune_after_s == 0.0
+        await turns(agent, 3, every=40.0)
+        await agent.handle(frame(seq=9), now=400.0)
+        await agent.handle(speech(), now=401.0)
+        await self.refuse(agent)
+        assert deleted(agent)
+
+    async def test_a_forced_round_never_touches_the_turn_it_is_making_room_for(self, agent):
+        """Freeing room by deleting the question is asking a different question."""
+        await turns(agent, 3, every=40.0)
+        await agent.handle(frame(seq=9), now=400.0)
+        await agent.handle(speech(), now=401.0)
+        live = set(agent._live_items)
+        await self.refuse(agent)
+        assert live, "the turn must have items of its own"
+        assert not live & set(deleted(agent))
+
+    async def test_the_same_refusal_reported_twice_only_costs_one_retry(self, agent):
+        """It arrives as an `error`, or on `response.done`, or both."""
+        agent.cfg.prune_after_s = 60.0
+        await turns(agent, 3, every=40.0)
+        await agent.handle(frame(seq=9), now=400.0)
+        await agent.handle(speech(), now=401.0)
+        before = len(agent.transport.sent_of_type("response.create"))
+        await self.refuse(agent)
+        await agent.on_server_event(
+            {
+                "type": "response.done",
+                "response": {"status": "failed", "status_details": {"error": self.TOO_LONG}},
+            }
+        )
+        assert len(agent.transport.sent_of_type("response.create")) == before + 1
+
+    async def test_a_refusal_that_frees_nothing_gives_up_rather_than_looping(self, agent):
+        """The very first turn: everything in the conversation is the turn."""
+        await agent.handle(frame(), now=100.0)
+        await agent.handle(speech(), now=101.0)
+        before = len(agent.transport.sent_of_type("response.create"))
+        await self.refuse(agent)
+        assert len(agent.transport.sent_of_type("response.create")) == before
+        assert not agent._response_active, "the gate must not be left holding"
+        assert [line for line in agent.lines if line.kind == "note"]
+
+    async def test_a_session_with_nothing_left_to_drop_reopens(self, agent):
+        """The same recovery the API's 60-minute cap already gets."""
+        await agent.handle(frame(), now=100.0)
+        await agent.handle(speech(), now=101.0)
+        await self.refuse(agent)
+        assert agent.transport._closed, "the pump reopens what it finds closed"
+        assert [line for line in agent.lines if "reopening" in line.text]
+
+    async def test_a_rate_limit_still_reads_as_a_rate_limit(self, agent):
+        """The closest miss there is: also about size, but of a *window*.
+
+        Pruning would not help it, and a spurious round throws away context and
+        pays for a duplicate response to fix a problem that was not there.
+        """
+        await turns(agent, 3, every=40.0)
+        await agent.handle(frame(seq=9), now=400.0)
+        await agent.handle(speech(), now=401.0)
+        before = len(deleted(agent))
+        await self.refuse(
+            agent,
+            {
+                "type": "invalid_request_error",
+                "code": "rate_limit_exceeded",
+                "message": "Rate limit reached: request too large for gpt-realtime",
+            },
+        )
+        assert [line for line in agent.lines if line.kind == "error"], "it is still reported"
+        assert len(deleted(agent)) == before
+
+    async def test_an_unknown_code_can_be_named_in_the_config(self, agent):
+        """The API does not document the one it actually sends."""
+        agent.cfg.context_full_codes = ["something_we_have_not_seen"]
+        await turns(agent, 3, every=40.0)
+        await agent.handle(frame(seq=9), now=400.0)
+        await agent.handle(speech(), now=401.0)
+        await self.refuse(
+            agent, {"type": "invalid_request_error", "code": "something_we_have_not_seen"}
+        )
+        assert deleted(agent)
+
+    async def test_the_budget_forces_a_round_before_the_server_complains(self, agent):
+        """Meeting the ceiling on our own terms costs a cache prefix; meeting
+        it on the server's costs a turn the player was waiting for."""
+        agent.cfg.context_budget_tokens = 500
+        await turns(agent, 2, every=40.0)
+        await agent.handle(frame(seq=9), now=400.0)
+        await complete_response(agent, item_id="item-9")
+        agent.meter.add({"input_tokens": 900})
+        await agent.on_server_event(
+            {
+                "type": "response.done",
+                "response": {"status": "completed", "usage": {"input_tokens": 900}},
+            }
+        )
+        agent._clock_obj.set(410.0)
+        await agent.tick(410.0)
+        assert deleted(agent), "the budget is what noticed"
+        assert [line for line in agent.lines if line.kind == "prune"]
+
+    async def test_a_request_inside_the_budget_prunes_nothing(self, agent):
+        agent.cfg.context_budget_tokens = 5000
+        await turns(agent, 2, every=40.0)
+        agent._clock_obj.set(410.0)
+        await agent.tick(410.0)
+        assert deleted(agent) == []
 
 
 class TestUsageIsRecorded:

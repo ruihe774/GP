@@ -1100,7 +1100,9 @@ async def _commentate(cfg: CaptureConfig, args) -> int:
 
     transport: Transport
     if args.dry_run:
-        transport = RecordingTransport(text=cfg.agent.text_output)
+        transport = RecordingTransport(
+            text=cfg.agent.text_output, context_limit=args.dry_run_context_limit
+        )
     else:
         from .agent.env import MissingAPIKey, load_api_key
 
@@ -1302,9 +1304,16 @@ def _print_agent_report(agent, args, out_dir: Path | None) -> None:
     pruned = report.get("pruned") or {}
     if pruned.get("rounds"):
         # Rounds is the number that matters: one round is one invalidated
-        # prompt-cache prefix, whether it dropped two items or twenty.
-        kinds = ", ".join(f"{n} {kind}" for kind, n in sorted(pruned.items()) if kind != "rounds")
-        print(f"  pruned          {kinds} in {pruned['rounds']} rounds")
+        # prompt-cache prefix, whether it removed two items or twenty. `forced`
+        # says how many of them the budget or the server asked for rather than
+        # the clock, which is the number that says a session was up against the
+        # context window rather than merely tidying.
+        totals = {"rounds", "forced", "replaced"}
+        kinds = ", ".join(f"{n} {kind}" for kind, n in sorted(pruned.items()) if kind not in totals)
+        rounds = f"{pruned['rounds']} rounds"
+        if pruned.get("forced"):
+            rounds += f" ({pruned['forced']} forced)"
+        print(f"  pruned          {kinds} in {rounds}, {pruned.get('replaced', 0)} left a stub")
     if report.get("output") == "text":
         print(f"  wrote           {len(agent.hud.shown)} remarks to the {agent.hud.name} hud")
     else:
@@ -1471,6 +1480,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="never connect: print what would be sent, and what it would cost",
+    )
+    commentate.add_argument(
+        "--dry-run-context-limit",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "with --dry-run, refuse a response once the conversation passes N "
+            "post-instruction tokens, the way the API does with truncation "
+            "disabled -- exercises the pruning and reconnect recovery offline"
+        ),
     )
     commentate.add_argument("--model", help="override agent.model")
     commentate.add_argument(

@@ -56,6 +56,25 @@ async def _wait_for(agent, kinds, timeout=45.0):
     return [line for line in agent.lines if line.kind in kinds]
 
 
+async def _wait_for_billing(agent, timeout=45.0):
+    """Wait for `response.done`, which is later than the remark itself.
+
+    The transcript (or the written remark) arrives as its own event and is what
+    puts a `say` line in the log; the usage block does not turn up until the
+    response is finished. Closing the session in between is a race that leaves
+    the meter empty and reads as "it never spoke", which is exactly the wrong
+    diagnosis.
+    """
+
+    async def poll():
+        while not agent.meter.responses:
+            if any(line.kind == "error" for line in agent.lines):
+                return
+            await asyncio.sleep(0.1)
+
+    await asyncio.wait_for(poll(), timeout=timeout)
+
+
 def test_the_session_configuration_is_accepted(api_key):
     """The whole point: `session.update` as we build it must not error."""
 
@@ -92,6 +111,7 @@ def test_it_answers_a_spoken_question_with_a_frame_attached(api_key):
             await agent.handle(frame, now=1.5)
             await agent.handle(speech, now=2.0)
             said = await _wait_for(agent, {"say", "error"})
+            await _wait_for_billing(agent)
             return said, agent.meter
         finally:
             await agent.close()
@@ -101,6 +121,62 @@ def test_it_answers_a_spoken_question_with_a_frame_attached(api_key):
     assert said[0].text.strip(), "the model said nothing at all"
     assert meter.out_audio > 0, "no audio tokens billed -- it did not speak"
     assert meter.in_image > 0, "the frame was not counted as image input"
+
+
+def test_a_pruning_round_is_accepted_mid_conversation(api_key):
+    """The one thing in the pruning design the docs cannot settle.
+
+    A round replaces items rather than deleting them, which means two shapes
+    the client had never sent before: a `conversation.item.create` carrying
+    `previous_item_id` to land the replacement where the original was, and an
+    assistant message carrying `output_text` -- the API says outright that it
+    "cannot populate assistant audio messages", so a spoken reply can only come
+    back as text. Both survive the SDK's transform; only the server can say
+    whether it takes them, and getting it wrong means every round earns an
+    error and quietly loses the replacement.
+    """
+    from gpagent.agent.session import Disposable
+    from gpagent.events import ScreenFrame
+    from gpagent.sinks.jsonl import read_session
+
+    if not SESS5.exists():
+        pytest.skip("sess5 recording is not checked in")
+    events = list(read_session(SESS5, load_blobs=True))
+    frame = next(e for e in events if isinstance(e, ScreenFrame) and e.data)
+
+    async def run():
+        agent, clock = await _open(api_key)
+        try:
+            clock.set(1.0)
+            await agent.handle(frame, now=1.0)
+            await _wait_for(agent, {"say", "error"})
+            images = [entry for entry in agent._disposable if entry.kind == "image"]
+            assert images, "the turn must have sent a screenshot to replace"
+            # Both replacement shapes at once, against the real conversation:
+            # one where the screenshot was, one as the assistant's own words.
+            await agent.transport.send(agent._stub_item(clock(), images[0]))
+            await agent.transport.send(
+                agent._stub_item(
+                    clock(),
+                    Disposable(
+                        clock(),
+                        agent._audio_item_id or images[0].item_id,
+                        "said",
+                        role="assistant",
+                        replacement="that was close",
+                    ),
+                )
+            )
+            await agent.transport.send(
+                {"type": "conversation.item.delete", "item_id": images[0].item_id}
+            )
+            await asyncio.sleep(3.0)
+            return [line for line in agent.lines if line.kind == "error"]
+        finally:
+            await agent.close()
+
+    errors = asyncio.run(run())
+    assert not errors, f"server rejected a replacement: {[e.text for e in errors]}"
 
 
 def test_a_text_session_writes_its_remark_instead_of_speaking_it(api_key):
@@ -127,6 +203,7 @@ def test_a_text_session_writes_its_remark_instead_of_speaking_it(api_key):
             await agent.handle(frame, now=1.0)
             await agent.handle(speech, now=2.0)
             said = await _wait_for(agent, {"say", "error"})
+            await _wait_for_billing(agent)
             return said, agent.meter, list(agent.hud.shown)
         finally:
             await agent.close()

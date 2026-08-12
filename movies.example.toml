@@ -92,20 +92,33 @@ max_output_tokens = 160       # a read line is shorter than a spoken one
 # minutes returning `rate_limit_exceeded` for every response, thirteen in a row,
 # with ~2.3k image tokens added per turn and nothing ever leaving.
 #
-# Three answers, in the order they apply. A lower retention ratio drops history
-# server-side in amortized batches, the only trimming that does not invalidate
-# the prompt-cache prefix.
-truncation_retention_ratio = 0.6
-# ...and client-side pruning for the part the server has no reason to prioritise:
-# the screenshots, which are ~85% of the input here and are worthless within a
-# couple of scenes, plus the per-turn nudge, which is the same three sentences
-# repeated once per turn. 180 s is about six remarks at this cadence -- enough
-# trail for the agent to know what film it is watching, short enough that the
-# request stops growing. The prompt cache is thrown away once per round, which
-# is why the round is expensive and the interval, not the cutoff, is the knob
-# that decides what it costs: at 90 s that is roughly one turn in three.
+# The server's own answer -- truncation -- is the wrong one HERE in particular,
+# and this is the config that shows why most clearly. It drops from the oldest
+# end, and the oldest end of this conversation is the entire film's dialogue,
+# sent once and put first precisely so it is cached for the rest of the session.
+# A retention ratio of 0.6 was buying amortized batches that keep the prompt
+# cache intact, at the price of eventually dropping the one item the agent
+# cannot do without and cannot get back. So: nobody trims this but us.
+truncation = "disabled"
+# Client-side pruning instead, on the part the server has no reason to
+# prioritise: the screenshots, which are ~85% of the input here and are
+# worthless within a couple of scenes, plus the per-turn nudge, which is the
+# same three sentences repeated once per turn. 180 s is about six remarks at
+# this cadence -- enough trail for the agent to know what film it is watching,
+# short enough that the request stops growing. The prompt cache is thrown away
+# once per round, which is why the round is expensive and the interval, not the
+# cutoff, is the knob that decides what it costs: at 90 s that is roughly one
+# turn in three.
+#
+# 180 s of retention is also far cheaper than it used to be. Nothing is deleted
+# outright any more except the nudge: images leave a line saying images were
+# here, and both sides of anything spoken leave their transcripts, so what the
+# agent loses at the cutoff is the pixels and the audio rather than the scene.
 prune_after_s = 180.0
 prune_interval_s = 90.0
+# ...and a floor under both, because with truncation off nothing else is
+# watching. A film runs long enough to reach this even at 180 s of retention.
+context_budget_tokens = 20000
 
 playback = false              # nothing to play; keeps the sink out of the way
 

@@ -28,9 +28,10 @@ Conversation shape, once at the start of the session:
                                constant, so they live in session.update
 
 The images have their own item rather than riding along with the text because
-they are the half that gets deleted again: an item is the unit `conversation
+they are the half that gets removed again: an item is the unit `conversation
 .item.delete` operates on, so anything that has to outlive a screenshot cannot
-share an item with one. See `_maybe_prune`.
+share an item with one. See `_prune_round`, which does not so much delete that
+item as swap it for a sentence saying what used to be there.
 
 Only `reply` sends audio. `react` and `ambient` are the same shape without it.
 
@@ -51,7 +52,7 @@ import json
 import logging
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
@@ -90,6 +91,60 @@ __all__ = [
 SAMPLE_RATE = 24000
 #: base64 of ~32 KB of PCM per frame keeps individual websocket messages small
 AUDIO_CHUNK_BYTES = 32768
+
+#: What stands in for an item a pruning round removed. Every one of these is
+#: permanent -- a stub is not itself disposable except at the very last rung of
+#: `_prune_now` -- so they are written to be the shortest sentence that still
+#: means something. A screenshot at high detail is ~765 tokens and an utterance
+#: a couple of hundred; these are a dozen.
+STUBS = {
+    #: `[dropped]` and not `[screen]`: the trail note that introduces real
+    #: frames owns that marker, and nothing left in the conversation should
+    #: point at images the model can no longer look at.
+    "image": "[dropped] {n} {frame_word} of what was on screen here.",
+    #: The bracket is load-bearing. Without it a transcript reads as typed
+    #: context, which is a different thing from the player having said it.
+    "heard": "[they said] {transcript}",
+    #: No marker: the agent did say these words, and bracketing them would put
+    #: a stage direction in the model's own mouth for it to imitate.
+    "said": "{transcript}",
+}
+#: ...and what stands in when the transcript never arrived.
+STUB_FALLBACKS = {
+    "heard": "[they said something here.]",
+    "said": "[a remark here was not recorded.]",
+}
+
+
+@dataclass
+class Disposable:
+    """One item this client is willing to remove again, and what replaces it.
+
+    Mutable on purpose. An image knows its replacement text the moment it is
+    created; a piece of audio does not. The transcript arrives on a later
+    event, and audio deleted before its transcript lands takes the only record
+    of what was said with it -- so the id is registered as soon as the item is
+    known to exist, `replacement` is filled in afterwards, and `pending` is
+    what stops a round touching the entry in between.
+    """
+
+    #: agent clock when the item entered the conversation
+    t: float
+    item_id: str
+    #: "image" | "note" | "heard" | "said" | "stub". The session's own
+    #: vocabulary rather than the API's: `heard` and `said` are already the
+    #: `Line` kinds for the two sides of a spoken exchange, so `report()` reads
+    #: "12 image, 9 note, 4 heard, 4 said".
+    kind: str
+    #: role the replacement item takes; assistant replacements carry
+    #: `output_text` content, everything else `input_text`
+    role: str = "user"
+    #: None means delete outright, with nothing put back in its place
+    replacement: str | None = None
+    #: replacement not known yet -- never removable while true
+    pending: bool = False
+    #: template arguments for `STUBS[kind]`
+    fields: dict[str, Any] = field(default_factory=dict)
 
 
 class ReplayClock:
@@ -165,15 +220,32 @@ class CommentaryAgent:
         #: shown. Text needs this as much as audio does: the API emits
         #: `response.output_text.done` for an interrupted response too.
         self._accept_output = True
-        #: Items this client created that it is willing to delete again, oldest
-        #: first: (t, item_id, kind). Screenshots and per-turn nudges only --
-        #: see `_maybe_prune` for why the conversation proper is not in here.
-        self._disposable: list[tuple[float, str, str]] = []
+        #: Everything removable, in conversation order. Screenshots, per-turn
+        #: nudges, and both sides of a spoken exchange -- see `_prune_round`.
+        self._disposable: list[Disposable] = []
+        #: the same records by item id, so an event that arrives later (a
+        #: transcript) can fill one in
+        self._by_item: dict[str, Disposable] = {}
+        #: Ids belonging to the turn being answered right now. No round may
+        #: touch these, however badly it needs the room: deleting an item out
+        #: from under an in-flight response is the one thing pruning has never
+        #: been allowed to do.
+        self._live_items: set[str] = set()
         self._item_seq = 0
         self._last_prune = 0.0
-        #: how many of each kind have been deleted, for `report()`
+        #: how many of each kind have been removed, for `report()`
         self.pruned: Counter[str] = Counter()
         self._prune_rounds = 0
+        self._forced_rounds = 0
+        self._replaced = 0
+        #: set when a response bills past `context_budget_tokens`; consumed by
+        #: the next `tick`, because pruning belongs on the tick and not in the
+        #: middle of reading a usage block
+        self._prune_forced = False
+        #: retries spent on the turn in flight, and the flag that collapses the
+        #: two ways one refusal can be reported (see `_on_context_full`)
+        self._context_full_retries = 0
+        self._retry_pending = False
         #: age of each frame at the moment it was attached, for tuning capture
         self._frame_ages: list[float] = []
 
@@ -268,10 +340,7 @@ class CommentaryAgent:
             "output_modalities": ["text"] if text_out else ["audio"],
             "instructions": instructions(self.cfg),
             "max_output_tokens": self.cfg.max_output_tokens,
-            "truncation": {
-                "type": "retention_ratio",
-                "retention_ratio": self.cfg.truncation_retention_ratio,
-            },
+            "truncation": self._truncation(),
             # Input audio stays either way: a text session still listens, and
             # still transcribes what it hears for the log.
             "audio": audio,
@@ -281,6 +350,34 @@ class CommentaryAgent:
             # field, so it's only sent when explicitly configured.
             session["reasoning"] = {"effort": self.cfg.reasoning_effort}
         return {"type": "session.update", "session": session}
+
+    def _truncation(self) -> Any:
+        """Who is allowed to drop history, as `session.truncation`.
+
+        "disabled" by default, and the reason is one item: the whole film's
+        dialogue, sent once and deliberately placed at the head of the
+        conversation so it keys the cached prefix of every request after it
+        (see `_seed_subtitles`). Server truncation drops from the oldest end.
+        It drops in amortized batches that leave the cache alone, which is a
+        good trade right up to the batch that takes the script -- and nothing
+        tells the client it happened, so the first sign would be an agent that
+        has quietly stopped knowing what is being said on screen.
+
+        Disabling it means the server refuses a response rather than trimming
+        one, which is a failure the client can see and answer (see
+        `_on_context_full`). The other two modes hand the job back.
+        """
+        if self.cfg.truncation != "retention_ratio":
+            return self.cfg.truncation
+        truncation: dict[str, Any] = {
+            "type": "retention_ratio",
+            "retention_ratio": self.cfg.truncation_retention_ratio,
+        }
+        if self.cfg.truncation_post_instruction_tokens > 0:
+            truncation["token_limits"] = {
+                "post_instructions": self.cfg.truncation_post_instruction_tokens
+            }
+        return truncation
 
     # -- subtitles ---------------------------------------------------------
 
@@ -449,6 +546,11 @@ class CommentaryAgent:
         self.player.discard()
         self._accept_output = True
         self._audio_item_id = None
+        # A fresh turn gets a fresh retry budget, and the items of the turn
+        # before it stop being untouchable now that it is over.
+        self._context_full_retries = 0
+        self._retry_pending = False
+        self._live_items.clear()
         with_image = self.cfg.image_on_unprompted or reason == "reply"
         ctx = self.context.take(now, with_image=with_image)
 
@@ -458,7 +560,7 @@ class CommentaryAgent:
                 await self.transport.send(self._text_item(now, ctx.text))
                 detail.append(f'"{ctx.text}"')
             if ctx.frame:
-                await self.transport.send(self._images_item(now, ctx))
+                await self.transport.send(self._live(self._images_item(now, ctx)))
                 # Frame age is the whole point of the capture-side trigger
                 # interval now that at most one frame is sent per response:
                 # it buys freshness, not tokens.
@@ -494,8 +596,12 @@ class CommentaryAgent:
         # `response.create.instructions`, which would replace the session
         # persona and, because it varies per turn, break the cached prefix.
         # See `persona.reason_note`.
-        await self.transport.send(self._reason_item(now, reason))
+        await self.transport.send(self._live(self._reason_item(now, reason)))
         await self.transport.send({"type": "response.create"})
+        # Nothing may await between that send and this line: a transport that
+        # answers instantly (RecordingTransport does) can refuse the response
+        # before the gate is up, and `_on_context_full` reads the gate to tell
+        # a rejected turn from a stray error.
         self.policy.mark_spoken(reason, now)
         self._response_active = True
         self._response_started = now
@@ -558,12 +664,13 @@ class CommentaryAgent:
         return self._item(now, "gpctx", "user", [{"type": "input_text", "text": text}], None)
 
     def _images_item(self, now: float, ctx) -> dict:
-        """Every screenshot this turn sends, in one item so one delete drops them.
+        """Every screenshot this turn sends, in one item so one round takes them.
 
         Trail and current frame share the item deliberately. They are created in
         the same turn and pruned on the same cutoff, so splitting them would buy
         two `conversation.item.delete` calls and two chances to invalidate the
-        prompt cache in exchange for a distinction nothing ever draws.
+        prompt cache in exchange for a distinction nothing ever draws. It also
+        means one stub covers the lot when they go.
         """
         content: list[dict] = []
         # A turn with no trail sends the current frame alone and says nothing
@@ -593,27 +700,95 @@ class CommentaryAgent:
                 content.append(self._image_part(f, self.cfg.image_trail_detail))
         if ctx.frame:
             content.append(self._image_part(ctx.frame, self.cfg.image_detail))
-        return self._item(now, "gpimg", "user", content, "image")
+        shown = sum(1 for part in content if part["type"] == "input_image")
+        return self._item(
+            now,
+            "gpimg",
+            "user",
+            content,
+            "image",
+            n=shown,
+            frame_word="frame" if shown == 1 else "frames",
+        )
 
     def _item(
-        self, now: float, prefix: str, role: str, content: list[dict], kind: str | None
+        self,
+        now: float,
+        prefix: str,
+        role: str,
+        content: list[dict],
+        kind: str | None,
+        *,
+        after: str | None = None,
+        **stub_fields: Any,
     ) -> dict:
         """One `conversation.item.create`, with an id we chose ourselves.
 
-        Client-assigned so an item can be deleted later without waiting for the
+        Client-assigned so an item can be removed later without waiting for the
         server to say what it called it -- and, since `conversation.item.created`
         arrives asynchronously, without a race between deciding to prune and
         learning the name of the thing to prune. `kind` names the disposable
         ones; None means the item stays for the life of the session.
+
+        `after` is `previous_item_id`, which puts the new item immediately
+        after an existing one instead of at the end. Only pruning uses it, to
+        land a replacement exactly where the thing it replaces was.
         """
         self._item_seq += 1
         item_id = f"{prefix}{self._item_seq:012d}"
         if kind is not None:
-            self._disposable.append((now, item_id, kind))
-        return {
+            self._register(Disposable(now, item_id, kind, role=role, fields=stub_fields))
+        event: dict[str, Any] = {
             "type": "conversation.item.create",
             "item": {"id": item_id, "type": "message", "role": role, "content": content},
         }
+        if after is not None:
+            event["previous_item_id"] = after
+        return event
+
+    def _live(self, event: dict) -> dict:
+        """Mark an item as belonging to the turn in flight, and pass it on.
+
+        Nothing removes an item the current response is being asked to look at,
+        not even the forced round that runs *because* the server refused that
+        very response. Freeing room by deleting the question is not freeing
+        room; it is asking a different question.
+        """
+        self._live_items.add(event["item"]["id"])
+        return event
+
+    def _register(self, entry: Disposable) -> None:
+        """Take note of an item a later round may remove.
+
+        Order matters and is creation order: `_prune_round` walks this list to
+        decide what goes, and a replacement has to be able to name the item it
+        follows, so the list has to be the conversation's own order.
+        """
+        if entry.item_id in self._by_item:
+            return
+        if entry.replacement is None and not entry.pending:
+            entry.replacement = self._stub_text(entry)
+        self._disposable.append(entry)
+        self._by_item[entry.item_id] = entry
+
+    def _stub_text(self, entry: Disposable, transcript: str | None = None) -> str | None:
+        """What goes back in when this entry comes out, or None to leave a gap.
+
+        A nudge leaves a gap on purpose: it was a sentence about the turn it
+        was written for and it has been wrong ever since. Everything else says
+        what was there, because a conversation that skips from a question to an
+        answer with nothing in between is one the model has to guess at.
+        """
+        template = {
+            "image": self.cfg.prune_image_stub_template,
+            "heard": self.cfg.prune_speech_stub_template,
+            "said": self.cfg.prune_reply_stub_template,
+        }.get(entry.kind) or STUBS.get(entry.kind)
+        if template is None:
+            return None
+        if entry.kind in STUB_FALLBACKS and not (transcript or "").strip():
+            return STUB_FALLBACKS[entry.kind]
+        return template.format(transcript=(transcript or "").strip(), **entry.fields)
 
     def _image_part(self, frame, detail: str) -> dict:
         b64 = base64.b64encode(frame.data).decode("ascii")
@@ -631,6 +806,11 @@ class CommentaryAgent:
         but identical to each other, so by the hundredth turn the conversation
         is carrying a hundred copies of three sentences that only ever applied
         to the turn they were written for.
+
+        The only kind that is deleted rather than replaced, and the only one a
+        round takes regardless of age: what a nudge says stopped being true the
+        moment the next turn started, so there is nothing worth standing in for
+        and no age at which it becomes worth keeping.
         """
         text = reason_note(reason, self.cfg)
         # How long the film has been running, when someone has told us that the
@@ -725,9 +905,15 @@ class CommentaryAgent:
         """Drop everything that referred to the session that just died."""
         now = self.clock()
         # Item ids belonged to the old conversation; deleting or truncating
-        # them on the new one would earn an error for each.
+        # them on the new one would earn an error for each. The stubs go with
+        # them: they were history, and history does not come back.
         self._disposable.clear()
+        self._by_item.clear()
+        self._live_items.clear()
         self._audio_item_id = None
+        self._retry_pending = False
+        self._context_full_retries = 0
+        self._prune_forced = False
         self.player.flush(now)
         self._accept_output = True
         self._reset_response_record()
@@ -761,10 +947,21 @@ class CommentaryAgent:
                     self._response_audio += pcm
                 self.player.push(pcm)
         elif kind == "response.output_item.added":
-            self._audio_item_id = (event.get("item") or {}).get("id") or self._audio_item_id
+            item_id = (event.get("item") or {}).get("id")
+            self._audio_item_id = item_id or self._audio_item_id
+            if item_id and not self.cfg.text_output:
+                # The agent's own spoken turn. Registered as removable and as
+                # pending: what replaces it is its transcript, and that has not
+                # arrived yet. A *text* session's assistant item is already the
+                # words themselves, so there is nothing there to replace.
+                self._live_items.add(item_id)
+                self._register(
+                    Disposable(now, item_id, "said", role="assistant", pending=True)
+                )
         elif kind == "response.output_audio_transcript.done":
             said = event.get("transcript") or ""
             self._add_transcript(said)
+            self._settle(event.get("item_id") or self._audio_item_id, said)
             self._emit(Line(now, "say", said))
         elif kind == "response.output_text.delta":
             # Nothing is shown per delta -- half a remark appearing and then
@@ -786,8 +983,26 @@ class CommentaryAgent:
                 self._add_transcript(said)
                 self._emit(Line(now, "say", said))
                 self.hud.show(said)
+        elif kind == "input_audio_buffer.committed":
+            # The commit we sent has become a user message item, and this is
+            # the only place its id is ever said. Without it the player's
+            # utterance is unremovable for the life of the session -- which it
+            # was, and which made audio a permanent floor under the request.
+            item_id = event.get("item_id")
+            if item_id:
+                self._register(
+                    Disposable(
+                        now, item_id, "heard", role="user", pending=self.cfg.transcribe_player
+                    )
+                )
         elif kind == "conversation.item.input_audio_transcription.completed":
-            self._emit(Line(now, "heard", event.get("transcript") or ""))
+            transcript = event.get("transcript") or ""
+            self._settle(event.get("item_id"), transcript)
+            self._emit(Line(now, "heard", transcript))
+        elif kind == "conversation.item.input_audio_transcription.failed":
+            # Nothing to show, but the entry waiting on this transcript has to
+            # stop waiting or it pins the audio in the conversation forever.
+            self._settle(event.get("item_id"), "")
         elif kind == "response.done":
             await self._finish_response(event)
         elif kind == "error":
@@ -797,6 +1012,9 @@ class CommentaryAgent:
                 # cancel and the cancel arriving. Nothing was wrong and nothing
                 # needs doing; the local playback stop already happened.
                 log.debug("ignoring benign realtime error: %s", err)
+                return
+            if _is_context_full(err, self.cfg.context_full_codes):
+                await self._on_context_full(now, err)
                 return
             self._emit(Line(now, "error", str(err.get("message") or err)))
             log.error("realtime error: %s", err)
@@ -823,6 +1041,14 @@ class CommentaryAgent:
         response = event.get("response") or {}
         self._response_usage = response.get("usage") or {}
         self.meter.add(response.get("usage"))
+        detail_error = (response.get("status_details") or {}).get("error") or {}
+        if response.get("status") != "completed" and _is_context_full(
+            detail_error, self.cfg.context_full_codes
+        ):
+            # The same refusal reaches us two ways depending on when the server
+            # notices. `_on_context_full` collapses them.
+            await self._on_context_full(self.clock(), detail_error)
+            return
         spoken_ms = await self.player.drain()
         if self.cfg.text_output:
             # What a written remark "takes" is how long it is on screen, which
@@ -863,11 +1089,45 @@ class CommentaryAgent:
             end = now + spoken_ms / 1000.0
         self._response_active = False
         self._response_started = None
+        # A response that said nothing still has an item in the conversation
+        # waiting on a transcript that is never coming.
+        self._settle(self._audio_item_id, self._response_transcript)
+        self._live_items.clear()
         self._record_response(now, cut=False)
         self.policy.on_response_finished(spoken_ms=spoken_ms, now=end)
         if self._watchdog is not None:
             self._watchdog.cancel()
             self._watchdog = None
+        # After `_record_response`, which resets the usage it reads -- so the
+        # number is taken from the event rather than from the field.
+        self._check_budget(now, int((response.get("usage") or {}).get("input_tokens") or 0))
+
+    def _check_budget(self, now: float, billed: int) -> None:
+        """Ask for a round when the request is getting close to the ceiling.
+
+        With `truncation = "disabled"` nothing else is watching the size of the
+        conversation, and the alternative to noticing here is noticing when a
+        `response.create` comes back refused -- which costs a turn the player
+        was waiting on, and arrives at the least convenient moment there is.
+
+        The number is what the *server* billed as input, not an estimate: it
+        already includes the instructions, the script and everything the
+        conversation is carrying, which is the whole quantity the ceiling is
+        about.
+        """
+        budget = self.cfg.context_budget_tokens
+        if budget <= 0 or billed <= budget:
+            return
+        self._prune_forced = True
+        self._emit(
+            Line(
+                now,
+                "note",
+                f"last request billed {billed} input tokens against a budget of "
+                f"{budget}; pruning on the next tick",
+                {"input_tokens": billed, "context_budget_tokens": budget},
+            )
+        )
 
     async def _cancel_response(self, now: float, *, why: str) -> None:
         # Only if the server is still generating. Audio keeps playing locally
@@ -891,6 +1151,10 @@ class CommentaryAgent:
         self._accept_output = False
         self._response_active = False
         self._response_started = None
+        # No transcript event is coming for a response that was cut off, so
+        # whatever it managed to say before the cut is what stands in for it.
+        self._settle(self._audio_item_id, self._response_transcript)
+        self._live_items.clear()
         self._audio_item_id = None
         self._record_response(now, cut=True, heard_ms=heard_ms)
         self.policy.on_response_cancelled(now)
@@ -960,63 +1224,353 @@ class CommentaryAgent:
     # -- context pruning ---------------------------------------------------
 
     async def _maybe_prune(self, now: float) -> None:
-        """Delete the disposable half of the conversation, in one round.
+        """The scheduled round: is anything old enough to be worth a round?
 
         Two decisions, and both are about the prompt cache rather than about
         what the model needs to remember.
 
         **One cutoff.** Screenshots -- the current frame and the trail behind it
-        -- and the per-turn system nudge all go on the same `prune_after_s`, so
-        every deletion the session ever wants to make is available at the same
-        moment. Three independent windows would mean three rounds and three
-        invalidations to remove things that were created together.
+        -- the per-turn system nudge, and both sides of a spoken exchange all go
+        on the same `prune_after_s`, so every removal the session ever wants to
+        make is available at the same moment. Independent windows would mean a
+        round and an invalidation each for things that were created together.
 
         **In bulk.** A delete truncates the cached prefix at the position of the
-        deleted item, and we always delete from the oldest end, so *any* round
+        deleted item, and we always remove from the oldest end, so *any* round
         costs essentially the whole prefix: the next request is billed at the
         fresh rate. That price is per round, not per item, which turns the whole
         problem into "how often", not "how much". `prune_interval_s` is the
         floor; nine items in one round cost a ninth of nine rounds of one.
 
-        The conversation proper is left alone. What the player said and what the
-        agent answered is the thread of the session, it is not something the
-        client can regenerate, and it is a fraction of the tokens; the server's
-        `truncation.retention_ratio` is the mechanism aimed at that, and it
-        drops history in amortized batches that leave the prefix intact.
+        The trigger here is deliberately the *old* one -- something past the
+        cutoff -- even though a round now also sweeps every stale nudge whatever
+        its age. Sweeping is not triggering: if two nudges were reason enough to
+        prune, a round would fire every `prune_interval_s` for the rest of the
+        session and pay the prefix each time, to save thirty tokens. Rounds stay
+        exactly as rare as they were; each one does strictly more.
 
-        Why do it at all when the cost measurement says trimming loses (see
+        Why prune at all when the cost measurement says trimming loses (see
         `AgentConfig.prune_after_s`): cached tokens count against TPM in full.
         The rate limit does not care that history is cheap, only that it is
         re-sent, and on sess_movie2 that ended the session thirteen requests
         before the film did.
         """
+        if self._prune_forced:
+            # A response billed past the budget. Deliberately consumed here
+            # rather than acted on where it was set: pruning belongs on the
+            # tick, not in the middle of reading a usage block.
+            self._prune_forced = False
+            await self._prune_now(now, why="over budget")
+            return
         if self.cfg.prune_after_s <= 0:
             return
         if now - self._last_prune < self.cfg.prune_interval_s:
             return
+        # Before the trigger is evaluated, not just before the sweep: an entry
+        # still waiting on a transcript is not prunable, so a deadline that
+        # expired since the last round has to be able to start one.
+        self._expire_pending(now)
         cutoff = now - self.cfg.prune_after_s
-        stale = [entry for entry in self._disposable if entry[0] < cutoff]
-        if not stale:
+        if not any(
+            entry.t < cutoff and self._prunable(entry, now, cutoff=cutoff)
+            for entry in self._disposable
+        ):
             # Deliberately without touching `_last_prune`: the interval limits
             # how often the cache may be thrown away, so a round that threw
             # nothing away must not push the next real one further out.
             return
+        await self._prune_round(
+            now, cutoff=cutoff, why=f"older than {self.cfg.prune_after_s:.0f}s"
+        )
+
+    async def _prune_now(self, now: float, *, why: str) -> int:
+        """A round that has to free something, and what it will spend to.
+
+        Called when the conversation is up against the context window rather
+        than merely growing: the token budget saw a response bill past
+        `context_budget_tokens`, or the server refused one outright. Neither
+        respects `prune_interval_s` -- the interval is a cost control, and a
+        request that cannot be made costs more than a cold cache -- and neither
+        respects `prune_after_s = 0`, which is a statement about routine
+        spending and not a refusal to survive.
+
+        Three rungs, stopping at the first that frees anything, because each
+        one gives up more than the last:
+
+        1. the scheduled cutoff, exactly as a timed round would take it;
+        2. everything removable except the turn being answered right now --
+           the conversation collapses to the script, the controller text and
+           the stubs, and the next request is small;
+        3. the stubs themselves, oldest first, keeping the newest
+           `context_full_keep_stubs`. This is the wall: once every image and
+           every utterance has already been replaced, the replacements are the
+           only thing left to spend, and spending the oldest of them beats a
+           session that can never speak again.
+
+        Returns how many items went, so a caller can tell the difference
+        between "made room" and "there is no room to make".
+        """
+        rungs: list[dict[str, Any]] = [
+            {"cutoff": now - self.cfg.prune_after_s if self.cfg.prune_after_s > 0 else now},
+            {"cutoff": now},
+            {"cutoff": now, "allow_stubs": True},
+        ]
+        for rung in rungs:
+            removed = await self._prune_round(now, why=why, forced=True, **rung)
+            if removed:
+                return removed
+        return 0
+
+    def _prunable(
+        self,
+        entry: Disposable,
+        now: float,
+        *,
+        cutoff: float,
+        allow_stubs: bool = False,
+    ) -> bool:
+        """May this entry come out, right now, on this cutoff?
+
+        The subtitle script never appears in `_disposable` at all, which is
+        structural rather than a check here: `_seed_subtitles` passes no kind.
+        """
+        if entry.pending:
+            # No transcript yet. Deleting the audio now would take the only
+            # record of what was said with it; `audio_stub_wait_s` is what
+            # stops that being an indefinite reprieve.
+            return False
+        if self._turn_in_flight(now):
+            if entry.item_id in self._live_items:
+                return False
+            if self._response_asked_at is not None and entry.t >= self._response_asked_at:
+                # Server-named items registered mid-turn (the committed
+                # utterance) only enter `_live_items` once the server names
+                # them, so age against the turn in flight covers the gap.
+                return False
+        if entry.kind == "stub":
+            return allow_stubs
+        if entry.kind == "note":
+            # Requirement of its own: a nudge is a sentence about the turn it
+            # was written for, so every one but the current turn's has been
+            # wrong since the moment the next turn started. Age does not come
+            # into it, and they are identical to each other besides.
+            return entry is not self._newest_note()
+        return entry.t < cutoff
+
+    def _turn_in_flight(self, now: float) -> bool:
+        """Is a response still plausibly being generated for this turn?
+
+        Bounded by `speak.response_gate_timeout_s` for the same reason the
+        policy's own gates are: `_response_active` is only cleared by a
+        `response.done` that may never arrive, and an absolute gate that can
+        never clear turns one lost event into a conversation that can never be
+        pruned again -- which, with the server no longer truncating, is a
+        session that eventually cannot make a request at all.
+        """
+        if not self._response_active or self._response_asked_at is None:
+            return False
+        return now - self._response_asked_at < self.speak_cfg.response_gate_timeout_s
+
+    def _newest_note(self) -> Disposable | None:
+        for entry in reversed(self._disposable):
+            if entry.kind == "note":
+                return entry
+        return None
+
+    async def _prune_round(
+        self,
+        now: float,
+        *,
+        cutoff: float,
+        why: str,
+        allow_stubs: bool = False,
+        forced: bool = False,
+    ) -> int:
+        """Swap the expensive half of the conversation for the cheap version.
+
+        A round does not so much delete as re-state. A screenshot becomes a
+        line saying screenshots were here; the player's utterance and the
+        agent's own reply become their transcripts, which is the same thread of
+        conversation at a twentieth of the tokens. Only the per-turn nudge goes
+        without a replacement, because it is the one thing here that stopped
+        being true when its turn ended.
+
+        Each victim is handled in two events, in this order and never the other
+        way round::
+
+            conversation.item.create  previous_item_id=<victim>, id=gpstb...
+            conversation.item.delete  item_id=<victim>
+
+        `previous_item_id` has to name an item that still exists, so deleting
+        first loses the replacement and earns an error for it. Inserting after
+        the *victim* rather than after the victim's predecessor is also what
+        keeps a multi-victim round in order with no bookkeeping -- and it is
+        the only option for the server-named audio items, whose predecessor
+        this client never learns.
+
+        The insert is free in cache terms. A prompt cache is a prefix match, so
+        the round's ceiling is already fixed by its earliest *delete*; every
+        insert lands at or after that point and cannot lower it further. That
+        is what makes replacing affordable at all: it costs tokens, which are
+        few, and not another invalidation, which is the expensive thing.
+        """
+        self._expire_pending(now)
+        victims = [
+            entry
+            for entry in self._disposable
+            if self._prunable(entry, now, cutoff=cutoff, allow_stubs=allow_stubs)
+        ]
+        if allow_stubs and self.cfg.context_full_keep_stubs > 0:
+            keep = {
+                entry.item_id
+                for entry in [e for e in victims if e.kind == "stub"][
+                    -self.cfg.context_full_keep_stubs :
+                ]
+            }
+            victims = [entry for entry in victims if entry.item_id not in keep]
+        if not victims:
+            return 0
         self._last_prune = now
-        self._disposable = [entry for entry in self._disposable if entry[0] >= cutoff]
-        for _, item_id, _kind in stale:
-            await self.transport.send({"type": "conversation.item.delete", "item_id": item_id})
-        counts = Counter(kind for _, _, kind in stale)
+        gone = {entry.item_id for entry in victims}
+        self._disposable = [e for e in self._disposable if e.item_id not in gone]
+        for item_id in gone:
+            self._by_item.pop(item_id, None)
+
+        replaced = 0
+        for entry in victims:
+            if entry.replacement:
+                await self.transport.send(self._stub_item(now, entry))
+                replaced += 1
+            await self.transport.send(
+                {"type": "conversation.item.delete", "item_id": entry.item_id}
+            )
+        counts = Counter(entry.kind for entry in victims)
         self.pruned.update(counts)
         self._prune_rounds += 1
+        self._replaced += replaced
+        if forced:
+            self._forced_rounds += 1
         self._emit(
             Line(
                 now,
                 "prune",
-                f"dropped {len(stale)} items older than {self.cfg.prune_after_s:.0f}s: "
+                f"{why}: removed {len(victims)} items ({replaced} replaced by text) -- "
                 + ", ".join(f"{n} {kind}" for kind, n in sorted(counts.items())),
-                {"pruned": dict(counts)},
+                {"pruned": dict(counts), "replaced": replaced, "forced": forced},
             )
         )
+        return len(victims)
+
+    def _stub_item(self, now: float, entry: Disposable) -> dict:
+        """The few tokens that stand in for what is about to be deleted."""
+        part = (
+            {"type": "output_text", "text": entry.replacement}
+            if entry.role == "assistant"
+            # `conversation.item.create` cannot populate assistant *audio*, so
+            # a spoken reply comes back as the assistant having written it.
+            else {"type": "input_text", "text": entry.replacement}
+        )
+        return self._item(now, "gpstb", entry.role, [part], "stub", after=entry.item_id)
+
+    def _expire_pending(self, now: float) -> None:
+        """Give up waiting for a transcript that is not coming.
+
+        `pending` is an absolute "never remove this", and a gate that can never
+        clear is the quietest failure mode in this file: one transcription lost
+        to a network hiccup would pin its audio in the conversation for the
+        rest of the session, which is precisely the growth pruning exists to
+        stop.
+        """
+        for entry in self._disposable:
+            if entry.pending and now - entry.t > self.cfg.audio_stub_wait_s:
+                entry.replacement = self._stub_text(entry)
+                entry.pending = False
+
+    def _settle(self, item_id: str | None, transcript: str) -> None:
+        """Fill in the words that stand in for a piece of audio."""
+        entry = self._by_item.get(item_id or "")
+        if entry is None or not entry.pending:
+            return
+        entry.replacement = self._stub_text(entry, transcript)
+        entry.pending = False
+
+    # -- the context ceiling -----------------------------------------------
+
+    async def _on_context_full(self, now: float, err: dict) -> None:
+        """The server will not answer until the conversation is smaller.
+
+        This is the bill for `truncation = "disabled"`, and it is the one we
+        chose: the server would have trimmed from the oldest end and taken the
+        script with it, silently. A refusal is at least a thing the client can
+        answer.
+
+        The answer, in order: make room, ask again, and if neither is possible
+        stop asking. `context_full_retries` bounds the second -- one refused
+        turn must never become a loop of prune-and-retry, which spends money on
+        every lap -- and a round that freed nothing is not retried at all,
+        because the request that just failed would be sent again unchanged.
+
+        When there is nothing left to free the session reopens, which is the
+        same recovery it already runs every hour when the API's 60-minute cap
+        drops the socket: closing the transport ends the pump's loop, and
+        `_reconnect` puts back the persona and the script. It costs the history
+        -- but a session that cannot make a request has lost that anyway, and
+        this way it keeps talking.
+        """
+        if self._retry_pending:
+            return
+        log.warning("conversation too long: %s", err)
+        if not self._response_active:
+            # Nothing is waiting on this one: the watchdog or a reconnect got
+            # there first. The conversation is still too long, so still prune;
+            # just do not conjure a response nobody asked for.
+            await self._prune_now(now, why="conversation full")
+            return
+        self._retry_pending = True
+        if self._context_full_retries >= self.cfg.context_full_retries:
+            self._abandon_turn(now, "conversation full, out of retries")
+            return
+        freed = await self._prune_now(now, why="conversation full")
+        if freed == 0:
+            self._abandon_turn(now, "conversation full and nothing left to remove")
+            self._emit(Line(now, "session", "nothing left to prune; reopening the session"))
+            # Ending the socket rather than calling `_reconnect` here: this
+            # runs inside the pump's own iteration, and the pump is the thing
+            # that owns reconnecting. See `_pump_events`.
+            await self.transport.close()
+            return
+        self._context_full_retries += 1
+        self._retry_pending = False
+        await self.transport.send({"type": "response.create"})
+        self._arm_watchdog()
+        self._emit(Line(now, "note", f"conversation full; freed {freed} items and asked again"))
+
+    def _abandon_turn(self, now: float, why: str) -> None:
+        """Give up on a response the server never started.
+
+        `_cancel_response`'s bookkeeping without any of its wire traffic: there
+        is nothing to cancel and nothing to truncate, because nothing was ever
+        generated. Releasing the gate is the whole point -- `_speak` sets
+        `_response_active` optimistically and only a `response.done` clears it,
+        so a refused turn left alone goes quiet until
+        `speak.response_gate_timeout_s` notices, which is 45 seconds of a
+        commentator saying nothing for no visible reason.
+
+        The player's utterance is already committed into the conversation, so
+        the next turn still answers it. What is lost is a beat, not the thought.
+        """
+        self._accept_output = False
+        self._response_active = False
+        self._response_started = None
+        self._settle(self._audio_item_id, self._response_transcript)
+        self._live_items.clear()
+        self._audio_item_id = None
+        self._record_response(now, cut=True)
+        self.policy.on_response_cancelled(now)
+        if self._watchdog is not None:
+            self._watchdog.cancel()
+            self._watchdog = None
+        self._emit(Line(now, "note", why))
 
     # -- logging -----------------------------------------------------------
 
@@ -1053,7 +1607,14 @@ class CommentaryAgent:
             "trail_sent": self.context.trail_sent,
             # Rounds, not just items: the round is what the prompt cache is
             # billed for, so "48 items in 6 rounds" is the number to read.
-            "pruned": {**self.pruned, "rounds": self._prune_rounds},
+            # `forced` counts the ones the budget or the server asked for, and
+            # `replaced` how many of the items left a sentence behind.
+            "pruned": {
+                **self.pruned,
+                "rounds": self._prune_rounds,
+                "forced": self._forced_rounds,
+                "replaced": self._replaced,
+            },
             "frame_age_s": {
                 "mean": round(sum(self._frame_ages) / len(self._frame_ages), 2),
                 "max": round(max(self._frame_ages), 2),
@@ -1068,6 +1629,45 @@ def _is_benign(err: dict) -> bool:
     """Errors that are races we already handled, not faults."""
     message = str(err.get("message") or "").lower()
     return "cancellation failed" in message or "no active response" in message
+
+
+#: substrings of `error.code` that mean the conversation itself is too big
+_FULL_CODE_HINTS = ("too_long", "too_large", "context_length", "token_limit")
+#: ...and, for the message fallback, one word about size and one about what is
+#: oversized. Both are required: plenty of errors are about size.
+_FULL_SIZE_WORDS = ("too long", "too large", "exceed", "over the limit")
+_FULL_SUBJECT_WORDS = ("conversation", "context window", "context length")
+
+
+def _is_context_full(err: dict, extra_codes: Sequence[str] = ()) -> bool:
+    """Is this the server saying the conversation will not fit?
+
+    Disabling truncation buys a conversation the server will not trim, and the
+    documented price is "an error will be returned if the Conversation is too
+    long to create a Response". The *code* for that error is not documented
+    anywhere, so this matches on code first, falls back to the message, and
+    takes `agent.context_full_codes` from the user for the day the real one
+    turns out to be something else.
+
+    The match is deliberately narrow at the edges rather than generous. A false
+    negative is a mute session, which is bad; a false positive is a full
+    pruning round plus a duplicate `response.create`, which costs money and
+    throws away context to fix a problem that was not there. `rate_limit` is
+    excluded by name because it is the closest miss there is -- also a
+    complaint about size, but about a *window* of requests, and it wants
+    backoff rather than a smaller conversation.
+    """
+    code = str(err.get("code") or "").lower()
+    if code and code in {c.lower() for c in extra_codes}:
+        return True
+    if code.startswith("rate_limit"):
+        return False
+    if any(hint in code for hint in _FULL_CODE_HINTS):
+        return True
+    message = str(err.get("message") or "").lower()
+    if not any(word in message for word in _FULL_SUBJECT_WORDS):
+        return False
+    return any(word in message for word in _FULL_SIZE_WORDS)
 
 
 # -- drivers ---------------------------------------------------------------
