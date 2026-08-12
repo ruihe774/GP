@@ -1,0 +1,175 @@
+# Watching a film or a TV episode, commented in text on screen.
+#
+#   gpagent commentate -c movies.example.toml -o run/
+#
+# Only keys that differ from the defaults are set here; everything else keeps
+# what `gpagent.example.toml` documents. Three things make this use case
+# different from a game:
+#
+#   1. Nothing to watch on the input side except the screen and the viewer's
+#      voice, so every unprompted remark rides on the picture alone.
+#   2. Remarks are read, not heard -- talking over dialogue is the one thing a
+#      person watching a film will not forgive. `agent.output = "text"` puts
+#      them on the HUD, and it also costs roughly 10x less per remark, which is
+#      what pays for the extra frames below.
+#   3. Film cuts constantly, so a scene change is not news the way it is in a
+#      game. The frames go up and the `react` bar goes up with them.
+
+[gamepad]
+enabled = false        # nothing to read; also stops the udev rescan loop
+
+[audio]
+# The TV is playing through the same sink the echo canceller references, so its
+# dialogue is echo by definition -- and every word of it is speech-shaped, which
+# is exactly what a VAD is built to fire on. This is the one place where
+# `high` earns its double-talk penalty: the cost of leaked dialogue is the agent
+# answering the film, and a viewer who talks over a loud scene can repeat
+# themselves.
+echo_suppression_level = "high"
+vad_threshold = 0.6    # 0.5 lets residual dialogue through
+min_speech_ms = 350    # a leaked syllable is not someone talking to you
+
+[screen]
+long_edge = 1024
+pipeline_fps = 3       # must exceed triggers.min_interval_s below, or the
+                       # "more frequent" frames are just the same frame twice
+jpeg_quality = 72
+
+[triggers]
+# Capture side, and NOT a cost knob: the agent sends at most one high-detail
+# frame per response plus a fixed-size trail, however many were captured. What
+# this buys is freshness and choice -- a denser pool for `context._pick_trail`
+# to spread a trail across, and a current frame that is a second old instead of
+# three seconds old when a cut has already moved the film on.
+min_interval_s = 1.0
+heartbeat_s = 2.0      # a dialogue scene barely changes; the metronome is what
+                       # keeps a trail from being four copies of one shot
+scene_threshold = 0.04 # a cut clears this easily; this catches pans and reveals
+scene_throttle_s = 1.0
+dedup_threshold = 0.01
+
+[agent]
+# Images are the whole bill in a text session, and mini prices them at $0.80/Mtok
+# against $5.00 for the full model (tokens.py::MODEL_RATES) -- a ~6x difference
+# on the only line that matters here. Switch to "gpt-realtime-2.1" if the
+# remarks are not sharp enough; expect the run to cost several times as much.
+model = "gpt-realtime-2.1-mini"
+
+output = "text"        # turns on [hud] as this session's output device
+persona_file = "personas/movies.txt"   # relative to the working directory, not
+                                       # to this file; use an absolute path if
+                                       # you run gpagent from elsewhere
+
+image_detail = "high"  # ~765 tokens for a 1024x576 frame. Faces and text on
+                       # screen are most of what there is to react to, and "low"
+                       # (85 flat) reads a film as colour and motion.
+
+# The trail is worth more here than in a game. A film's meaning is in the cut:
+# one frame of two people in a room says nothing that six frames of the same
+# room across twenty seconds do -- who entered, who is looking away now, whether
+# the camera has been pushing in. At 85 tokens each this is the cheapest context
+# available and it is made of frames already captured and otherwise discarded.
+image_trail = 6
+image_trail_detail = "low"
+image_trail_min_gap_s = 2.5   # ABOVE capture's min_interval_s on purpose: with
+                              # frames every second, bucketing alone would
+                              # happily send six frames of one four-second beat.
+image_trail_max_age_s = 60.0
+max_image_age_s = 8.0         # a 20s-old frame in a film is a different scene
+
+max_output_tokens = 160       # a read line is shorter than a spoken one
+
+# A two-hour film is longer than anything this was tuned on, and the API re-bills
+# the whole conversation every turn: input tokens per request grow all session,
+# and images are the bulk of them. TPM, not price, is the ceiling that bites
+# first. A lower retention ratio drops history in amortized batches server-side,
+# which is the only trimming that does not invalidate the prompt-cache prefix.
+truncation_retention_ratio = 0.6
+
+playback = false              # nothing to play; keeps the sink out of the way
+
+# The per-turn nudge. `react` is doing different work than it does in a game --
+# there, something happened to the player; here, something happened in a story
+# the agent is only a spectator to.
+[agent.reason_instructions]
+reply = "They just said something to you. Answer it, briefly, without spoiling anything ahead of where they are."
+react = "Something just shifted on screen. One short reaction -- what someone watching next to them would actually say, not a description of the shot."
+ambient = "The film has been running quietly for a while. One short, low-stakes remark or a question about what they make of it. Do not recap, do not review, and do not repeat anything you have already said."
+
+# Replaces persona.TEXT_OUTPUT_NOTE. Same job as the built-in, plus the one
+# constraint specific to watching: the frame is the thing being looked at, and a
+# line of text is competing with it.
+text_output_note = """
+You are not speaking out loud. What you say appears as one line of text in the
+corner of their screen, caught at a glance while they are watching something
+else. Keep it to one short line -- shorter than you would say it, and short
+enough to read without looking away for long. Plain words only: no markdown, no
+asterisks, no emoji, no stage directions, and never refer to the text or the
+screen it is on."""
+
+[speak]
+# Ambient is the main voice here. Nothing arrives from a controller, the viewer
+# is mostly silent by design, and `react` is deliberately hard to trigger (see
+# below) -- so without a short ambient timer the agent watches two hours in
+# near-total silence.
+ambient_after_s = 30.0
+ambient_requires_activity = false
+# ^ With no gamepad this gate is decorative: `policy.on_scene` refreshes the
+#   activity clock on EVERY frame regardless of score, and the heartbeat means
+#   frames never stop. Turning it off says what is actually true rather than
+#   leaving a gate that looks like it guards something.
+
+min_gap_s = 12.0       # quiet floor between unprompted remarks; a read line is
+                       # on screen for hud.hold_* seconds and the floor is
+                       # measured from the end of that
+max_per_min = 5.0
+
+# A cut is not an event. Film cuts every few seconds and the default 0.35 would
+# make `react` fire on the edit rhythm itself -- so this is set above where an
+# ordinary cut lands, leaving it for the shots that are genuinely a break: a
+# location change, a title, a hard tonal turn.
+scene_threshold = 0.6
+event_cooldown_s = 25.0
+burst_windows = 1      # irrelevant with the gamepad off; scene sets `react`
+                       # directly and never counts windows
+
+reply_ttl_s = 10.0     # people ask questions mid-scene and look back at the film
+reply_min_gap_s = 3.0
+
+# The default backoff assumes a talkative player. Someone watching a film ignores
+# nearly everything by design -- that is what watching is -- and at 1.6^3 the
+# agent would mute itself for the second half of the film after four unanswered
+# remarks. Backoff still exists, it just cannot run away.
+backoff_factor = 1.25
+backoff_max = 2
+engagement_boost = 0.6
+
+[hud]
+enabled = true
+
+# Borderless: a panel over a film is a letterbox bar with opinions. Stroked text
+# keeps the picture underneath.
+style = "stroked"
+stroke_width_px = 3
+
+anchor = "top-right"   # bottom is where subtitles live
+monitor = "primary"
+margin_px = 48
+width_frac = 0.30
+font_size_px = 26      # read from a couch, not from a desk
+max_entries = 2        # two lines of someone else's thoughts over a film is
+                       # already the limit
+dim_older = 0.4
+
+# Hold time is not just display: the speak policy treats a remark as still
+# standing while it is on screen, so this is what the quiet floor and the reply
+# beat are measured against. Slightly slower than the default cps, because the
+# viewer's eyes are on the middle of the screen and not on the corner.
+read_cps = 13.0
+hold_min_s = 3.5
+hold_max_s = 10.0
+fade_ms = 400
+
+fg_color = "#f6f7fa"
+bg_opacity = 0.9       # the outline colour in "stroked" -- near-opaque so light
+                       # scenes do not swallow the glyphs
