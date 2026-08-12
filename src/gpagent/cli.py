@@ -93,7 +93,16 @@ def _build_config(args) -> CaptureConfig:
         cfg.apply_overrides(_parse_set(getattr(args, "set", []) or []))
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
-    sections = (("gamepad", "no_gamepad"), ("audio", "no_audio"), ("screen", "no_screen"))
+    if getattr(args, "srt", None):
+        cfg.subtitles.path = args.srt
+    if getattr(args, "srt_offset", None) is not None:
+        cfg.subtitles.offset_s = args.srt_offset
+    sections = (
+        ("gamepad", "no_gamepad"),
+        ("audio", "no_audio"),
+        ("screen", "no_screen"),
+        ("subtitles", "no_subtitles"),
+    )
     for section, flag in sections:
         if getattr(args, flag, False):
             getattr(cfg, section).enabled = False
@@ -1133,22 +1142,43 @@ async def _commentate(cfg: CaptureConfig, args) -> int:
                 )
             )
 
-    agent = CommentaryAgent(
-        cfg,
-        transport,
-        player,
-        hud,
-        clock=clock or time.monotonic,
-        log_path=(out_dir / "agent.jsonl") if out_dir else None,
-        on_line=None if args.quiet else _print_line,
-        recorder=sink.write if sink is not None else None,
-    )
+    try:
+        agent = CommentaryAgent(
+            cfg,
+            transport,
+            player,
+            hud,
+            clock=clock or time.monotonic,
+            log_path=(out_dir / "agent.jsonl") if out_dir else None,
+            on_line=None if args.quiet else _print_line,
+            recorder=sink.write if sink is not None else None,
+        )
+    except (OSError, ValueError) as exc:
+        # The subtitle file is the only thing the constructor reads from disk,
+        # and a session that quietly runs without the dialogue it was told to
+        # use is worse than one that does not start.
+        print(f"subtitles: {exc}", file=sys.stderr)
+        if sink is not None:
+            sink.close({"error": str(exc)})
+        return 1
 
     mode = "dry run" if args.dry_run else cfg.agent.model
     source = f"replay {args.replay}" if args.replay else "live capture"
     print(f"commentating: {source} -> {mode}")
     if args.replay and isinstance(_read_manifest(Path(args.replay)).get("config"), dict):
         print(f"  using recorded config from {args.replay} (pass -c/--set/flags to override)")
+    if agent.script is not None:
+        from .agent.subtitles import clock as film_clock
+
+        script = agent.script
+        print(
+            f"  subtitles: {len(script.cues)} cues from {script.path}"
+            f" (~{script.tokens} tok, {film_clock(script.runtime_s)} of film)"
+        )
+        if cfg.subtitles.offset_s:
+            print(f"    starting {film_clock(cfg.subtitles.offset_s)} in")
+        if script.skipped:
+            print(f"    {script.skipped} sound-effect cues skipped")
     if hud is not None:
         print(f"  text output -> hud: {hud.name} ({cfg.hud.anchor} of {cfg.hud.monitor})")
         if hud.name == "null":
@@ -1260,6 +1290,12 @@ def _print_agent_report(agent, args, out_dir: Path | None) -> None:
         f"  frames          {report['frames_sent']} sent of {report['frames_seen']} captured"
         + (f", +{report['trail_sent']} as trail" if report.get("trail_sent") else "")
     )
+    subs = report.get("subtitles")
+    if subs:
+        # One line, because that is what it cost: sent once, cached thereafter.
+        print(
+            f"  subtitles       {subs['cues']} cues, ~{subs['tokens']} tok sent once"
+        )
     if report["frame_age_s"]:
         age = report["frame_age_s"]
         print(f"  frame age       {age['mean']}s mean, {age['max']}s worst at send time")
@@ -1485,6 +1521,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_const",
         const="voice",
         help="speak, overriding agent.output from the config",
+    )
+    commentate.add_argument(
+        "--srt",
+        metavar="PATH",
+        help="subtitle file for what is being watched; sent whole, once, before "
+        "the first turn (sets subtitles.path)",
+    )
+    commentate.add_argument(
+        "--srt-offset",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="how far into the film this run starts, so the agent is told where "
+        "they are (sets subtitles.offset_s)",
+    )
+    commentate.add_argument(
+        "--no-subtitles", action="store_true", help="ignore subtitles.path for this run"
     )
     commentate.add_argument(
         "--no-playback", action="store_true", help="do not open the audio sink"

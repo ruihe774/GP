@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from .agent.config import AgentConfig, HudConfig, SpeakConfig
+from .agent.config import AgentConfig, HudConfig, SpeakConfig, SubtitleConfig
 
 __all__ = [
     "GamepadConfig",
@@ -22,6 +22,7 @@ __all__ = [
     "AgentConfig",
     "SpeakConfig",
     "HudConfig",
+    "SubtitleConfig",
     "CaptureConfig",
 ]
 
@@ -159,6 +160,10 @@ class CaptureConfig:
     #: The on-screen commentary overlay. Its own section because it is a
     #: display surface, driven by `gpagent hud` and independent of a session.
     hud: HudConfig = field(default_factory=HudConfig)
+    #: The subtitle file for what is being watched. Not capture either: it comes
+    #: off disk, is read by Component B alone, and is sent once before the first
+    #: turn (see agent/subtitles.py).
+    subtitles: SubtitleConfig = field(default_factory=SubtitleConfig)
 
     # -- (de)serialization -------------------------------------------------
 

@@ -7,7 +7,15 @@ timestamp recorded in the file (no sleeping, no wall clock, deterministic), and
 `drive_from_bus` lets it default to `time.monotonic` for live capture. Nothing
 below this layer knows which of the three it is running under.
 
-Conversation shape, per response:
+Conversation shape, once at the start of the session:
+
+    session.update             persona, language, output modality
+    conversation.item.create   one system item: the whole subtitle file, if one
+                               was configured (see subtitles.py). Sent here,
+                               before the first turn, so it sits in the cached
+                               prefix for the rest of the session.
+
+...and then, per response:
 
     conversation.item.create   one user item: accumulated controller summaries
     conversation.item.create   one user item: the screenshots -- ordering note,
@@ -61,9 +69,14 @@ from ..events import (
 from ..tokens import UsageMeter
 from .context import ContextBuffer, Frame
 from .hud import NullHud, hold_for
-from .persona import instructions, reason_note
+from .persona import instructions, reason_note, subtitle_note
 from .playback import NullPlayer
 from .policy import SpeakPolicy
+from .subtitles import Script, load_script
+
+# `clock` is the injected time source everywhere in this file; the subtitle
+# module's is a formatter, so it comes in under a name that says which.
+from .subtitles import clock as film_clock
 
 log = logging.getLogger(__name__)
 
@@ -123,6 +136,10 @@ class CommentaryAgent:
         self.cfg = cfg.agent
         self.speak_cfg = cfg.speak
         self.hud_cfg = cfg.hud
+        self.subtitle_cfg = cfg.subtitles
+        # Read here, not in `start()`: a missing or unparseable file should fail
+        # before a socket is opened and before the first dollar is spent.
+        self.script: Script | None = load_script(cfg.subtitles)
         self.clock = clock
         self.transport = transport
         self.player = player if player is not None else NullPlayer(clock)
@@ -196,6 +213,7 @@ class CommentaryAgent:
             log.warning("playback failed to start; continuing silent", exc_info=True)
             self.player = NullPlayer(self.clock)
         await self.transport.send(self.session_update())
+        await self._seed_subtitles()
         self._pump = asyncio.create_task(self._pump_events(), name="realtime-pump")
         self._emit(Line(self.clock(), "session", f"session open ({self.cfg.model})"))
 
@@ -263,6 +281,68 @@ class CommentaryAgent:
             # field, so it's only sent when explicitly configured.
             session["reasoning"] = {"effort": self.cfg.reasoning_effort}
         return {"type": "session.update", "session": session}
+
+    # -- subtitles ---------------------------------------------------------
+
+    async def _seed_subtitles(self) -> None:
+        """Send the whole subtitle file, once, before the first turn.
+
+        Position in the conversation is the entire design. This item is created
+        immediately after `session.update` and never deleted, so it is part of
+        the cached prefix of every request in the session: a two-hour film's
+        dialogue is ~8-10k tokens, billed as fresh input exactly once and at the
+        cached rate every turn after that. The same text fed a cue at a time
+        would land at the *tail* of each turn instead, where nothing is cached
+        yet, and would be re-billed as fresh input for the rest of the session.
+
+        It is not disposable. Pruning exists to stop the request growing, and
+        this item does not grow -- it is a constant, and it is the one piece of
+        context the agent cannot reconstruct from anything else it is sent.
+        """
+        if self.script is None:
+            return
+        text = f"{subtitle_note(self.subtitle_cfg)}\n\n{self.script.text}"
+        content = [{"type": "input_text", "text": text}]
+        now = self.clock()
+        await self.transport.send(self._item(now, "gpsub", "system", content, None))
+        offset = self.subtitle_cfg.offset_s
+        self._emit(
+            Line(
+                now,
+                "session",
+                f"subtitles: {len(self.script.cues)} cues, ~{self.script.tokens} tok, "
+                f"{film_clock(self.script.runtime_s)} of film"
+                + (f", starting {film_clock(offset)} in" if offset else ""),
+                {"subtitles": self.subtitle_summary()},
+            )
+        )
+
+    def subtitle_summary(self) -> dict[str, Any] | None:
+        if self.script is None:
+            return None
+        return {
+            "path": self.script.path,
+            "cues": len(self.script.cues),
+            "tokens": self.script.tokens,
+            "runtime_s": round(self.script.runtime_s, 1),
+            "offset_s": self.subtitle_cfg.offset_s,
+            "skipped_effects": self.script.skipped,
+        }
+
+    def _film_position(self, now: float) -> float | None:
+        """Seconds into the film, or None while that is not yet knowable.
+
+        The session clock and the film's clock differ by two things: the offset
+        between the agent's clock and capture's (`_t_offset`, learned from the
+        events themselves), and how far into the film capture started
+        (`subtitles.offset_s`, which only the user knows). Before the first
+        event there is no estimate of the first, and a position invented from
+        `time.monotonic()` would be the machine's uptime -- so nothing is said
+        rather than something wrong.
+        """
+        if self.script is None or self._t_offset is None:
+            return None
+        return now - self._t_offset + self.subtitle_cfg.offset_s
 
     # -- capture events ----------------------------------------------------
 
@@ -424,8 +504,17 @@ class CommentaryAgent:
         self.spoke += 1
         self._arm_watchdog()
 
+        # The position note is part of what this turn showed the model, so it is
+        # reported with the rest of it -- and reading a session back, "which
+        # minute of the film was this" is the first thing anyone asks.
+        position = self._film_position(now) if self.subtitle_cfg.position_note else None
+        if position is not None:
+            detail.append(f"film {film_clock(position)}")
+
         cause = self.policy.react_cause if reason == "react" else ""
         extra: dict[str, Any] = {"sent": detail, "state": self.policy.state(now)}
+        if position is not None:
+            extra["film_t"] = round(position, 1)
         if ctx.frame:
             # Identities, not just counts. `sent` above is the console story;
             # this is what lets a reader pull the exact blobs back out of
@@ -543,7 +632,17 @@ class CommentaryAgent:
         is carrying a hundred copies of three sentences that only ever applied
         to the turn they were written for.
         """
-        content = [{"type": "input_text", "text": reason_note(reason, self.cfg)}]
+        text = reason_note(reason, self.cfg)
+        # How long the film has been running, when someone has told us that the
+        # clock and the film are the same thing (`position_note`, off by
+        # default -- a pause or a seek makes this a confident lie). It rides
+        # here rather than anywhere else because this item is appended at the
+        # tail of the conversation every turn: a value that changes every turn
+        # costs nothing at a position nothing is cached after.
+        position = self._film_position(now) if self.subtitle_cfg.position_note else None
+        if position is not None:
+            text += self.subtitle_cfg.position_template.format(clock=film_clock(position))
+        content = [{"type": "input_text", "text": text}]
         return self._item(now, "gprsn", "system", content, "note")
 
     async def _send_audio(self, pcm: bytes) -> None:
@@ -592,6 +691,12 @@ class CommentaryAgent:
         deliberate choice from the design: a couch commentator that forgets
         what happened four minutes ago is fine, and it keeps recovery to one
         `session.update`.
+
+        The subtitle file is the exception, and the only one: it is not history,
+        it is reference material the session cannot work without, and a film is
+        very likely to outlive the API's 60-minute session cap. It goes back in
+        at the same position as before -- ahead of everything -- so the new
+        session's prefix is cacheable from the first turn.
         """
         if self._closing:
             return False
@@ -606,6 +711,7 @@ class CommentaryAgent:
             await self.transport.close()
             await self.transport.connect()
             await self.transport.send(self.session_update())
+            await self._seed_subtitles()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -657,8 +763,9 @@ class CommentaryAgent:
         elif kind == "response.output_item.added":
             self._audio_item_id = (event.get("item") or {}).get("id") or self._audio_item_id
         elif kind == "response.output_audio_transcript.done":
-            self._response_transcript = event.get("transcript") or ""
-            self._emit(Line(now, "say", self._response_transcript))
+            said = event.get("transcript") or ""
+            self._add_transcript(said)
+            self._emit(Line(now, "say", said))
         elif kind == "response.output_text.delta":
             # Nothing is shown per delta -- half a remark appearing and then
             # growing is a worse thing to catch out of the corner of an eye
@@ -674,10 +781,11 @@ class CommentaryAgent:
             # remark on screen that the session already decided against.
             if not self._accept_output:
                 return
-            self._response_transcript = event.get("text") or ""
-            if self._response_transcript:
-                self._emit(Line(now, "say", self._response_transcript))
-                self.hud.show(self._response_transcript)
+            said = event.get("text") or ""
+            if said:
+                self._add_transcript(said)
+                self._emit(Line(now, "say", said))
+                self.hud.show(said)
         elif kind == "conversation.item.input_audio_transcription.completed":
             self._emit(Line(now, "heard", event.get("transcript") or ""))
         elif kind == "response.done":
@@ -692,6 +800,24 @@ class CommentaryAgent:
                 return
             self._emit(Line(now, "error", str(err.get("message") or err)))
             log.error("realtime error: %s", err)
+
+    def _add_transcript(self, said: str) -> None:
+        """Fold one output part into the transcript of the response in flight.
+
+        A response can produce more than one text (or transcript) part: on
+        sess_movie3 one of thirty-two came back as a short preamble followed by
+        the remark, two `response.output_text.done` events a hundredth of a
+        second apart. Both were shown and both were logged, but this field was
+        overwritten rather than appended, so the `agent.response` in
+        `events.jsonl` recorded only the second half of what the viewer read.
+
+        Joining also makes the reading-time hold in `_finish_response` cover
+        everything that went on screen, which is what the quiet floor is
+        supposed to be measured from.
+        """
+        if not said:
+            return
+        self._response_transcript = f"{self._response_transcript} {said}".strip()
 
     async def _finish_response(self, event: dict) -> None:
         response = event.get("response") or {}
@@ -918,6 +1044,7 @@ class CommentaryAgent:
     def report(self) -> dict[str, Any]:
         return {
             "output": self.cfg.output,
+            "subtitles": self.subtitle_summary(),
             "responses": self.spoke,
             "by_reason": dict(self.policy.counts),
             "declined": dict(self.policy.declined),

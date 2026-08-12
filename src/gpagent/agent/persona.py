@@ -16,16 +16,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .config import AgentConfig
+from .config import AgentConfig, SubtitleConfig
 
 __all__ = [
     "DEFAULT_PERSONA",
     "TEXT_OUTPUT_NOTE",
+    "SUBTITLE_NOTE",
+    "POSITION_NOTE_HINT",
     "RESPONSE_INSTRUCTIONS",
     "LANGUAGE_NAMES",
     "resolve_persona",
     "instructions",
     "reason_note",
+    "subtitle_note",
     "language_name",
 ]
 
@@ -79,6 +82,51 @@ asterisks, no emoji, no stage directions, and never refer to the text or the
 screen it is on."""
 
 
+#: Sent above the subtitle file, in the same item, once per session.
+#:
+#: The script is the only way the agent knows what is being said -- it has no
+#: film audio at all -- and it necessarily arrives whole, so it also hands over
+#: the ending. Three paragraphs, doing three different jobs: what this is, how
+#: to work out where in it they are, and that the rest of the file is not
+#: theirs to use. Kept with the script rather than in the persona because it is
+#: about *this text*, and a rule stated next to the thing it governs is the one
+#: that survives an hour of conversation.
+#:
+#: The middle one is load-bearing and is deliberately not a clock. Nothing here
+#: knows where the film actually is -- it pauses, it gets rewound (see
+#: `SubtitleConfig.position_note`) -- so the model is told to locate itself from
+#: what it can see and hear, which is evidence that degrades gracefully, rather
+#: than from a number that would be wrong with no way to notice.
+SUBTITLE_NOTE = """\
+This is the complete subtitle file for what they are watching, start to finish.
+You cannot hear it, so this is how you know what is being said. Each line is
+stamped with its position in the film.
+
+Where they have got to is for you to work out and keep track of, from what is
+on screen and from what they say about it. Nothing tells you the time: they can
+pause it, go back over a line, or start halfway in. Find the part of the script
+that matches what you are being shown, and remember that the last line you
+matched is roughly where they are. When you are not sure, assume they are
+earlier than you think.
+
+Everything after that point has not happened yet. It is not yours to use, ever:
+do not refer to it, do not hint at it, do not shade a remark with it, and do not
+let on that you know how any of it goes. Read ahead of them and the film is
+ruined, and they cannot get it back. If they ask you outright what happens next,
+say you would rather not.
+"""
+
+#: Appended to the above when `subtitles.position_note` is on. Separate because
+#: it contradicts the paragraph above it: it is only true when someone has
+#: promised that playback runs start to finish untouched.
+POSITION_NOTE_HINT = """
+Each turn also tells you roughly how long the film has been running. It is
+measured from the clock, not from the film, so it is a hint and not a fact: if
+it disagrees with what you are being shown, what you are being shown wins, and
+if it has ever run ahead of the film assume it still is.
+"""
+
+
 RESPONSE_INSTRUCTIONS = {
     "reply": "They just said something to you. Answer it, briefly.",
     "react": (
@@ -124,6 +172,13 @@ def instructions(cfg: AgentConfig) -> str:
             "never comment on which language is being spoken."
         )
         text += template.format(name=name)
+    return text
+
+
+def subtitle_note(cfg: SubtitleConfig) -> str:
+    text = cfg.note if cfg.note is not None else SUBTITLE_NOTE
+    if cfg.position_note:
+        text += POSITION_NOTE_HINT
     return text
 
 

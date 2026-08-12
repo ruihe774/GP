@@ -2,12 +2,18 @@
 #
 #   gpagent commentate -c movies.example.toml -o run/
 #
+# With subtitles for what is being watched, which is worth the trouble:
+#
+#   gpagent commentate -c movies.example.toml --srt film.srt -o run/
+#
 # Only keys that differ from the defaults are set here; everything else keeps
 # what `gpagent.example.toml` documents. Three things make this use case
 # different from a game:
 #
 #   1. Nothing to watch on the input side except the screen and the viewer's
-#      voice, so every unprompted remark rides on the picture alone.
+#      voice, so every unprompted remark rides on the picture alone -- unless a
+#      subtitle file is supplied, which is the one cheap way to give it the
+#      other half of a film. See [subtitles] at the bottom.
 #   2. Remarks are read, not heard -- talking over dialogue is the one thing a
 #      person watching a film will not forgive. `agent.output = "text"` puts
 #      them on the HUD, and it also costs roughly 10x less per remark, which is
@@ -208,3 +214,32 @@ fade_ms = 400
 fg_color = "#f6f7fa"
 bg_opacity = 0.9       # the outline colour in "stroked" -- near-opaque so light
                        # scenes do not swallow the glyphs
+
+[subtitles]
+# The half of a film the agent otherwise never gets. It cannot hear anything --
+# the microphone is echo-cancelled against the system sink precisely so that
+# dialogue does not read as the viewer talking (see [audio] above) -- so without
+# this it is watching a silent film and guessing at faces.
+#
+# Sent whole, once, ahead of the first turn, where it costs ~8-10k tokens of
+# fresh input and then sits in the cached prefix for the rest of the film. The
+# alternative, a cue at a time, is the same text re-billed uncached every turn.
+#
+# path is not set here: it is per-film, so pass --srt on the command line.
+# path = "film.srt"
+#
+# The whole file means the ending too, and what carries the weight of that is
+# the prompt: personas/movies.txt ("No spoilers, ever", plus the paragraph about
+# the script) and persona.SUBTITLE_NOTE, which tells the model to find the
+# current scene in the script from what is on screen and to assume they are
+# earlier than it thinks when it cannot.
+#
+# Not a clock, deliberately. Watching a film at home means pausing it, going
+# back over a line nobody caught, and leaving it paused through a phone call --
+# so elapsed session time runs ahead of the film, silently, in the one direction
+# that matters. See position_note in gpagent.example.toml; leave it off unless
+# playback really is untouched start to finish, and set offset_s with it.
+position_note = false
+offset_s = 0.0
+
+timestamps = true

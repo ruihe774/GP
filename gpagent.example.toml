@@ -281,3 +281,48 @@ dim_older = 0.55         # alpha multiplier for everything that is not newest
 # bug. It exists for finding out where the window actually is.
 click_through = true
 # display = ":0"         # unset follows $DISPLAY
+
+[subtitles]
+# The subtitle file for what is being watched. Component B only: nothing here
+# is captured, it is read off disk once and sent to the model as one system
+# item, immediately after the persona and before the first turn.
+#
+#   gpagent commentate -c movies.example.toml --srt film.srt --srt-offset 40
+#
+# It is sent WHOLE -- ending included -- and that is a cost decision. One item
+# at the head of the conversation is fresh input exactly once and cached input
+# on every turn after it; the same dialogue fed a cue at a time would land at
+# the tail of each turn, where nothing is cached yet, and be re-billed as fresh
+# for the rest of the session. A two-hour film is ~8-10k tokens, about one turn
+# of screenshots at movie settings.
+#
+# What that costs is the model knowing how it ends. persona.SUBTITLE_NOTE is
+# sent above the script saying so in as many words, the movies persona forbids
+# spoilers outright, and the same note tells the model to work out where they
+# are from what is on screen rather than from any clock -- see position_note.
+enabled = true
+# path = "film.srt"      # nothing is sent without this
+# How far into the film this run starts, in seconds: the script is timestamped
+# from the film's first frame and the session clock starts when gpagent does.
+# Only the position note reads it; the script is sent in the film's own time.
+offset_s = 0.0
+encoding = ""            # "" tries UTF-8 then cp1252, which is what these are
+timestamps = true        # HH:MM:SS per line -- ~a quarter of the tokens, and
+                         # what makes a scene locatable in the file at all
+
+# Tell the model, every turn, how long the film has been running. OFF, because
+# the only position available is offset_s plus elapsed session time, and that is
+# where the film is only if it never pauses, never gets rewound over a line and
+# never sits paused through a phone call. It does all three, and every one of
+# them leaves the note reading a minute AHEAD of the viewer -- the exact
+# direction that hands over dialogue they have not reached. A stated position is
+# also trusted in a way an absent one is not, so being confidently wrong here is
+# worse than saying nothing: left off, the model locates the scene from what it
+# is shown, which is evidence rather than arithmetic. Turn it on only for
+# playback that genuinely runs start to finish untouched, and set offset_s too.
+position_note = false
+position_template = " Roughly {clock} in, by the clock."
+skip_effects = false     # drop [DOOR SLAMS] / (sighs) / music cues. Off: on a
+                         # hearing-impaired track those lines are most of what
+                         # the agent knows about a scene with no dialogue.
+# note = "..."           # replaces persona.SUBTITLE_NOTE

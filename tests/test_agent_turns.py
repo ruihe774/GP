@@ -1101,6 +1101,26 @@ class TestTextOutput:
         assert said[0].data is None and said[0].dur_ms == 0
         assert said[0].latency_ms > 0, "measured from the first delta, not the last"
 
+    async def test_a_response_written_in_two_parts_is_recorded_whole(self):
+        # One response can produce more than one output_text part: a model that
+        # writes a preamble and then the remark sends two, and the player reads
+        # both off the HUD. The recording has to say what they read.
+        recorded = []
+        agent = self.text_agent(recorder=recorded.append)
+        await agent.handle(frame(score=1.0), now=100.0)
+        await agent.on_server_event(
+            {"type": "response.output_item.added", "item": {"id": "a1"}}
+        )
+        for part in ("Let me think.", "that barrel again"):
+            await agent.on_server_event(
+                {"type": "response.output_text.done", "item_id": "a1", "text": part}
+            )
+        await agent.on_server_event({"type": "response.done", "response": {"status": "completed"}})
+
+        said = [e for e in recorded if isinstance(e, AgentResponse)]
+        assert said[0].transcript == "Let me think. that barrel again"
+        assert agent.hud.shown == ["Let me think.", "that barrel again"]
+
     async def test_text_output_tokens_are_metered(self):
         agent = self.text_agent()
         await agent.handle(frame(score=1.0), now=100.0)

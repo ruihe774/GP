@@ -19,7 +19,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-__all__ = ["AgentConfig", "SpeakConfig", "HudConfig", "HudAnchor", "HudStyle"]
+__all__ = [
+    "AgentConfig",
+    "SpeakConfig",
+    "HudConfig",
+    "SubtitleConfig",
+    "HudAnchor",
+    "HudStyle",
+]
 
 ImageDetail = Literal["auto", "low", "high"]
 ReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh"]
@@ -212,6 +219,72 @@ class AgentConfig:
     def text_output(self) -> bool:
         """Read, not heard. The question a dozen places downstream ask."""
         return self.output == "text"
+
+
+@dataclass
+class SubtitleConfig:
+    """The subtitle file for what is being watched, sent once, whole.
+
+    Its own section rather than more keys on `AgentConfig` for the same reason
+    `[hud]` is: this is an input the session is *given*, from outside capture
+    entirely, and the one thing anybody sets is `path`.
+
+    The whole file goes, including everything the viewer has not reached yet.
+    That is a decision about cost and about caching -- see `agent/subtitles.py`
+    -- and it hands the model the ending, which is why `persona.SUBTITLE_NOTE`
+    travels with it and why `position_note` exists.
+    """
+
+    enabled: bool = True
+    #: path to a `.srt`. Nothing is sent without one; this is the whole feature's
+    #: on switch, and `enabled` is only here so a config can keep the path and
+    #: turn it off for one run.
+    path: str | None = None
+    #: Where the film is when capture starts, in seconds. The script is
+    #: timestamped from the film's first frame and the session clock starts when
+    #: gpagent does, so this is the difference between the two: start gpagent
+    #: 40 s into the film and `offset_s = 40`. Only `position_note` reads it --
+    #: the script itself is sent unshifted, in the film's own time. Useless on
+    #: its own, since it fixes the start of a mapping whose slope is the
+    #: assumption `position_note` cannot make.
+    offset_s: float = 0.0
+    #: Force a text encoding. Empty tries UTF-8 and then cp1252, which is what
+    #: subtitle files in the wild actually are.
+    encoding: str = ""
+    #: Prefix each line with its `HH:MM:SS`. About a quarter of the script's
+    #: tokens, and the only thing that makes "where they have got to" mean
+    #: anything -- turn it off only if the position note is off too.
+    timestamps: bool = True
+    # Telling the model where they are in the film sounds like the obvious
+    # counterweight to handing it the whole script -- but the only position
+    # available is `offset_s` plus elapsed session time, which is playback time
+    # only if the film never pauses, never seeks, and never changes speed. It
+    # pauses. Someone gets a drink, someone rewinds ten seconds to catch a line,
+    # someone leaves it paused through a phone call, and from then on the note
+    # says a minute the viewer has not reached yet -- which is precisely the
+    # direction that turns dialogue the agent has into dialogue it should not
+    # have. A stated position is trusted in a way an absent one is not, so being
+    # confidently wrong here is worse than saying nothing: without it the model
+    # locates itself from the screen and from what has just been said, which
+    # degrades gracefully because it is evidence rather than arithmetic.
+    #
+    # Turn it on for playback that genuinely runs start to finish untouched, and
+    # set `offset_s` with it.
+    #: append the elapsed-time position to the per-turn nudge. Off by default:
+    #: it is extrapolated from wall time, so a pause or a seek makes it lie.
+    #: When on it rides on the nudge, which is appended at the tail of the
+    #: conversation, so a value that changes every turn costs no cache.
+    position_note: bool = False
+    #: template for that note; `{clock}` is `HH:MM:SS` into the film
+    #: `{clock}` is `HH:MM:SS` of elapsed playback. Hedged on purpose -- it is
+    #: an extrapolation, and it should not read like a reading off the player.
+    position_template: str = " Roughly {clock} in, by the clock."
+    #: Drop cues that are entirely `[DOOR SLAMS]`, `(sighs)` or `♪ ... ♪`.
+    #: Off by default: on a hearing-impaired track those lines are most of what
+    #: the agent knows about a scene with no dialogue in it.
+    skip_effects: bool = False
+    #: replaces persona.SUBTITLE_NOTE, the framing sent above the script
+    note: str | None = None
 
 
 @dataclass
