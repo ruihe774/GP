@@ -88,10 +88,36 @@ voice_speed = 1.0          # playback rate; server clamps to [0.25, 1.5]
 # since the API has no output-language parameter.
 # language = "ja"
 
+# Template for the output-language directive appended when `language` is set.
+# `{name}` is substituted with the resolved language name. Unset uses the
+# built-in sentence (see agent/persona.py).
+# language_directive = "\nSpeak {name} at all times."
+
 # Replace the built-in persona (see agent/persona.py). `persona` wins over
 # `persona_file`. Write it in English whatever `language` is set to: it is
 # instructions to the model, not something anyone hears.
 # persona_file = "~/.config/gpagent/persona.txt"
+
+# Override for the note appended to the persona when output = "text" (see
+# agent/persona.py::TEXT_OUTPUT_NOTE). Unset uses the built-in note.
+# text_output_note = "\nKeep it to one short line."
+
+# Per-reason overrides for the per-turn nudge sent before every
+# response.create (see agent/persona.py::RESPONSE_INSTRUCTIONS). Any reason
+# left out keeps its built-in text.
+# [agent.reason_instructions]
+# reply = "They just said something to you. Answer it, briefly."
+# react = "Something just happened. One short reaction."
+# ambient = "It has been quiet for a while. One short, low-stakes remark."
+
+# Prefix the per-turn nudge above is wrapped in.
+# reason_note_prefix = "Right now: "
+
+# Template for the note sent ahead of trail images, ordering them for the
+# model (see agent/session.py::Session._context_item). `{n}`, `{frame_word}`
+# ("frame"/"frames") and `{span}` are substituted. Unset uses the built-in
+# sentence.
+# trail_note_template = "[screen] {n} earlier {frame_word} from the last {span:.0f}s, oldest first, then the current screen last."
 
 # high is ~765 tokens for a 1024x576 frame, low a flat 85. Measured over 151 s
 # of play, low saves about 15% of the *total* bill -- less than it looks, since

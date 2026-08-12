@@ -16,7 +16,7 @@ session.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 __all__ = ["AgentConfig", "SpeakConfig", "HudConfig", "HudAnchor", "HudStyle"]
@@ -67,6 +67,24 @@ class AgentConfig:
     #: The persona itself stays in English -- it is instructions to the model,
     #: not something anyone hears.
     language: str | None = None
+    #: template for the output-language directive appended when `language` is
+    #: set; `{name}` is substituted with the resolved language name (see
+    #: persona.language_name). None uses the built-in sentence.
+    language_directive: str | None = None
+
+    #: override for persona.TEXT_OUTPUT_NOTE, appended when `output = "text"`.
+    #: None uses the built-in note.
+    text_output_note: str | None = None
+    #: per-reason overrides for persona.RESPONSE_INSTRUCTIONS ("reply" /
+    #: "react" / "ambient"); a reason missing here falls back to the built-in
+    #: text. Sent as the per-turn nudge before every `response.create`.
+    reason_instructions: dict[str, str] = field(default_factory=dict)
+    #: prefix the per-turn nudge is wrapped in, e.g. "Right now: ".
+    reason_note_prefix: str = "Right now: "
+    #: template for the trail-frame ordering note sent ahead of trail images
+    #: (see Session._context_item); `{n}`, `{frame_word}` ("frame"/"frames")
+    #: and `{span}` are substituted. None uses the built-in sentence.
+    trail_note_template: str | None = None
 
     # -- vision -----------------------------------------------------------
     #: "high" is ~765 tok for a 1024x576 frame, "low" a flat 85 -- a 9x lever.

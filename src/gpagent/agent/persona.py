@@ -115,18 +115,19 @@ def instructions(cfg: AgentConfig) -> str:
     """
     text = resolve_persona(cfg)
     if cfg.text_output:
-        text += TEXT_OUTPUT_NOTE
+        text += cfg.text_output_note if cfg.text_output_note is not None else TEXT_OUTPUT_NOTE
     if cfg.language:
         name = language_name(cfg.language)
-        text += (
-            f"\nSpeak {name} at all times. The player speaks {name}; answer in "
-            f"{name} even if they use another language for a word or two, and "
-            f"never comment on which language is being spoken."
+        template = cfg.language_directive or (
+            "\nSpeak {name} at all times. The player speaks {name}; answer in "
+            "{name} even if they use another language for a word or two, and "
+            "never comment on which language is being spoken."
         )
+        text += template.format(name=name)
     return text
 
 
-def reason_note(reason: str) -> str:
+def reason_note(reason: str, cfg: AgentConfig | None = None) -> str:
     """The one-line nudge for this turn, to be sent as a system message.
 
     This used to be `instructions_for(cfg, reason)`, sent on
@@ -154,4 +155,7 @@ def reason_note(reason: str) -> str:
     sit inside the cached prefix, and deleting them per turn would invalidate
     exactly the prefix this change exists to preserve.
     """
-    return f"Right now: {RESPONSE_INSTRUCTIONS[reason]}"
+    overrides = cfg.reason_instructions if cfg else {}
+    text = overrides.get(reason, RESPONSE_INSTRUCTIONS[reason])
+    prefix = cfg.reason_note_prefix if cfg else "Right now: "
+    return f"{prefix}{text}"

@@ -469,12 +469,15 @@ class CommentaryAgent:
             # ahead of them costs ~25 tokens and makes them a sequence.
             span = ctx.frame.t - ctx.trail[0].t
             n = len(ctx.trail)
+            template = self.cfg.trail_note_template or (
+                "[screen] {n} earlier {frame_word} from the last {span:.0f}s, "
+                "oldest first, then the current screen last."
+            )
             content.append(
                 {
                     "type": "input_text",
-                    "text": (
-                        f"[screen] {n} earlier frame{'' if n == 1 else 's'} from the "
-                        f"last {span:.0f}s, oldest first, then the current screen last."
+                    "text": template.format(
+                        n=n, frame_word="frame" if n == 1 else "frames", span=span
                     ),
                 }
             )
@@ -512,7 +515,7 @@ class CommentaryAgent:
                 "id": f"gprsn{self._item_seq:012d}",
                 "type": "message",
                 "role": "system",
-                "content": [{"type": "input_text", "text": reason_note(reason)}],
+                "content": [{"type": "input_text", "text": reason_note(reason, self.cfg)}],
             },
         }
 
