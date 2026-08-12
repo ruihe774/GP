@@ -395,6 +395,9 @@ def render_card(
     pad, line_px = metrics.pad, metrics.line_px
     text_left = pad + (metrics.accent_px + pad if bordered else 0)
     text_width = max(1, metrics.width - text_left - pad)
+    # A bare "top"/"bottom" anchor centres the card on the monitor, so the
+    # text inside it should read as centred too rather than ragged-left.
+    centered = not (cfg.anchor.endswith("left") or cfg.anchor.endswith("right"))
     blocks = [wrap_text(e.text, font, text_width) for e in entries]
     heights = [len(lines) * line_px + 2 * pad for lines in blocks]
     rule_gap = metrics.rule_px if bordered else 0
@@ -432,17 +435,20 @@ def render_card(
             )
         for row, line in enumerate(lines):
             y = top + pad + row * line_px
+            x = text_left
+            if centered:
+                x += (text_width - font.getlength(line)) / 2
             if bordered:
                 # A hairline shadow, not a blur: the card sits over a game
                 # frame that may be any colour, and one dark pixel of offset
                 # is the cheapest thing that keeps light text on light
                 # scenery readable.
-                draw.text((text_left + metrics.shadow_px, y + metrics.shadow_px), line,
+                draw.text((x + metrics.shadow_px, y + metrics.shadow_px), line,
                           font=font, fill=(0, 0, 0, 160))
-                draw.text((text_left, y), line, font=font, fill=(*fg, 255))
+                draw.text((x, y), line, font=font, fill=(*fg, 255))
             else:
                 draw.text(
-                    (text_left, y), line, font=font, fill=(*fg, 255),
+                    (x, y), line, font=font, fill=(*fg, 255),
                     stroke_width=metrics.stroke_px, stroke_fill=(*bg, 255),
                 )
         dim = 1.0 if index == newest else max(0.0, min(1.0, cfg.dim_older))
