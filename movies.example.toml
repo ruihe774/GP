@@ -94,7 +94,16 @@ playback = false              # nothing to play; keeps the sink out of the way
 [agent.reason_instructions]
 reply = "They just said something to you. Answer it, briefly, without spoiling anything ahead of where they are."
 react = "Something just shifted on screen. One short reaction -- what someone watching next to them would actually say, not a description of the shot."
-ambient = "The film has been running quietly for a while. One short, low-stakes remark or a question about what they make of it. Do not recap, do not review, and do not repeat anything you have already said."
+# `ambient` fires far more often than the other two here, so whatever it invites
+# is what the session sounds like. The built-in ends "...remark or a question
+# about what they are doing", and on sess_movie1 all four ambient lines came back
+# as questions -- reasonably, since it was asked for one. It asks for a statement.
+# ...and the built-in's "It has been quiet for a while" is wrong at this cadence:
+# ambient_after_s is 30 s here against the default 75, so it fires in an ordinary
+# lull between remarks, not after a long silence. Told the silence is long, the
+# model writes a line that tries to break it -- which is the other half of why
+# the questions showed up.
+ambient = "A lull -- nothing has needed saying for a bit. One short, low-stakes observation, an aside rather than an opener: a statement, not a question. Do not recap, do not review, and do not repeat anything you have already said."
 
 # Replaces persona.TEXT_OUTPUT_NOTE. Same job as the built-in, plus the one
 # constraint specific to watching: the frame is the thing being looked at, and a
@@ -125,10 +134,16 @@ min_gap_s = 12.0       # quiet floor between unprompted remarks; a read line is
 max_per_min = 5.0
 
 # A cut is not an event. Film cuts every few seconds and the default 0.35 would
-# make `react` fire on the edit rhythm itself -- so this is set above where an
+# make `react` fire on the edit rhythm itself -- so this sits above where an
 # ordinary cut lands, leaving it for the shots that are genuinely a break: a
 # location change, a title, a hard tonal turn.
-scene_threshold = 0.6
+#
+# Measured on sess_movie1 (134 frames, 3.6 min of animation): p50 0.05, p90 0.24,
+# and the only scores above 0.6 were the first four frames -- the studio logo and
+# title cards, i.e. the film starting. Real in-film breaks topped out at 0.47, so
+# 0.6 meant `react` never fired once the film was running and every remark came
+# from `ambient`. 0.45 is just under those breaks.
+scene_threshold = 0.45
 event_cooldown_s = 25.0
 burst_windows = 1      # irrelevant with the gamepad off; scene sets `react`
                        # directly and never counts windows
@@ -140,7 +155,12 @@ reply_min_gap_s = 3.0
 # nearly everything by design -- that is what watching is -- and at 1.6^3 the
 # agent would mute itself for the second half of the film after four unanswered
 # remarks. Backoff still exists, it just cannot run away.
-backoff_factor = 1.25
+#
+# 1.25 was still too steep in practice: a viewer who says nothing for four
+# minutes saturates it, and sess_movie1 spent the whole run at 1.56x -- ambient
+# every 47 s against the 30 s asked for here. 1.15^2 puts the saturated cadence
+# at ~40 s.
+backoff_factor = 1.15
 backoff_max = 2
 engagement_boost = 0.6
 
