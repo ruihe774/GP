@@ -246,7 +246,16 @@ class AgentConfig:
     #: never does. The point of a budget is to meet the ceiling on our own
     #: terms: without one the first sign of trouble is a rejected
     #: `response.create`, which costs a turn the player was waiting on.
-    context_budget_tokens: int = 20000
+    #: 20000 was set well below the model's actual 128k context window and
+    #: paid for it: sess_movie5 (`movies.example.toml`, six-frame trail)
+    #: crossed 20000 by turn 7 of 22 and forced a round on nearly every turn
+    #: after, most of which only found a stale note to sweep (images and
+    #: speech are also guarded by the scheduled cutoff in `_prune_now`'s
+    #: first rung) -- a cache invalidation paid on almost every response for
+    #: no headroom bought back, while a real request billed 41189 tokens
+    #: without incident. 100000 leaves 28k for output and the next turn's
+    #: growth before the real 128k ceiling.
+    context_budget_tokens: int = 100000
     #: How many times one turn may be asked for again after the server says the
     #: conversation is too long. Per turn, not per session.
     context_full_retries: int = 1

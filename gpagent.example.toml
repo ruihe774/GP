@@ -220,7 +220,11 @@ truncation_post_instruction_tokens = 0   # 0 uses the model's own window
 # input than this, the next tick forces a round. It costs one cache prefix; the
 # alternative is finding the ceiling with a rejected response.create, which
 # costs a turn the player was waiting on. 0 waits for the server to complain.
-context_budget_tokens = 20000
+# 100000 leaves headroom under the model's 128k context window for output and
+# the next turn's growth -- a lower budget (20000 was the old default) crosses
+# early and forces a round on nearly every turn thereafter, each one paying a
+# cache invalidation whether or not it finds anything worth removing.
+context_budget_tokens = 100000
 context_full_retries = 1      # per turn: prune once, ask once more, then give up
 context_full_keep_stubs = 8   # stubs spared when a forced round has nothing else left
 # Error codes to read as "the conversation is too long", on top of the built-in

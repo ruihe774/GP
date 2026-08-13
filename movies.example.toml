@@ -118,7 +118,14 @@ prune_after_s = 180.0
 prune_interval_s = 90.0
 # ...and a floor under both, because with truncation off nothing else is
 # watching. A film runs long enough to reach this even at 180 s of retention.
-context_budget_tokens = 20000
+#
+# 20000 was too tight for six high-detail trail frames: sess_movie5 crossed it
+# by turn 7 of 22 and forced a round on nearly every turn after, most of which
+# found nothing older than prune_after_s to remove but a stale note -- a cache
+# invalidation paid for on almost every response while buying back no headroom,
+# with a real request billing 41189 tokens along the way without incident.
+# 100000 leaves real headroom under the 128k window.
+context_budget_tokens = 100000
 
 playback = false              # nothing to play; keeps the sink out of the way
 
